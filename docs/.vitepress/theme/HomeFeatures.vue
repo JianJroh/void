@@ -1,0 +1,56 @@
+<script setup>
+import { Icon } from '@iconify/vue';
+import { useData } from 'vitepress';
+import placeholderImage from './feature-placeholder.svg';
+
+const { frontmatter } = useData();
+</script>
+
+<template>
+  <div v-if="frontmatter.features">
+    <section
+      v-for="feature in frontmatter.features"
+      :key="feature.title"
+      class="wrapper border-t border-nickel grid md:grid-cols-2 md:divide-x divide-nickel"
+    >
+      <div class="px-5 py-6 md:p-10 flex flex-col justify-between gap-15">
+        <div class="flex flex-col gap-5">
+          <Icon
+            v-if="feature.iconify"
+            :icon="feature.iconify"
+            class="size-5 text-vite"
+            aria-hidden="true"
+          />
+          <h3 class="text-white text-xl md:text-3xl">{{ feature.title }}</h3>
+          <p class="max-w-[25rem] text-white/70 text-base text-pretty">
+            <code v-if="feature.command" class="mr-1 outline-none bg-nickel/50 text-vite">{{
+              feature.command
+            }}</code>
+            {{ feature.details }}
+          </p>
+          <ul v-if="feature.highlights" class="checkmark-list">
+            <li v-for="highlight in feature.highlights" :key="highlight">{{ highlight }}</li>
+          </ul>
+        </div>
+        <a
+          v-if="feature.guide"
+          :href="feature.guide.link"
+          class="px-3 py-1.5 bg-slate rounded w-fit inline-flex items-center gap-2 text-white text-sm font-mono hover:bg-nickel focus-visible:outline-2 focus-visible:outline-vite"
+        >
+          {{ feature.guide.text }}
+          <Icon icon="lucide:arrow-up-right" class="size-4" aria-hidden="true" />
+        </a>
+      </div>
+      <div
+        class="bg-slate border-t border-nickel md:border-t-0 min-h-[22rem] sm:min-h-[30rem] p-5 sm:p-10 flex items-center justify-center"
+      >
+        <img
+          :src="feature.image || placeholderImage"
+          :alt="feature.imageAlt || ''"
+          class="w-full max-w-[32rem]"
+          loading="lazy"
+        />
+      </div>
+    </section>
+  </div>
+</template>
