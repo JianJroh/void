@@ -23,6 +23,8 @@ export type CloudflareVersionMetadata =
       schema: 2;
       migrations: ReadonlyArray<string>;
       triggerConfig: CloudflareTriggerConfig;
+      /** Digest of the complete Worker upload input, when supplied by the caller. */
+      contentHash?: string;
     }>;
 
 export type CloudflareTriggerConfig = Readonly<{
@@ -129,9 +131,10 @@ type RecentCloudflareVersion = Readonly<{
 export function encodeCloudflareVersionMessage(
   migrations: ReadonlyArray<string>,
   triggerConfig?: CloudflareTriggerConfig,
+  contentHash?: string,
 ): string {
   const metadata: CloudflareVersionMetadata = triggerConfig
-    ? { schema: 2, migrations, triggerConfig }
+    ? { schema: 2, migrations, triggerConfig, ...(contentHash ? { contentHash } : {}) }
     : { schema: 1, migrations };
   return `void:${JSON.stringify(metadata)}`;
 }
@@ -148,6 +151,7 @@ export function parseCloudflareVersionMessage(
       schema?: unknown;
       migrations?: unknown;
       triggerConfig?: unknown;
+      contentHash?: unknown;
     };
     if (
       (value.schema !== 1 && value.schema !== 2) ||
@@ -163,7 +167,17 @@ export function parseCloudflareVersionMessage(
       return { schema: 1, migrations: value.migrations };
     }
     const triggerConfig = parseTriggerConfig(value.triggerConfig);
-    return triggerConfig ? { schema: 2, migrations: value.migrations, triggerConfig } : null;
+    if (!triggerConfig) {
+      return null;
+    }
+    return {
+      schema: 2,
+      migrations: value.migrations,
+      triggerConfig,
+      ...(typeof value.contentHash === 'string' && /^[a-f0-9]{64}$/.test(value.contentHash)
+        ? { contentHash: value.contentHash }
+        : {}),
+    };
   } catch {
     return null;
   }
@@ -838,8 +852,17 @@ async function activateCloudflareVersionWithSecretsFile(
     return { ok: false, reason: 'uploader-changed' };
   }
   const previousVersionId = previous.versionId;
+  // Activation can succeed before trigger synchronization or the local receipt
+  // cleanup fails. Once its last recorded candidate owns all live traffic, the
+  // receipt no longer authorizes any *inactive* successor. The history checks
+  // below still reject a newer upload from another operation.
+  const trustedInheritanceVersionIds =
+    previousVersionId && options.trustedInheritanceVersionIds?.at(-1) === previousVersionId
+      ? []
+      : options.trustedInheritanceVersionIds;
   let inheritanceBaseline: Array<RecentCloudflareVersion> | undefined;
   let trustedCandidateChain = false;
+  let activeSecretsPinned = false;
   if (options.expectedPreviousVersionId !== undefined || options.verifyInheritedSecrets === true) {
     const recent = await readRecentCloudflareVersionIds(options, commonArgs);
     if (recent === null) {
@@ -848,22 +871,22 @@ async function activateCloudflareVersionWithSecretsFile(
     const latestVersionId = recent.at(-1)?.id ?? null;
     if (
       options.expectedPreviousVersionId !== undefined ||
-      options.trustedInheritanceVersionIds !== undefined
+      trustedInheritanceVersionIds !== undefined
     ) {
       const activeIndex = recent.findIndex((version) => version.id === previous.versionId);
       const inheritedChain = activeIndex < 0 ? [] : recent.slice(activeIndex);
       const inheritedCandidates = inheritedChain.slice(1).map((version) => version.id);
       trustedCandidateChain =
-        options.trustedInheritanceVersionIds !== undefined &&
-        options.trustedInheritanceVersionIds.length > 0 &&
-        arraysEqual(inheritedCandidates, options.trustedInheritanceVersionIds);
+        trustedInheritanceVersionIds !== undefined &&
+        trustedInheritanceVersionIds.length > 0 &&
+        arraysEqual(inheritedCandidates, trustedInheritanceVersionIds);
       const safeInheritanceChain =
         inheritedChain.length > 0 &&
         inheritedChain.every(
           (version, index) =>
             index === 0 || version.number === inheritedChain[index - 1]!.number + 1,
         ) &&
-        (arraysEqual(inheritedCandidates, options.trustedInheritanceVersionIds ?? []) ||
+        (arraysEqual(inheritedCandidates, trustedInheritanceVersionIds ?? []) ||
           options.pinActiveSecrets !== undefined);
       if (!safeInheritanceChain) {
         return {
@@ -904,6 +927,7 @@ async function activateCloudflareVersionWithSecretsFile(
             rollback: 'not-needed',
           };
         }
+        activeSecretsPinned = true;
       }
     }
     inheritanceBaseline = recent;
@@ -999,6 +1023,18 @@ async function activateCloudflareVersionWithSecretsFile(
 
   const alias = `void-ready-${Date.now().toString(36)}`;
   if (options.atomic && previous.versionId !== null) {
+    // Pinning the active secrets selects the version-aware uploader for atomic
+    // publication, including when the active version is the latest upload.
+    if (!activeSecretsPinned && options.pinActiveSecrets) {
+      const activeSecrets = await readCloudflareVersionSecretBindings(
+        options,
+        commonArgs,
+        previous.versionId,
+      );
+      if (activeSecrets?.length) {
+        await options.pinActiveSecrets(previous.versionId, activeSecrets);
+      }
+    }
     return bootstrapFirstDeployment({ ...options, message }, commonArgs, previous.versionId, true);
   }
   options.onProgress?.('Uploading the Worker and assets...');

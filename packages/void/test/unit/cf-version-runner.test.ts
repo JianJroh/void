@@ -5,6 +5,7 @@ import { connect, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Duplex } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 import { getWorkerConfigPath } from '@cloudflare/build-output-utils';
 import { afterEach, expect, it } from 'vite-plus/test';
 import {
@@ -22,6 +23,9 @@ import {
 } from '../../src/cli/cf-version-runner.ts';
 
 const roots: Array<string> = [];
+const pinnedCfVersion = JSON.parse(
+  readFileSync(fileURLToPath(import.meta.resolve('cf/package.json')), 'utf8'),
+).version as string;
 afterEach(() => {
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
@@ -212,7 +216,10 @@ async function output(config: Record<string, unknown> = {}, additionalAsset = fa
     mkdirSync(directory, { recursive: true });
     writeFileSync(join(directory, 'index.html'), '<h1>Public</h1>');
     if (additionalAsset) {
-      writeFileSync(join(directory, 'second.html'), '<h1>Second</h1>');
+      writeFileSync(join(directory, 'module.js'), 'export const ready = true;');
+      writeFileSync(join(directory, 'style.css'), 'body { color: red; }');
+      writeFileSync(join(directory, 'image.png'), Buffer.from([137, 80, 78, 71]));
+      writeFileSync(join(directory, 'opaque.unknown'), 'opaque');
     }
     writeFileSync(join(directory, 'private.txt'), 'Never upload this');
     writeFileSync(join(directory, '.assetsignore'), 'private.txt\n');
@@ -232,7 +239,7 @@ async function output(config: Record<string, unknown> = {}, additionalAsset = fa
   return prepared!;
 }
 
-it('uploads live secrets and multiple asset batches when the latest upload is inactive', async () => {
+async function verifyPinnedUpload(atomic: boolean): Promise<void> {
   const prepared = await output(
     {
       secrets: { required: ['AUTH_SECRET'] },
@@ -287,7 +294,7 @@ it('uploads live secrets and multiple asset batches when the latest upload is in
             ]),
           }
         : path.includes('/assets/upload')
-          ? ++uploadedBatches === 2
+          ? ++uploadedBatches === 5
             ? { jwt: 'completion-token' }
             : {}
           : request.method === 'GET'
@@ -316,11 +323,13 @@ it('uploads live secrets and multiple asset batches when the latest upload is in
         apiBaseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/client/v4`,
         workerName: 'void-test',
         token: 'synthetic-token',
-        atomic: false,
+        atomic,
         verifyUploader: () => true,
       });
       expect(uploaded.id).toBe('22222222-2222-4222-8222-222222222222');
-      const upload = requests.find(({ url }) => url.endsWith('/versions'));
+      const upload = requests.find(({ url }) =>
+        url.endsWith(atomic ? '/versions?deploy=true' : '/versions'),
+      );
       expect(upload).toBeDefined();
       const body = JSON.parse(upload!.body);
       expect(body.bindings).toEqual(
@@ -337,15 +346,34 @@ it('uploads live secrets and multiple asset batches when the latest upload is in
       });
       expect(body.bindings).toContainEqual({ name: 'ASSETS', type: 'assets' });
       const session = requests.find(({ url }) => url.endsWith('/assets-upload-session'));
-      expect(Object.keys(JSON.parse(session!.body).manifest)).toEqual([
-        '/index.html',
-        '/second.html',
-      ]);
-      expect(
-        requests
-          .filter(({ url }) => url.includes('/assets/upload'))
-          .map(({ authorization }) => authorization),
-      ).toEqual(['Bearer asset-token', 'Bearer asset-token']);
+      const manifest = JSON.parse(session!.body).manifest as Record<string, { hash: string }>;
+      expect(Object.keys(manifest)).toEqual(
+        expect.arrayContaining([
+          '/index.html',
+          '/module.js',
+          '/style.css',
+          '/image.png',
+          '/opaque.unknown',
+        ]),
+      );
+      expect(Object.keys(manifest)).toHaveLength(5);
+      const assetUploads = requests.filter(({ url }) => url.includes('/assets/upload'));
+      for (const [name, contentType, contents] of [
+        ['index.html', 'text/html', Buffer.from('<h1>Public</h1>')],
+        ['module.js', 'text/javascript', Buffer.from('export const ready = true;')],
+        ['style.css', 'text/css', Buffer.from('body { color: red; }')],
+        ['image.png', 'image/png', Buffer.from([137, 80, 78, 71])],
+        ['opaque.unknown', 'application/null', Buffer.from('opaque')],
+      ] as const) {
+        const hash = manifest[`/${name}`].hash;
+        const upload = assetUploads.find(({ body }) => body.includes(`name="${hash}"`));
+        expect(upload?.body).toContain(`filename="${hash}"`);
+        expect(upload?.body).toContain(`Content-Type: ${contentType}`);
+        expect(upload?.body).toContain(contents.toString('base64'));
+      }
+      expect(assetUploads.map(({ authorization }) => authorization)).toEqual(
+        Array(5).fill('Bearer asset-token'),
+      );
     } finally {
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
@@ -354,7 +382,13 @@ it('uploads live secrets and multiple asset batches when the latest upload is in
   } finally {
     prepared.dispose();
   }
-});
+}
+
+it('uploads live secrets and multiple asset batches when the latest upload is inactive', () =>
+  verifyPinnedUpload(false));
+
+it('uploads live secrets and multiple asset batches for atomic publication', () =>
+  verifyPinnedUpload(true));
 
 it('does not pin active secrets during an existing-Worker handoff', async () => {
   const prepared = await output();
@@ -403,7 +437,7 @@ it('does not delegate credentialed commands to a project-local cf', async () => 
   const result = await command(['--version'], { cwd: root, capture: true });
   expect(result.status, result.stderr).toBe(0);
   expect(result.stdout).not.toContain('UNPINNED_PROJECT_CF_EXECUTED');
-  expect(result.stdout).toContain('1.0.0-beta.5');
+  expect(result.stdout).toContain(pinnedCfVersion);
 });
 
 it('captures noninteractive cf output when Void owns the terminal', async () => {
@@ -417,7 +451,7 @@ it('captures noninteractive cf output when Void owns the terminal', async () => 
   });
   const result = await command(['--version'], { cwd: root, capture: false });
   expect(result.status, result.stderr).toBe(0);
-  expect(result.stdout).toContain('1.0.0-beta.5');
+  expect(result.stdout).toContain(pinnedCfVersion);
 });
 
 it('uses the configured HTTP proxy for direct cf activation reads', async () => {

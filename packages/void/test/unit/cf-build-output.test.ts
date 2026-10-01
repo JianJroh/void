@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import {
   existsSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -17,7 +18,7 @@ import { cloudflare } from '@cloudflare/vite-plugin';
 import { renderCloudflareStaticEntry } from '@void/deploy-cloudflare';
 import { toSlash } from 'pathslash';
 import { createBuilder } from 'vite';
-import { afterEach, expect, it } from 'vite-plus/test';
+import { afterEach, expect, it, vi } from 'vite-plus/test';
 import {
   prepareCfBuildOutput,
   prepareCfFrameworkBuildOutput,
@@ -29,6 +30,7 @@ const roots: Array<string> = [];
 // Windows CI can take longer than Vitest's 5-second default under parallel load.
 const CF_BUILD_TIMEOUT_MS = process.platform === 'win32' ? 45_000 : 15_000;
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
@@ -253,6 +255,114 @@ it(
   },
   CF_BUILD_TIMEOUT_MS,
 );
+
+it(
+  'accepts a nested hashed Worker entry with a relative module import',
+  async () => {
+    const output = worker({
+      name: 'void-test',
+      compatibility_date: '2026-09-29',
+      main: './assets/index-hash.js',
+    });
+    mkdirSync(join(output, 'assets'));
+    writeFileSync(
+      join(output, 'assets/index-hash.js'),
+      "import { message } from './message.js'; export default { fetch() { return new Response(message) } };\n",
+    );
+    writeFileSync(join(output, 'assets/message.js'), 'export const message = "nested entry";\n');
+    rmSync(join(output, 'index.js'));
+    const prepared = await prepareCfBuildOutput(output, 'account-id');
+    expect(prepared).not.toBeNull();
+    if (!prepared) {
+      return;
+    }
+    try {
+      const built = await readBuildOutput(prepared.directory);
+      expect(built.workers.default.config.manifest).toMatchObject({
+        mainModule: 'assets/index-hash.js',
+        modules: { 'assets/message.js': { type: 'esm' } },
+      });
+      const cf = join(dirname(fileURLToPath(import.meta.resolve('cf/package.json'))), 'bin', 'cf');
+      const dryRun = spawnSync(
+        process.execPath,
+        [cf, 'workers', 'versions', 'create', '--prebuilt', '--dry-run'],
+        { cwd: prepared.directory, encoding: 'utf8' },
+      );
+      expect(dryRun.status, `${dryRun.stdout}\n${dryRun.stderr}`).toBe(0);
+    } finally {
+      prepared.dispose();
+    }
+  },
+  CF_BUILD_TIMEOUT_MS,
+);
+
+it.each(['../index.js', '/index.js', 'C:\\index.js'])(
+  'rejects an out-of-bundle entry %s',
+  async (main) => {
+    const output = worker({ name: 'void-test', compatibility_date: '2026-09-29', main });
+    await expect(prepareCfBuildOutput(output, 'account-id')).rejects.toThrow(
+      'inside its output directory',
+    );
+  },
+);
+
+it('reports a missing built entry', async () => {
+  const output = worker({
+    name: 'void-test',
+    compatibility_date: '2026-09-29',
+    main: 'assets/missing.js',
+  });
+  await expect(prepareCfBuildOutput(output, 'account-id')).rejects.toThrow(
+    '"assets/missing.js" is missing',
+  );
+});
+
+it(
+  'preserves binary font modules in a deployable Worker bundle',
+  async () => {
+    const output = worker({
+      name: 'void-test',
+      compatibility_date: '2026-09-29',
+      main: 'index.js',
+    });
+    mkdirSync(join(output, 'assets'));
+    writeFileSync(
+      join(output, 'index.js'),
+      "import font from './assets/font.woff2'; export default { fetch() { return new Response(String(font.byteLength)) } };\n",
+    );
+    writeFileSync(join(output, 'assets/font.woff2'), Buffer.from([1, 2, 3]));
+    const prepared = await prepareCfBuildOutput(output, 'account-id');
+    expect(prepared).not.toBeNull();
+    if (!prepared) {
+      return;
+    }
+    try {
+      const built = await readBuildOutput(prepared.directory);
+      expect(built.workers.default.config.manifest).toMatchObject({
+        mainModule: 'index.js',
+        modules: { 'assets/font.woff2': { type: 'data' } },
+      });
+      const cf = join(dirname(fileURLToPath(import.meta.resolve('cf/package.json'))), 'bin', 'cf');
+      const dryRun = spawnSync(
+        process.execPath,
+        [cf, 'workers', 'versions', 'create', '--prebuilt', '--dry-run'],
+        { cwd: prepared.directory, encoding: 'utf8' },
+      );
+      expect(dryRun.status, `${dryRun.stdout}\n${dryRun.stderr}`).toBe(0);
+    } finally {
+      prepared.dispose();
+    }
+  },
+  CF_BUILD_TIMEOUT_MS,
+);
+
+it('names the file when a plugin emits an unsupported module', async () => {
+  const output = worker({ name: 'void-test', compatibility_date: '2026-09-29', main: 'index.js' });
+  writeFileSync(join(output, 'plugin.unknown'), 'unexpected');
+  await expect(prepareCfBuildOutput(output, 'account-id')).rejects.toThrow(
+    'unsupported module "plugin.unknown"',
+  );
+});
 
 it('preserves worker settings that the previous bridge dropped', async () => {
   const output = worker({
@@ -498,3 +608,91 @@ it('bundles a generated static Worker and staged assets into prebuilt cf output'
     prepared.dispose();
   }
 });
+
+it.skipIf(process.platform === 'win32')(
+  'builds a named Sandbox image into cf prebuilt output and cleans up its local tag',
+  async () => {
+    const output = worker({
+      name: 'void-sandbox-test',
+      main: 'index.js',
+      compatibility_date: '2026-09-30',
+      durable_objects: { bindings: [{ name: 'SANDBOX', class_name: 'Sandbox' }] },
+      migrations: [{ tag: 'v1', new_sqlite_classes: ['Sandbox'] }],
+      containers: [
+        {
+          name: 'void-sandbox-v1',
+          class_name: 'Sandbox',
+          scheduling_policy: 'durable_object',
+          images: {
+            default: {
+              dockerfile: join(outputDirectory(), 'Dockerfile'),
+              build_context: outputDirectory(),
+            },
+          },
+        },
+      ],
+    });
+    function outputDirectory() {
+      return tmpdir();
+    }
+    const log = join(dirname(output), 'docker.log');
+    const binary = join(dirname(output), 'docker-stub');
+    writeFileSync(
+      binary,
+      '#!/usr/bin/env node\n' +
+        'require("node:fs").appendFileSync(' +
+        JSON.stringify(log) +
+        ', JSON.stringify(process.argv.slice(2)) + "\\n");\n',
+    );
+    chmodSync(binary, 0o755);
+    vi.stubEnv('WRANGLER_DOCKER_BIN', binary);
+    const prepared = await prepareCfBuildOutput(output, 'account-id');
+    expect(prepared).not.toBeNull();
+    if (!prepared) {
+      return;
+    }
+    let tag: string;
+    try {
+      const built = await readBuildOutput(prepared.directory);
+      const container = built.containers[0]!.config;
+      expect(container.schedulingPolicy).toBe('durable-object');
+      if (container.schedulingPolicy !== 'durable-object') {
+        throw new Error('Expected a managed container');
+      }
+      const image = container.images?.default;
+      expect(image).toEqual({ localReference: expect.stringMatching(/^void-sandbox-build:/) });
+      if (!image || !('localReference' in image)) {
+        throw new Error('Expected a prepared local image');
+      }
+      tag = image.localReference;
+      const cf = join(dirname(fileURLToPath(import.meta.resolve('cf/package.json'))), 'bin', 'cf');
+      const dryRun = spawnSync(
+        process.execPath,
+        [cf, 'workers', 'versions', 'create', '--prebuilt', '--dry-run'],
+        {
+          cwd: prepared.directory,
+          encoding: 'utf8',
+        },
+      );
+      expect(dryRun.status, dryRun.stdout + dryRun.stderr).toBe(0);
+    } finally {
+      await prepared.dispose();
+    }
+    const calls = readFileSync(log, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(calls[0]).toEqual([
+      'build',
+      '--platform',
+      'linux/amd64',
+      '--file',
+      join(tmpdir(), 'Dockerfile'),
+      '--tag',
+      tag!,
+      tmpdir(),
+    ]);
+    expect(calls.at(-1)).toEqual(['image', 'rm', tag!]);
+  },
+  CF_BUILD_TIMEOUT_MS,
+);

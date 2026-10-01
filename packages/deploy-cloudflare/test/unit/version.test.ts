@@ -186,6 +186,37 @@ describe('Cloudflare version activation', () => {
       runWrangler.mock.calls.some(([args]) => args[0] === 'versions' && args[1] === 'deploy'),
     ).toBe(false);
   });
+  it('pins active secrets for atomic publication when the active version is the latest', async () => {
+    const base = runner({
+      bootstrap: ok(`Worker Version ID: ${NEXT}\nhttps://my-worker.example.workers.dev`),
+    });
+    const runWrangler = vi.fn((args: Array<string>) =>
+      args[0] === 'versions' && args[1] === 'view'
+        ? ok(
+            JSON.stringify({
+              id: CURRENT,
+              resources: { bindings: [{ name: 'AUTH_SECRET', type: 'secret_text' }] },
+            }),
+          )
+        : base(args),
+    );
+    const pinActiveSecrets = vi.fn().mockResolvedValue(true);
+    const result = await activateCloudflareVersion({
+      runWrangler,
+      workerName: 'my-worker',
+      verifyUploader: () => true,
+      verifyInheritedSecrets: true,
+      pinActiveSecrets,
+      atomic: true,
+      workersDevSubdomain: 'example',
+      message: encodeCloudflareVersionMessage([]),
+      fetch: async () => Response.json({ ready: true }),
+    });
+    expect(result).toMatchObject({ ok: true, versionId: NEXT });
+    expect(pinActiveSecrets).toHaveBeenCalledWith(CURRENT, [
+      { name: 'AUTH_SECRET', type: 'secret_text' },
+    ]);
+  });
   it('returns the Cloudflare error when zero-percent staging fails', async () => {
     const runWrangler = runner({
       upload: ok(`Worker Version ID: ${NEXT}`),
@@ -374,6 +405,46 @@ describe('Cloudflare version activation', () => {
         fetch: async () => Response.json({ ready: true }),
       }),
     ).resolves.toMatchObject({ ok: true, versionId: NEXT });
+  });
+
+  it('recovers a receipt whose last candidate already owns production', async () => {
+    const runWrangler = runner();
+    const recordVerifiedCandidate = vi.fn();
+    await expect(
+      activateCloudflareVersion({
+        runWrangler,
+        workerName: 'my-worker',
+        verifyUploader: () => true,
+        verifyInheritedSecrets: true,
+        trustedInheritanceVersionIds: [CONCURRENT, CURRENT],
+        message: encodeCloudflareVersionMessage([]),
+        fetch: async () => Response.json({ ready: true }),
+        recordVerifiedCandidate,
+      }),
+    ).resolves.toMatchObject({ ok: true, versionId: NEXT, previousVersionId: CURRENT });
+    expect(recordVerifiedCandidate).toHaveBeenCalledWith(NEXT, CURRENT);
+  });
+
+  it('still rejects a foreign upload after the recorded candidate became active', async () => {
+    const runWrangler = runner({
+      versions: ok(
+        JSON.stringify([
+          { id: CURRENT, number: 1 },
+          { id: CONCURRENT, number: 2 },
+        ]),
+      ),
+    });
+    await expect(
+      activateCloudflareVersion({
+        runWrangler,
+        workerName: 'my-worker',
+        verifyUploader: () => true,
+        verifyInheritedSecrets: true,
+        trustedInheritanceVersionIds: [CURRENT],
+        message: encodeCloudflareVersionMessage([]),
+      }),
+    ).resolves.toMatchObject({ ok: false, reason: 'inheritance-source-changed' });
+    expect(runWrangler.mock.calls.some(([args]) => args[1] === 'upload')).toBe(false);
   });
 
   it('does not inherit any remote secret from a failed candidate newer than production', async () => {
@@ -1179,6 +1250,26 @@ describe('Cloudflare version activation', () => {
     });
     expect(parseCloudflareVersionMessage('manual deploy')).toBeNull();
     expect(parseCloudflareVersionMessage('void:{bad')).toBeNull();
+  });
+
+  it('round-trips an upload digest only when it is a valid SHA-256 value', () => {
+    const triggers = {
+      workers_dev: true,
+      preview_urls: false,
+      routes: [],
+      crons: [],
+      queueConsumers: [],
+      workflows: [],
+    };
+    const digest = 'a'.repeat(64);
+    expect(
+      parseCloudflareVersionMessage(encodeCloudflareVersionMessage([], triggers, digest)),
+    ).toMatchObject({ contentHash: digest });
+    expect(
+      parseCloudflareVersionMessage(
+        `void:${JSON.stringify({ schema: 2, migrations: [], triggerConfig: triggers, contentHash: 'bad' })}`,
+      ),
+    ).not.toHaveProperty('contentHash');
   });
 
   // Wrangler 4.131 applies its Email Routing plan inside `triggers deploy`, reading the

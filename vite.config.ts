@@ -24,6 +24,9 @@ const testTimeout = 120_000 * ciTimeoutScale;
 const hookTimeout = 120_000 * ciTimeoutScale;
 
 const platformAlias = {
+  'void/_sandbox-container': fileURLToPath(
+    new URL('packages/void/src/runtime/sandbox-container.ts', import.meta.url),
+  ),
   'void:sandbox-controller-source': fileURLToPath(
     new URL('platform/packages/api/test/__mocks__/sandbox-controller-source.ts', import.meta.url),
   ),
@@ -58,7 +61,9 @@ export default defineConfig({
         // Without this, the gated live Cloudflare e2e's credentials never reach `vp test run`, so it
         // skips even when the CI job injects them. `untrackedEnv` forwards them without folding them
         // into the task's cache fingerprint (credentials must not bust the cache).
-        untrackedEnv: ['VOID_E2E_CF_TOKEN', 'VOID_E2E_CF_ACCOUNT_ID', 'VOID_E2E_RUN_ID'],
+        cache: {
+          untrackedEnv: ['VOID_E2E_CF_TOKEN', 'VOID_E2E_CF_ACCOUNT_ID', 'VOID_E2E_RUN_ID'],
+        },
       },
     },
   },
@@ -384,6 +389,7 @@ export default defineConfig({
     sequence: { sequencer: SuiteSequencer },
     projects: [
       {
+        extends: false,
         test: {
           name: 'unit',
           include: ['packages/*/test/unit/**/*.test.ts'],
@@ -396,6 +402,7 @@ export default defineConfig({
         },
       },
       {
+        extends: false,
         resolve: { alias: platformAlias },
         test: {
           name: 'platform-unit',
@@ -405,6 +412,7 @@ export default defineConfig({
         },
       },
       {
+        extends: false,
         resolve: { alias: platformAlias },
         test: {
           name: 'platform-api-integration',
@@ -416,6 +424,7 @@ export default defineConfig({
         },
       },
       {
+        extends: false,
         test: {
           // Every integration file here owns its fixture directory, so one worker pool can
           // schedule the longest files first and fill idle slots across package boundaries.

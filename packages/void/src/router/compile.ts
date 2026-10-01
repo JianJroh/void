@@ -6,6 +6,7 @@ import type { MigrationPlanBundle } from '../migrations/plan.ts';
 import { resolveLayoutIds } from '../pages/layout-resolution.ts';
 import { generateQueueResolverSource } from '../queues/dispatch.ts';
 import { INTERNAL_BINDING_EXACT_NAMES, INTERNAL_BINDING_PREFIXES } from '../runtime/env-raw.ts';
+import { DEFAULT_SANDBOX_CLASS_NAME } from '../sandbox/config.ts';
 import type { ScanResult } from './scan.ts';
 
 /**
@@ -2578,12 +2579,39 @@ export function compileAssetFallbackHelper(
       : `  return response;`;
 
   return `
+const __voidAssetContentTypes = {
+  ".avif": "image/avif",
+  ".css": "text/css; charset=utf-8",
+  ".gif": "image/gif",
+  ".html": "text/html; charset=utf-8",
+  ".ico": "image/x-icon",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+  ".txt": "text/plain; charset=utf-8",
+  ".wasm": "application/wasm",
+  ".webp": "image/webp",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+};
+
 async function serveWithAssets(request, env, response) {
   if (response.status !== 404 || !env.ASSETS || (request.method !== "GET" && request.method !== "HEAD")) return response;
   const asset = await env.ASSETS.fetch(new Request(request.url, { method: request.method, headers: request.headers }));
   if (asset.status !== 404) {
     const res = new Response(asset.body, asset);
-    if (new URL(request.url).pathname.startsWith(${JSON.stringify('/' + assetsDir + '/')})) {
+    const pathname = new URL(request.url).pathname;
+    // Directly uploaded assets can reach the binding without a MIME type.
+    if (!res.headers.get("Content-Type")) {
+      const filename = pathname.slice(pathname.lastIndexOf("/") + 1);
+      const contentType = __voidAssetContentTypes[filename.slice(filename.lastIndexOf(".")).toLowerCase()];
+      if (contentType) res.headers.set("Content-Type", contentType);
+    }
+    if (pathname.startsWith(${JSON.stringify('/' + assetsDir + '/')})) {
       res.headers.set("Cache-Control", "public, max-age=31536000, immutable");
     } else {
       res.headers.set("Cache-Control", "no-store");
@@ -2635,7 +2663,9 @@ export interface WorkerEntryOptions {
    */
   runtimeEmailPath?: string;
   envSchemaModule?: { importPath: string; helperPath: string };
-  sandbox?: boolean | { bindingName?: string; className?: string; runtimePath?: string };
+  sandbox?:
+    | boolean
+    | { bindingName?: string; className?: string; instanceType?: string; runtimePath?: string };
   /**
    * Emit an SPA-style fallback in the asset-fallthrough path: when
    * `assetConfig.not_found_handling = "none"`, the worker returns
@@ -2694,7 +2724,9 @@ export function compileWorkerEntry(options: WorkerEntryOptions = {}): string {
   })`;
   const hasSandbox = sandbox === true || typeof sandbox === 'object';
   const sandboxClassName =
-    typeof sandbox === 'object' ? (sandbox.className ?? 'Sandbox') : 'Sandbox';
+    typeof sandbox === 'object'
+      ? (sandbox.className ?? DEFAULT_SANDBOX_CLASS_NAME)
+      : DEFAULT_SANDBOX_CLASS_NAME;
   const sandboxBindingName =
     typeof sandbox === 'object' ? (sandbox.bindingName ?? 'SANDBOX') : 'SANDBOX';
   const sandboxRuntimePath =
@@ -2702,10 +2734,11 @@ export function compileWorkerEntry(options: WorkerEntryOptions = {}): string {
   const sandboxImport = hasSandbox
     ? `import { VoidPlatformSandbox as __VoidSandbox, __setSandboxBindingName } from ${JSON.stringify(sandboxRuntimePath)};\n`
     : '';
+  const sandboxInstanceType = typeof sandbox === 'object' ? sandbox.instanceType : undefined;
   const sandboxExport = hasSandbox
-    ? sandboxClassName === 'Sandbox'
-      ? `export { __VoidSandbox as Sandbox };\n__setSandboxBindingName(${JSON.stringify(sandboxBindingName)});\n`
-      : `export class ${sandboxClassName} extends __VoidSandbox {}\n__setSandboxBindingName(${JSON.stringify(sandboxBindingName)});\n`
+    ? sandboxClassName === DEFAULT_SANDBOX_CLASS_NAME && !sandboxInstanceType
+      ? `export { __VoidSandbox as SandboxV1 };\n__setSandboxBindingName(${JSON.stringify(sandboxBindingName)});\n`
+      : `export class ${sandboxClassName} extends __VoidSandbox {${sandboxInstanceType ? ` protected override instanceType = ${JSON.stringify(sandboxInstanceType)} as const; ` : ''}}\n__setSandboxBindingName(${JSON.stringify(sandboxBindingName)});\n`
     : '';
   const hasLive = live === true || typeof live === 'object';
   const liveBindingName =

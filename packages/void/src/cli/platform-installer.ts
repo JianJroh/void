@@ -1,5 +1,15 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  copyFileSync,
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import {
   createServer,
   request as httpRequest,
@@ -9,6 +19,7 @@ import {
 import { request as httpsRequest } from 'node:https';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import {
   encodeCloudflareVersionMessage,
   parseCloudflareVersionMessage,
@@ -54,7 +65,7 @@ import type {
   PlatformRuntimeManifest,
   PlatformRuntimeMigration,
 } from '@void/platform/installer';
-import { join } from 'pathslash';
+import { dirname, join, resolve } from 'pathslash';
 import { cfAccessHeaders } from '../shared/cf-access.ts';
 import { ensurePlatformAccessToken } from './cf-access.ts';
 import { verifyInstalledPlatformAccessProtection } from './platform-access-preflight.ts';
@@ -74,6 +85,7 @@ import {
 import {
   hyperdriveOriginConfigHash,
   hyperdriveOriginFromConnectionString,
+  parsePostgresConnectionString,
   PlatformWorkerCustomDomainsChangedError,
   PlatformWorkerRoutesChangedError,
   type CloudflareNamedResource,
@@ -101,6 +113,7 @@ import {
   recordPlatformWorkerTraffic,
   trackedPlatformWorkerTraffic,
 } from './platform-traffic.ts';
+import { platformWorkerLiveTriggersMatch } from './platform-trigger-proof.ts';
 import { resolveWranglerArgv } from './preset.ts';
 import { createDefaultRunWrangler, resolvePinnedApiBaseUrl } from './provision.ts';
 
@@ -1021,7 +1034,14 @@ async function recoverInterruptedPlatformWorkerCutover(
   workerActions: ReadonlyArray<PlatformInstallPlanAction>;
 }> {
   if (interruptedCutover) {
-    for (const key of [...interruptedCutover.staged.keys()].reverse()) {
+    const recoveryOrder: ReadonlyArray<PlatformWorkerKey> = [
+      'dispatch',
+      'tail',
+      'emailGateway',
+      'proxy',
+      'api',
+    ];
+    for (const key of recoveryOrder.filter((key) => interruptedCutover.staged.has(key))) {
       const snapshot = interruptedCutover.staged.get(key)!;
       const preservedRoutes = dependencies.recoverWorkerCutover
         ? []
@@ -1245,6 +1265,12 @@ export async function installPlatform(
   const cloudflareApiBaseUrl = dependencies.client.apiBaseUrl ?? resolvePinnedApiBaseUrl();
   const runPinnedPlatformWrangler: typeof runPlatformWrangler = (args, accountId, cwd, capture) =>
     runPlatformWranglerAtApiBase(args, accountId, cwd, capture, cloudflareApiBaseUrl);
+  const runParallelPinnedPlatformWrangler: typeof runPlatformWrangler = (
+    args,
+    accountId,
+    cwd,
+    capture,
+  ) => runPlatformWranglerAtApiBase(args, accountId, cwd, capture, cloudflareApiBaseUrl, true);
   const resolvedRuntime = dependencies.runtime ?? resolvePlatformRuntime();
   const runtimeDirectory = resolvedRuntime.directory;
   const runtime = resolvedRuntime.manifest;
@@ -1380,6 +1406,11 @@ export async function installPlatform(
     writeInstallationManifest(manifest);
   }
   assertRequiredPlatformSecrets(plan, manifest, secrets, !!dependencies.prepareAuthentication);
+  if (hyperdriveAction?.action === 'create') {
+    // Reject a URL Hyperdrive can never accept before the claim binds it to this installation.
+    parsePostgresConnectionString(secrets.databaseUrl);
+    assertVoidCreatedHyperdriveTrustsDatabase(secrets.databaseUrl);
+  }
   const pendingSecrets = secretCheckpoint(secrets, workerSecretUpdateIntent);
   writePendingInstallationSecrets(manifest, {
     ...pendingSecrets,
@@ -1984,8 +2015,99 @@ export async function installPlatform(
         secretCheckpoint(secrets, workerSecretUpdateIntent),
       );
     }
-    for (const key of workerKeys) {
+    const parallelWorkerUploads =
+      !dependencies.deployWorker &&
+      !requiresStagedCommit &&
+      !workerSecretUpdateIntent &&
+      !recoveringUnsafeTraffic &&
+      workerActions.length === workerKeys.length &&
+      workerActions.every((action) => action.action === 'update');
+    let workerManifestQueue = Promise.resolve();
+    let workerManifestFailed = false;
+    let workerManifestFailure: unknown;
+    const checkpointWorkerManifest = (
+      update: () => Promise<void>,
+      safetyRecovery = false,
+    ): Promise<void> => {
+      if (!parallelWorkerUploads) {
+        return update();
+      }
+      const result = workerManifestQueue.then(async () => {
+        if (workerManifestFailed && !safetyRecovery) {
+          throw workerManifestFailure;
+        }
+        try {
+          await update();
+        } catch (error) {
+          workerManifestFailed = true;
+          workerManifestFailure = error;
+          throw error;
+        }
+      });
+      workerManifestQueue = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    };
+    let availableUploadSlots = 2;
+    let uploadFailure: unknown;
+    const uploadWaiters: Array<{
+      resolve: () => void;
+      reject: (error: unknown) => void;
+    }> = [];
+    const acquireUploadSlot = async (): Promise<(failure?: unknown) => void> => {
+      if (uploadFailure !== undefined) {
+        throw uploadFailure;
+      }
+      if (availableUploadSlots === 0) {
+        await new Promise<void>((resolve, reject) => uploadWaiters.push({ resolve, reject }));
+      } else {
+        availableUploadSlots--;
+      }
+      return (failure) => {
+        if (failure !== undefined && uploadFailure === undefined) {
+          uploadFailure = failure;
+          for (const waiter of uploadWaiters.splice(0)) {
+            waiter.reject(failure);
+          }
+        }
+        const next = uploadFailure === undefined ? uploadWaiters.shift() : undefined;
+        if (next) {
+          next.resolve();
+        } else {
+          availableUploadSlots++;
+        }
+      };
+    };
+    const workerReady = (parallelWorkerUploads ? workerKeys : []).map(() => {
+      let resolve!: () => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<void>((onResolve, onReject) => {
+        resolve = onResolve;
+        reject = onReject;
+      });
+      return { promise, resolve, reject };
+    });
+    const uploadBatch = Promise.all(workerReady.map((ready) => ready.promise)).then(
+      () => ({ error: null }),
+      (error: unknown) => ({ error }),
+    );
+    const deployOneWorker = async (
+      key: PlatformWorkerKey,
+      waitForPriorWorker?: () => Promise<void>,
+      onReadyForActivation?: () => Promise<void>,
+    ): Promise<void> => {
       dependencies.onProgress?.(`Deploying the ${key} service`);
+      let workerStepStarted = performance.now();
+      const markWorkerStep = (step: string) => {
+        if (process.env.VOID_PLATFORM_TIMINGS === '1') {
+          process.stderr.write(
+            `[platform timing] worker ${key} ${step} ${(performance.now() - workerStepStarted).toFixed(0)} ms\n`,
+          );
+        }
+        workerStepStarted = performance.now();
+      };
       const action = workerActions.find(
         (entry) =>
           entry.key === (key === 'emailGateway' ? 'email-gateway-worker' : `${key}-worker`),
@@ -1997,15 +2119,22 @@ export async function installPlatform(
         zoneId,
         action.action !== 'create',
       );
-      manifest = recordProvisionIntent(manifest, action, now());
-      writeInstallationManifest(manifest);
-      await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
-      await dependencies.revalidateBeforeWorkerDeploy(manifest, action);
+      await checkpointWorkerManifest(async () => {
+        const intended = recordProvisionIntent(manifest!, action, now());
+        if (intended !== manifest) {
+          manifest = intended;
+          writeInstallationManifest(manifest);
+          await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
+        }
+      });
+      await dependencies.revalidateBeforeWorkerDeploy(manifest!, action);
+      markWorkerStep('revalidate');
       const preservedRoutes = dependencies.deployWorker
         ? []
         : action.action === 'create'
           ? []
           : await inventoryUnmanagedPlatformWorkerTraffic(dependencies.client, plan, action.name);
+      markWorkerStep('traffic inventory');
       const workerConfig = mergePlatformWorkerTrafficConfig(configs[key], preservedRoutes);
       const previousWorkerConfig = mergePlatformWorkerTrafficConfig(
         previousConfigs[key],
@@ -2015,19 +2144,27 @@ export async function installPlatform(
         ? await dependencies.deployWorker(workerConfig, workerSecrets, previousWorkerConfig)
         : await deployPlatformWorker(workerConfig, workerSecrets, {
             apiBaseUrl: cloudflareApiBaseUrl,
+            ...(parallelWorkerUploads
+              ? { acquireUploadSlot, onReadyForActivation, waitForPriorWorker }
+              : {}),
+            ...(dependencies.client.request
+              ? { readCloudflare: (path) => dependencies.client.request!(path) }
+              : {}),
             onStaged: async (previousVersionId, stagedVersionId, previousTriggers) => {
-              manifest = recordWorkerCutoverStage(
-                manifest!,
-                workerCutoverGeneration,
-                key,
-                previousVersionId,
-                stagedVersionId,
-                action.name,
-                previousTriggers,
-                now(),
-              );
-              writeInstallationManifest(manifest);
-              await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
+              await checkpointWorkerManifest(async () => {
+                manifest = recordWorkerCutoverStage(
+                  manifest!,
+                  workerCutoverGeneration,
+                  key,
+                  previousVersionId,
+                  stagedVersionId,
+                  action.name,
+                  previousTriggers,
+                  now(),
+                );
+                writeInstallationManifest(manifest);
+                await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
+              });
             },
             onTrafficPublished: async () => {
               if (!dependencies.client.listWorkerDomains || !dependencies.client.listWorkerRoutes) {
@@ -2037,25 +2174,32 @@ export async function installPlatform(
                 dependencies.client.listWorkerDomains(plan.account.id),
                 zoneId ? dependencies.client.listWorkerRoutes(zoneId) : Promise.resolve([]),
               ]);
-              manifest = recordPlatformWorkerTraffic(
-                manifest!,
-                action.name,
-                { customDomains, routes },
-                now(),
-              );
-              writeInstallationManifest(manifest);
-              await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
+              await checkpointWorkerManifest(async () => {
+                const next = recordPlatformWorkerTraffic(
+                  manifest!,
+                  action.name,
+                  { customDomains, routes },
+                  now(),
+                );
+                if (JSON.stringify(next.resources) !== JSON.stringify(manifest!.resources)) {
+                  manifest = next;
+                  writeInstallationManifest(manifest);
+                  await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
+                }
+              });
             },
             onUnsafeTraffic: async () => {
-              manifest = recordWorkerUnsafeTraffic(
-                manifest!,
-                workerCutoverGeneration,
-                key,
-                action.name,
-                now(),
-              );
-              writeInstallationManifest(manifest);
-              await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
+              await checkpointWorkerManifest(async () => {
+                manifest = recordWorkerUnsafeTraffic(
+                  manifest!,
+                  workerCutoverGeneration,
+                  key,
+                  action.name,
+                  now(),
+                );
+                writeInstallationManifest(manifest);
+                await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
+              }, true);
             },
             managedRoutes: preserveDisabled
               ? []
@@ -2110,15 +2254,58 @@ export async function installPlatform(
                 PLATFORM_DISABLED_VALUE,
               );
             },
-            runner: runPinnedPlatformWrangler,
+            runner: parallelWorkerUploads
+              ? runParallelPinnedPlatformWrangler
+              : runPinnedPlatformWrangler,
             workerExisted: action.action !== 'create',
           });
+      markWorkerStep('deploy');
       if (rollback) {
         workerRollbacks.push(rollback);
       }
-      manifest = recordResource(manifest, action, action.name, 'created', now());
-      writeInstallationManifest(manifest);
-      await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
+      await checkpointWorkerManifest(async () => {
+        const recorded = recordResource(manifest!, action, action.name, 'created', now());
+        if (
+          rollback ||
+          dependencies.deployWorker ||
+          JSON.stringify(recorded.resources) !== JSON.stringify(manifest!.resources)
+        ) {
+          manifest = recorded;
+          writeInstallationManifest(manifest);
+          await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
+        }
+      });
+      markWorkerStep('record');
+    };
+    if (parallelWorkerUploads) {
+      const tasks: Array<Promise<void>> = [];
+      for (const [index, key] of workerKeys.entries()) {
+        const priorWorker = tasks.at(-1);
+        const ready = workerReady[index]!;
+        const task = deployOneWorker(key, priorWorker ? () => priorWorker : undefined, async () => {
+          ready.resolve();
+          const batch = await uploadBatch;
+          if (batch.error !== null) {
+            throw batch.error;
+          }
+        });
+        task.then(
+          () => ready.resolve(),
+          (error: unknown) => ready.reject(error),
+        );
+        tasks.push(task);
+      }
+      const results = await Promise.allSettled(tasks);
+      const firstFailure = results.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      );
+      if (firstFailure) {
+        throw firstFailure.reason;
+      }
+    } else {
+      for (const key of workerKeys) {
+        await deployOneWorker(key);
+      }
     }
 
     manifest = setInstallationEndpoints(
@@ -2363,6 +2550,9 @@ export async function installPlatform(
           ? await dependencies.deployWorker(workerConfig, workerSecrets, previousWorkerConfig)
           : await deployPlatformWorker(workerConfig, workerSecrets, {
               apiBaseUrl: cloudflareApiBaseUrl,
+              ...(dependencies.client.request
+                ? { readCloudflare: (path) => dependencies.client.request!(path) }
+                : {}),
               onStaged: async (previousVersionId, stagedVersionId, previousTriggers) => {
                 manifest = recordWorkerCutoverStage(
                   manifest!,
@@ -2388,14 +2578,17 @@ export async function installPlatform(
                   dependencies.client.listWorkerDomains(plan.account.id),
                   zoneId ? dependencies.client.listWorkerRoutes(zoneId) : Promise.resolve([]),
                 ]);
-                manifest = recordPlatformWorkerTraffic(
+                const next = recordPlatformWorkerTraffic(
                   manifest!,
                   action.name,
                   { customDomains, routes },
                   now(),
                 );
-                writeInstallationManifest(manifest);
-                await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
+                if (JSON.stringify(next.resources) !== JSON.stringify(manifest!.resources)) {
+                  manifest = next;
+                  writeInstallationManifest(manifest);
+                  await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
+                }
               },
               onUnsafeTraffic: async () => {
                 manifest = recordWorkerUnsafeTraffic(
@@ -2459,6 +2652,9 @@ export async function installPlatform(
                   PLATFORM_DISABLED_VALUE,
                 );
               },
+              // Traffic opens only after every Worker in this generation is
+              // verified against its own staged checkpoint, so none may be reused.
+              reuseMatchingVersion: false,
               runner: runPinnedPlatformWrangler,
               workerExisted: true,
             });
@@ -2661,7 +2857,13 @@ async function writeRemoteInstallationCheckpointWithoutDatabase(
   manifest: PlatformInstallationManifest,
   databaseLock?: PlatformDatabaseLifecycleLock,
 ): Promise<void> {
+  const startedAt = performance.now();
   await databaseLock?.checkpoint?.(manifest);
+  if (process.env.VOID_PLATFORM_TIMINGS === '1') {
+    process.stderr.write(
+      `[platform timing] database checkpoint ${(performance.now() - startedAt).toFixed(0)} ms\n`,
+    );
+  }
   const routing = manifest.resources.find(
     (resource) =>
       resource.key === 'routing-kv' &&
@@ -2672,12 +2874,18 @@ async function writeRemoteInstallationCheckpointWithoutDatabase(
   if (!routing) {
     return;
   }
+  const kvStartedAt = performance.now();
   await client.putKvValue(
     plan.account.id,
     routing.id,
     REMOTE_INSTALLATION_MANIFEST_KEY,
     JSON.stringify(manifest),
   );
+  if (process.env.VOID_PLATFORM_TIMINGS === '1') {
+    process.stderr.write(
+      `[platform timing] remote checkpoint ${(performance.now() - kvStartedAt).toFixed(0)} ms\n`,
+    );
+  }
 }
 
 function recordProvisionIntent(
@@ -3283,6 +3491,20 @@ export function assertRequiredPlatformSecrets(
   }
 }
 
+/**
+ * A Hyperdrive that Void creates validates the server against public certificate authorities
+ * only, so it cannot honor a private CA that the local database client would trust.
+ */
+function assertVoidCreatedHyperdriveTrustsDatabase(databaseUrl: string): void {
+  // Same last-value-wins rule as the local client; pg ignores an empty value.
+  const sslrootcert = new URL(databaseUrl).searchParams.getAll('sslrootcert').at(-1);
+  if (sslrootcert && sslrootcert !== 'system') {
+    throw new Error(
+      'platform: A Hyperdrive created by Void trusts only public certificate authorities, so it cannot use the certificate authority in DATABASE_URL sslrootcert. If the database certificate comes from a public certificate authority, use sslrootcert=system. Otherwise create a separately managed Hyperdrive that trusts it, then select it with "Use an existing Hyperdrive" when you start a new installation, or set VOID_PLATFORM_HYPERDRIVE_ID, VOID_PLATFORM_HYPERDRIVE_ORIGIN_HOST, and VOID_PLATFORM_HYPERDRIVE_ORIGIN_USER.',
+    );
+  }
+}
+
 /** Make pg's current strict TLS behavior explicit without rewriting saved connection details. */
 export function platformDatabaseClientUrl(databaseUrl: string): string {
   let url: URL;
@@ -3291,9 +3513,19 @@ export function platformDatabaseClientUrl(databaseUrl: string): string {
   } catch {
     return databaseUrl;
   }
-  // Match pg's last-value-wins query parsing and respect explicit libpq compatibility.
+  if (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') {
+    return databaseUrl;
+  }
+  // Match pg's last-value-wins query parsing. libpq reads `sslrootcert=system` as the system
+  // trust store and requires verify-full with it, while pg would open it as a file path. Node's
+  // default CAs with hostname verification give pg the same policy.
+  if (url.searchParams.getAll('sslrootcert').at(-1) === 'system') {
+    url.searchParams.delete('sslrootcert');
+    url.searchParams.set('sslmode', 'verify-full');
+    return url.toString();
+  }
+  // Respect explicit libpq compatibility.
   if (
-    (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') ||
     url.searchParams.getAll('sslmode').at(-1) !== 'require' ||
     url.searchParams.getAll('uselibpqcompat').at(-1) === 'true'
   ) {
@@ -4061,6 +4293,10 @@ export async function claimPlatformDatabaseConnection(
 
 type PlatformWorkerDeploymentOptions = Readonly<{
   apiBaseUrl: string;
+  readCloudflare?: (path: string) => Promise<unknown>;
+  acquireUploadSlot?: () => Promise<(failure?: unknown) => void>;
+  onReadyForActivation?: () => Promise<void>;
+  waitForPriorWorker?: () => Promise<void>;
   inspectNewWorker: () => Promise<'missing' | 'owned'>;
   onStaged: (
     previousVersionId: string | null,
@@ -4080,18 +4316,221 @@ type PlatformWorkerDeploymentOptions = Readonly<{
   publishRoutes: (workerName: string, patterns: ReadonlyArray<string>) => Promise<void>;
   removeCustomDomains: () => Promise<void>;
   retainNewWorker: () => Promise<void>;
+  /** False uploads a new version even when the active one has identical input. */
+  reuseMatchingVersion?: boolean;
   runner: typeof runPlatformWrangler;
   workerExisted: boolean;
 }>;
 
-async function deployPlatformWorker(
+let cachedPlatformUploaderHash: string | null | undefined;
+
+function platformWorkerUploaderHash(): string | null {
+  if (cachedPlatformUploaderHash !== undefined) {
+    return cachedPlatformUploaderHash;
+  }
+  try {
+    const launcher = resolveWranglerArgv(process.cwd())[1];
+    if (!launcher) {
+      return (cachedPlatformUploaderHash = null);
+    }
+    const digest = createHash('sha256');
+    digest.update('platform-uploader:v1\0');
+    digest.update(process.version);
+    digest.update(readFileSync(resolve(dirname(launcher), '..', '..', 'package.json')));
+    const cfDirectory = dirname(fileURLToPath(import.meta.resolve('cf/package.json')));
+    digest.update(readFileSync(join(cfDirectory, 'package.json')));
+    digest.update(readFileSync(join(cfDirectory, 'bin', 'cf')));
+    const cfCodeHash = platformWorkerDirectoryHash(join(cfDirectory, 'dist'));
+    if (!cfCodeHash) {
+      throw new Error('Cloudflare CLI code is unavailable.');
+    }
+    digest.update(cfCodeHash);
+    let dependencyDirectory = dirname(
+      fileURLToPath(import.meta.resolve('@cloudflare/build-output-utils')),
+    );
+    while (!existsSync(join(dependencyDirectory, 'package.json'))) {
+      const parent = dirname(dependencyDirectory);
+      if (parent === dependencyDirectory) {
+        throw new Error('Cloudflare build output package is unavailable.');
+      }
+      dependencyDirectory = parent;
+    }
+    digest.update(readFileSync(join(dependencyDirectory, 'package.json')));
+    const buildOutputCodeHash = platformWorkerDirectoryHash(join(dependencyDirectory, 'dist'));
+    if (!buildOutputCodeHash) {
+      throw new Error('Cloudflare build output code is unavailable.');
+    }
+    digest.update(buildOutputCodeHash);
+    const visited = new Set<string>();
+    const visit = (path: string, name: string) => {
+      if (visited.has(path)) {
+        return;
+      }
+      visited.add(path);
+      const source = readFileSync(path);
+      digest.update(`${name}\0`);
+      digest.update(source);
+      const imports = [
+        ...source
+          .toString('utf8')
+          .matchAll(/\b(?:from|import)\s*(?:\(\s*)?['"](\.{1,2}\/[^'"]+)['"]/g),
+      ]
+        .map((match) => match[1]!)
+        .sort();
+      for (const specifier of imports) {
+        visit(resolve(dirname(path), specifier), specifier);
+      }
+    };
+    visit(launcher, 'launcher');
+    return (cachedPlatformUploaderHash = digest.digest('hex'));
+  } catch {
+    return (cachedPlatformUploaderHash = null);
+  }
+}
+
+function platformWorkerDirectoryHash(directory: string): string | null {
+  if (!lstatSync(directory).isDirectory()) {
+    return null;
+  }
+  const digest = createHash('sha256');
+  const visit = (path: string, prefix: string): boolean => {
+    for (const entry of readdirSync(path, { withFileTypes: true }).sort((a, b) =>
+      a.name.localeCompare(b.name),
+    )) {
+      const relativePath = `${prefix}${entry.name}`;
+      const absolutePath = join(path, entry.name);
+      if (entry.isDirectory()) {
+        digest.update(`directory:${relativePath}\0`);
+        if (!visit(absolutePath, `${relativePath}/`)) {
+          return false;
+        }
+      } else if (entry.isFile()) {
+        digest.update(`file:${relativePath}\0`);
+        digest.update(createHash('sha256').update(readFileSync(absolutePath)).digest('hex'));
+      } else {
+        return false;
+      }
+    }
+    return true;
+  };
+  return visit(directory, '') ? digest.digest('hex') : null;
+}
+
+/** Hash every input that can change a version upload; missing or unusual files disable reuse. */
+export function platformWorkerUploadFingerprint(
+  config: Record<string, unknown>,
+  managedRoutes: ReadonlyArray<string> = [],
+): string | null {
+  const uploaderHash = platformWorkerUploaderHash();
+  if (typeof config.main !== 'string' || !uploaderHash) {
+    return null;
+  }
+  try {
+    const main = lstatSync(config.main);
+    if (!main.isFile()) {
+      return null;
+    }
+    const mainSha256 = createHash('sha256').update(readFileSync(config.main)).digest('hex');
+    const normalized: Record<string, unknown> = { ...config, main: { sha256: mainSha256 } };
+    if (config.assets !== undefined) {
+      const assets = config.assets;
+      if (!assets || typeof assets !== 'object' || Array.isArray(assets)) {
+        return null;
+      }
+      const directory = (assets as Record<string, unknown>).directory;
+      if (typeof directory !== 'string') {
+        return null;
+      }
+      const assetsHash = platformWorkerDirectoryHash(directory);
+      if (!assetsHash) {
+        return null;
+      }
+      normalized.assets = {
+        ...(assets as Record<string, unknown>),
+        directory: assetsHash,
+      };
+    }
+    return createHash('sha256')
+      .update(JSON.stringify({ schema: 2, config: normalized, managedRoutes, uploaderHash }))
+      .digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+function snapshotPlatformWorkerUploadInputs(
+  config: Record<string, unknown>,
+  directory: string,
+): Record<string, unknown> {
+  const main = config.main;
+  if (typeof main !== 'string') {
+    throw new Error('platform: Worker upload has no script artifact.');
+  }
+  const snapshotMain = join(directory, 'worker-upload.js');
+  copyFileSync(main, snapshotMain);
+  const snapshot: Record<string, unknown> = { ...config, main: snapshotMain };
+  if (config.assets !== undefined) {
+    const assets = config.assets as Record<string, unknown>;
+    const sourceDirectory = assets.directory;
+    if (typeof sourceDirectory !== 'string') {
+      throw new Error('platform: Worker upload has no assets directory.');
+    }
+    const snapshotDirectory = join(directory, 'worker-assets');
+    cpSync(sourceDirectory, snapshotDirectory, { recursive: true });
+    snapshot.assets = { ...assets, directory: snapshotDirectory };
+  }
+  return snapshot;
+}
+
+function platformWorkerApiReadRunner(
+  accountId: string,
+  workerName: string,
+  readCloudflare: (path: string) => Promise<unknown>,
+  fallback: typeof runPlatformWrangler,
+): typeof runPlatformWrangler {
+  const base = `/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}`;
+  return async (args, account, cwd, capture) => {
+    try {
+      if (args[0] === 'deployments' && (args[1] === 'status' || args[1] === 'list')) {
+        const response = await readCloudflare(`${base}/deployments`);
+        const deployments =
+          response && typeof response === 'object' && !Array.isArray(response)
+            ? (response as { deployments?: unknown }).deployments
+            : null;
+        if (!Array.isArray(deployments)) {
+          throw new Error(
+            `platform: Cloudflare returned malformed deployment history for ${workerName}.`,
+          );
+        }
+        return {
+          status: args[1] === 'status' && deployments.length === 0 ? 1 : 0,
+          stderr: '',
+          stdout: JSON.stringify(args[1] === 'status' ? deployments[0] : deployments),
+        };
+      }
+      if (args[0] === 'versions' && args[1] === 'view' && args[2]) {
+        const version = await readCloudflare(`${base}/versions/${encodeURIComponent(args[2])}`);
+        return { status: 0, stderr: '', stdout: JSON.stringify(version) };
+      }
+    } catch {
+      // An API read error is not evidence of ownership or deployment lineage.
+      // Run the established cf command for the same check.
+    }
+    return fallback(args, account, cwd, capture);
+  };
+}
+
+export async function deployPlatformWorker(
   config: Record<string, unknown>,
   secrets: Record<string, string> | null,
   options: PlatformWorkerDeploymentOptions,
-): Promise<PlatformWorkerRollback> {
+): Promise<PlatformWorkerRollback | null> {
   const directory = mkdtempSync(join(tmpdir(), 'void-platform-deploy-'));
   const workerName = String(config.name);
   const accountId = String(config.account_id);
+  const readRunner = options.readCloudflare
+    ? platformWorkerApiReadRunner(accountId, workerName, options.readCloudflare, options.runner)
+    : options.runner;
   let activatedVersionId: string | null = null;
   let activatedDeploymentId: string | null = null;
   let uploadedVersionId: string | null = null;
@@ -4102,26 +4541,194 @@ async function deployPlatformWorker(
   const previousTraffic = isolatePlatformWorkerCustomDomains(options.previousConfig);
   let uploadConfig = withoutPlatformWorkerTrafficAttachments(nextTraffic.wranglerConfig);
   const nextTriggers = readTriggerConfigFromObject(nextTraffic.wranglerConfig);
+  const contentHash =
+    secrets === null ? platformWorkerUploadFingerprint(config, options.managedRoutes) : null;
+  const reuseMatchingVersion = options.reuseMatchingVersion !== false;
   let previousTriggers = readTriggerConfigFromObject(previousTraffic.wranglerConfig);
   try {
     const configPath = join(directory, 'wrangler.json');
     writeFileSync(configPath, `${JSON.stringify(uploadConfig, null, 2)}\n`, {
       mode: 0o600,
     });
+    const reconcileExistingVersion = async (
+      versionId: string,
+      triggerConfig: CloudflareTriggerConfig,
+      runner: typeof runPlatformWrangler,
+      deploymentId?: string,
+    ): Promise<null> => {
+      // A reused version still needs its mutable traffic state reconciled.
+      try {
+        const liveTriggersMatch =
+          deploymentId && options.readCloudflare
+            ? await platformWorkerLiveTriggersMatch({
+                accountId,
+                workerName,
+                desired: nextTriggers,
+                readCloudflare: options.readCloudflare,
+              })
+            : false;
+        if (liveTriggersMatch) {
+          const beforeTraffic = await readPlatformWorkerDeployments(
+            configPath,
+            accountId,
+            workerName,
+            runner,
+          );
+          if (
+            beforeTraffic[0]?.id !== deploymentId ||
+            !deploymentRunsOnlyVersion(beforeTraffic[0], versionId)
+          ) {
+            throw new Error(
+              `platform: Worker ${workerName} changed deployment lineage during trigger verification.`,
+            );
+          }
+        } else {
+          const triggers = await stabilizeCloudflareVersionTriggers({
+            configPath,
+            knownTriggerConfigs: { [versionId]: nextTriggers },
+            manageRoutes: false,
+            previousTriggerConfig: triggerConfig,
+            publishEmptyCustomDomains: async () => {
+              await options.removeCustomDomains();
+              return cleanPlatformCommandResult();
+            },
+            runWrangler: platformWorkerCommandRunner(accountId, directory, runner),
+            targetTriggerConfig: nextTriggers,
+            targetVersionId: versionId,
+            workerName,
+          });
+          assertPlatformTriggerStabilization(triggers, workerName, versionId, 'publish');
+        }
+        if (nextTraffic.customDomains.length > 0) {
+          await options.publishCustomDomains(workerName, nextTraffic.customDomains);
+        }
+        if (options.managedRoutes.length > 0) {
+          await options.publishRoutes(workerName, options.managedRoutes);
+        }
+        await options.onTrafficPublished();
+        if (
+          !deploymentId &&
+          (await readActivePlatformWorkerVersion(configPath, accountId, workerName, runner)) !==
+            versionId
+        ) {
+          throw new Error(`platform: Worker ${workerName} changed during traffic reconciliation.`);
+        }
+        if (deploymentId) {
+          const after = await readPlatformWorkerDeployments(
+            configPath,
+            accountId,
+            workerName,
+            runner,
+          );
+          if (after[0]?.id !== deploymentId || !deploymentRunsOnlyVersion(after[0], versionId)) {
+            throw new Error(
+              `platform: Worker ${workerName} changed deployment lineage during reconciliation.`,
+            );
+          }
+        }
+        return null;
+      } catch (error) {
+        const failures = await recoverFailedPlatformWorkerDeployment({
+          checkpointUnsafeTraffic: options.onUnsafeTraffic,
+          closeRoutingGate: options.retainNewWorker,
+          rollback: null,
+          unsafeTraffic: true,
+        });
+        throw new PlatformWorkerRecoveryIncompleteError(
+          `platform: Worker ${workerName} traffic reconciliation failed: ${errorMessage(error)}${
+            failures.length > 0 ? ` Safety recovery also failed: ${failures.join('; ')}` : ''
+          }`,
+          { cause: error },
+        );
+      }
+    };
+    if (options.workerExisted && contentHash && reuseMatchingVersion && options.readCloudflare) {
+      let candidate:
+        | {
+            deploymentId: string;
+            snapshot: Awaited<ReturnType<typeof readActivePlatformWorkerSnapshot>>;
+          }
+        | undefined;
+      let changedDuringRead = false;
+      try {
+        const before = await readPlatformWorkerDeployments(
+          configPath,
+          accountId,
+          workerName,
+          readRunner,
+        );
+        const activeVersion =
+          before[0]?.versions.length === 1 && before[0].versions[0]?.percentage === 100
+            ? before[0].versions[0].versionId
+            : null;
+        if (!activeVersion) {
+          throw new Error(
+            `platform: Existing Worker ${workerName} has no single active production version.`,
+          );
+        }
+        const snapshot = await readPlatformWorkerVersionSnapshot(
+          configPath,
+          accountId,
+          workerName,
+          readPlatformWorkerOwnershipMarker(config),
+          activeVersion,
+          readRunner,
+        );
+        const after = await readPlatformWorkerDeployments(
+          configPath,
+          accountId,
+          workerName,
+          readRunner,
+        );
+        changedDuringRead =
+          before[0]?.id !== after[0]?.id ||
+          !deploymentRunsOnlyVersion(after[0], snapshot.versionId);
+        if (!changedDuringRead && snapshot.contentHash === contentHash) {
+          candidate = { deploymentId: after[0]!.id, snapshot };
+        }
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          (error.message.includes('changed concurrently') ||
+            error.message.includes('does not belong to this installation'))
+        ) {
+          throw error;
+        }
+        // A read error is not evidence of equality; use the established upload path.
+      }
+      if (changedDuringRead) {
+        throw new Error(
+          `platform: Worker ${workerName} changed concurrently while its deployment lineage was inspected.`,
+        );
+      }
+      if (
+        candidate &&
+        platformWorkerUploadFingerprint(config, options.managedRoutes) === contentHash
+      ) {
+        await options.onReadyForActivation?.();
+        await options.waitForPriorWorker?.();
+        return await reconcileExistingVersion(
+          candidate.snapshot.versionId,
+          candidate.snapshot.triggerConfig,
+          readRunner,
+          candidate.deploymentId,
+        );
+      }
+    }
     if (options.workerExisted) {
       const previous = await readActivePlatformWorkerSnapshot(
         configPath,
         accountId,
         workerName,
         readPlatformWorkerOwnershipMarker(config),
-        options.runner,
+        readRunner,
       );
       previousVersionId = previous.versionId;
       const deployments = await readPlatformWorkerDeployments(
         configPath,
         accountId,
         workerName,
-        options.runner,
+        readRunner,
       );
       if (!deploymentRunsOnlyVersion(deployments[0], previousVersionId)) {
         throw new Error(
@@ -4130,6 +4737,20 @@ async function deployPlatformWorker(
       }
       previousDeployment = deployments[0]!;
       previousDeploymentId = previousDeployment.id;
+      if (
+        contentHash &&
+        reuseMatchingVersion &&
+        previous.contentHash === contentHash &&
+        platformWorkerUploadFingerprint(config, options.managedRoutes) === contentHash
+      ) {
+        await options.onReadyForActivation?.();
+        await options.waitForPriorWorker?.();
+        return await reconcileExistingVersion(
+          previousVersionId,
+          previous.triggerConfig,
+          readRunner,
+        );
+      }
       uploadConfig = withoutCompletedPlatformWorkerMigrations(uploadConfig, previous.migrationTag);
       writeFileSync(configPath, `${JSON.stringify(uploadConfig, null, 2)}\n`, {
         mode: 0o600,
@@ -4143,6 +4764,20 @@ async function deployPlatformWorker(
         mergePreservedTriggerRoutes(previousTriggers, options.preservedRoutes),
       );
     }
+    const immutableConfig = contentHash
+      ? snapshotPlatformWorkerUploadInputs(config, directory)
+      : null;
+    const uploadedContentHash = immutableConfig
+      ? platformWorkerUploadFingerprint(immutableConfig, options.managedRoutes)
+      : null;
+    if (immutableConfig) {
+      uploadConfig = {
+        ...uploadConfig,
+        main: immutableConfig.main,
+        ...(immutableConfig.assets === undefined ? {} : { assets: immutableConfig.assets }),
+      };
+      writeFileSync(configPath, `${JSON.stringify(uploadConfig, null, 2)}\n`, { mode: 0o600 });
+    }
     const argv = [
       ...(options.workerExisted ? ['versions', 'upload'] : ['deploy']),
       '--config',
@@ -4152,45 +4787,57 @@ async function deployPlatformWorker(
       '--experimental-auto-create=false',
       ...(!options.workerExisted ? ['--autoconfig=false'] : []),
       '--message',
-      encodeCloudflareVersionMessage([], nextTriggers),
+      encodeCloudflareVersionMessage([], nextTriggers, uploadedContentHash ?? undefined),
     ];
     if (secrets) {
       const secretsPath = join(directory, 'secrets.json');
       writeFileSync(secretsPath, JSON.stringify(secrets), { mode: 0o600 });
       argv.push('--secrets-file', secretsPath);
     }
-    const uploaded = options.workerExisted
-      ? await options.runner(argv, accountId, directory, true)
-      : await runPlatformWranglerForConditionalCreate(
-          argv,
-          accountId,
-          directory,
-          true,
-          workerName,
-          options.apiBaseUrl,
-        );
+    const releaseUploadSlot = await options.acquireUploadSlot?.();
+    let uploaded: CloudflareCommandResult;
+    let uploadError: unknown;
+    try {
+      uploaded = options.workerExisted
+        ? await options.runner(argv, accountId, directory, true)
+        : await runPlatformWranglerForConditionalCreate(
+            argv,
+            accountId,
+            directory,
+            true,
+            workerName,
+            options.apiBaseUrl,
+          );
+      assertCleanPlatformWrangler(
+        uploaded,
+        `${options.workerExisted ? 'upload' : 'bootstrap'} ${workerName}`,
+      );
+    } catch (error) {
+      uploadError = error;
+      throw error;
+    } finally {
+      releaseUploadSlot?.(uploadError);
+    }
     uploadedVersionId = parseUploadedPlatformWorkerVersion(
       `${uploaded.stdout}\n${uploaded.stderr}`,
     );
     if (!options.workerExisted) {
       activatedVersionId = uploadedVersionId;
     }
-    assertCleanPlatformWrangler(
-      uploaded,
-      `${options.workerExisted ? 'upload' : 'bootstrap'} ${workerName}`,
-    );
     if (!uploadedVersionId) {
       throw new Error(
         `platform: Wrangler uploaded ${workerName} without reporting its immutable version id.`,
       );
     }
     await options.onStaged(previousVersionId, uploadedVersionId, previousTriggers);
+    await options.onReadyForActivation?.();
+    await options.waitForPriorWorker?.();
     if (options.workerExisted) {
       const deploymentsBeforeActivation = await readPlatformWorkerDeployments(
         configPath,
         accountId,
         workerName,
-        options.runner,
+        readRunner,
       );
       if (
         deploymentsBeforeActivation[0]?.id !== previousDeploymentId ||
@@ -4222,7 +4869,7 @@ async function deployPlatformWorker(
       configPath,
       accountId,
       workerName,
-      options.runner,
+      readRunner,
     );
     const lineage = classifyPlatformWorkerDeploymentLineage(
       deploymentsAfterActivation,
@@ -4253,7 +4900,7 @@ async function deployPlatformWorker(
           expectedActiveDeploymentId: lineage.deploymentId,
           expectedActiveVersionId: uploadedVersionId,
           restoration: interveningDeployment,
-          runner: options.runner,
+          runner: readRunner,
           workerName,
         });
       } catch (recoveryError) {
@@ -4288,7 +4935,7 @@ async function deployPlatformWorker(
         await options.removeCustomDomains();
         return cleanPlatformCommandResult();
       },
-      runWrangler: platformWorkerCommandRunner(accountId, directory, options.runner),
+      runWrangler: platformWorkerCommandRunner(accountId, directory, readRunner),
       targetTriggerConfig: nextTriggers,
       targetVersionId: uploadedVersionId,
       workerName,
@@ -4318,7 +4965,7 @@ async function deployPlatformWorker(
         removeCustomDomains: options.removeCustomDomains,
         publishCustomDomains: options.publishCustomDomains,
         retainNewWorker: options.retainNewWorker,
-        runner: options.runner,
+        runner: readRunner,
         workerExisted: options.workerExisted,
         workerName,
       });
@@ -4349,7 +4996,7 @@ async function deployPlatformWorker(
               removeCustomDomains: options.removeCustomDomains,
               publishCustomDomains: options.publishCustomDomains,
               retainNewWorker: options.retainNewWorker,
-              runner: options.runner,
+              runner: readRunner,
               workerExisted: options.workerExisted,
               workerName,
             })
@@ -4572,9 +5219,12 @@ async function runPlatformWranglerAtApiBase(
   cwd: string,
   capture: boolean,
   apiBaseUrl = resolvePinnedApiBaseUrl(),
+  parallelWorkerUpload = false,
 ): Promise<CloudflareCommandResult> {
+  const startedAt = performance.now();
   const runner = createDefaultRunWrangler(process.cwd(), {
     launcher: resolveWranglerArgv(process.cwd()),
+    parallelWorkerUpload,
     timeoutMs: PLATFORM_WRANGLER_TIMEOUT_MS,
   });
   const result = await runner([...args], {
@@ -4583,6 +5233,15 @@ async function runPlatformWranglerAtApiBase(
     captureJson: capture,
     cwd,
   });
+  if (process.env.VOID_PLATFORM_TIMINGS === '1') {
+    const operation =
+      args[0] === 'versions' || args[0] === 'deployments'
+        ? `${args[0]} ${args[1] ?? ''}`
+        : (args[0] ?? 'unknown');
+    process.stderr.write(
+      `[platform timing] wrangler ${operation} ${(performance.now() - startedAt).toFixed(0)} ms\n`,
+    );
+  }
   const stdout = result.stdout || '';
   const stderr = result.stderr || '';
   // Void owns progress output. Successful commands may still emit banners and
@@ -4603,6 +5262,7 @@ async function runPlatformWranglerAtApiBase(
 }
 
 type ConditionalWorkerCreateState = {
+  assetSessionStarted: boolean;
   attempted: boolean;
   conflictStatus: number | null;
   created: boolean;
@@ -4656,8 +5316,11 @@ async function startConditionalWorkerCreateProxy(
     throw new Error('platform: Cloudflare API base URL must use HTTP or HTTPS.');
   }
   const basePath = upstreamBase.pathname.replace(/\/+$/, '');
-  const expectedPath = `${basePath}/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}`;
+  const accountPath = `${basePath}/accounts/${encodeURIComponent(accountId)}`;
+  const expectedPath = `${accountPath}/workers/scripts/${encodeURIComponent(workerName)}`;
+  const assetUploadPath = `${accountPath}/workers/assets/upload`;
   const state: ConditionalWorkerCreateState = {
+    assetSessionStarted: false,
     attempted: false,
     conflictStatus: null,
     created: false,
@@ -4691,9 +5354,27 @@ async function startConditionalWorkerCreateProxy(
         ).test(incomingUrl.pathname);
       const isReadOnly =
         incoming.method === 'GET' || incoming.method === 'HEAD' || incoming.method === 'OPTIONS';
+      // A Worker with static assets must register its asset manifest and upload
+      // the missing files before the script PUT that references them. Neither
+      // step attaches anything to a Worker; only the guarded create does.
+      const isAssetUploadSession =
+        incoming.method === 'POST' &&
+        incomingUrl.pathname === `${expectedPath}/assets-upload-session` &&
+        incomingUrl.search === '';
+      const isAssetUpload =
+        incoming.method === 'POST' &&
+        state.assetSessionStarted &&
+        ((incomingUrl.pathname === assetUploadPath && incomingUrl.search === '?base64=true') ||
+          (incomingUrl.search === '' &&
+            incomingUrl.pathname.startsWith(`${assetUploadPath}/`) &&
+            /^[0-9a-f]{32}$/.test(incomingUrl.pathname.slice(assetUploadPath.length + 1))));
       if (
         (isTopLevelWorkerUpload && !isConditionalCreate) ||
-        (!isReadOnly && !isConditionalCreate && !state.created)
+        (!isReadOnly &&
+          !isConditionalCreate &&
+          !isAssetUploadSession &&
+          !isAssetUpload &&
+          !state.created)
       ) {
         state.rejectedMutation = `${incoming.method ?? 'UNKNOWN'} ${incomingUrl.pathname}${
           incomingUrl.pathname === expectedPath && !supportedCreateQuery
@@ -4712,6 +5393,9 @@ async function startConditionalWorkerCreateProxy(
       if (isConditionalCreate) {
         state.attempted = true;
         headers['if-none-match'] = '*';
+      }
+      if (isAssetUploadSession) {
+        state.assetSessionStarted = true;
       }
       const upstreamUrl = new URL(
         `${incomingUrl.pathname}${incomingUrl.search}`,
@@ -5122,6 +5806,7 @@ export async function readActivePlatformWorkerSnapshot(
   expectedOwnershipMarker: string,
   runner: typeof runPlatformWrangler = runPlatformWrangler,
 ): Promise<{
+  contentHash?: string;
   migrationTag: string | null;
   triggerConfig: CloudflareTriggerConfig;
   versionId: string;
@@ -5134,6 +5819,33 @@ export async function readActivePlatformWorkerSnapshot(
       `platform: Existing Worker ${workerName} has no single active production version.`,
     );
   }
+  const snapshot = await readPlatformWorkerVersionSnapshot(
+    configPath,
+    accountId,
+    workerName,
+    expectedOwnershipMarker,
+    versionId,
+    runner,
+    async () => {
+      if ((await readActiveVersion()) !== versionId) {
+        throw new Error(
+          `platform: Worker ${workerName} changed concurrently while its active version was inspected.`,
+        );
+      }
+    },
+  );
+  return snapshot;
+}
+
+async function readPlatformWorkerVersionSnapshot(
+  configPath: string,
+  accountId: string,
+  workerName: string,
+  expectedOwnershipMarker: string,
+  versionId: string,
+  runner: typeof runPlatformWrangler,
+  validateCurrentVersion?: () => Promise<void>,
+): Promise<Awaited<ReturnType<typeof readActivePlatformWorkerSnapshot>>> {
   const result = await runner(
     ['versions', 'view', versionId, '--config', configPath, '--name', workerName, '--json'],
     accountId,
@@ -5173,11 +5885,7 @@ export async function readActivePlatformWorkerSnapshot(
       `platform: Active Worker version ${versionId} for ${workerName} does not belong to this installation.`,
     );
   }
-  if ((await readActiveVersion()) !== versionId) {
-    throw new Error(
-      `platform: Worker ${workerName} changed concurrently while its active version was inspected.`,
-    );
-  }
+  await validateCurrentVersion?.();
   const annotations = (value as { annotations?: unknown }).annotations;
   const message =
     annotations &&
@@ -5192,7 +5900,12 @@ export async function readActivePlatformWorkerSnapshot(
     );
   }
   const migrationTag = readCloudflareVersionMigrationTag(value);
-  return { migrationTag, triggerConfig: metadata.triggerConfig, versionId };
+  return {
+    ...(metadata.contentHash ? { contentHash: metadata.contentHash } : {}),
+    migrationTag,
+    triggerConfig: metadata.triggerConfig,
+    versionId,
+  };
 }
 
 export function withoutCompletedPlatformWorkerMigrations(

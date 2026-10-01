@@ -175,6 +175,18 @@ export async function runInstalledPlatformCommand(args: PlatformArgs): Promise<v
     throw new Error(`platform: Unsupported lifecycle command ${args.subcommand}.`);
   }
   assertNoninteractivePlatformMutationAcknowledged(args, process.stdin.isTTY === true);
+  const timingStart = performance.now();
+  let timingPrevious = timingStart;
+  const markPhase = (phase: string) => {
+    if (process.env.VOID_PLATFORM_TIMINGS !== '1') {
+      return;
+    }
+    const current = performance.now();
+    process.stderr.write(
+      `[platform timing] phase ${phase} ${(current - timingPrevious).toFixed(0)} ms, total ${(current - timingStart).toFixed(0)} ms\n`,
+    );
+    timingPrevious = current;
+  };
   const manifest = await resolveInstalledPlatformManifest(args.selector);
   const operatorCredential = await resolvePlatformCloudflareCredential();
   const operatorClient = new PlatformCloudflareClient(operatorCredential.token);
@@ -251,6 +263,7 @@ export async function runInstalledPlatformCommand(args: PlatformArgs): Promise<v
       includeEmailGateway: runtime!.manifest.artifacts.emailGateway !== undefined,
       enableSandbox: runtime!.manifest.safetyProtocols.sandboxDrain >= 3,
     });
+    markPhase('plan');
     note(
       formatPlatformInstallPlan(plan),
       args.subcommand === 'upgrade'
@@ -321,6 +334,7 @@ export async function runInstalledPlatformCommand(args: PlatformArgs): Promise<v
         databaseUrl,
       },
     );
+    markPhase('ownership');
     const installation =
       args.subcommand === 'enable'
         ? setInstallationDesiredState(manifest, 'enabled', new Date().toISOString())
@@ -367,6 +381,7 @@ export async function runInstalledPlatformCommand(args: PlatformArgs): Promise<v
         },
       );
     }
+    markPhase('runtime token');
     if (!databaseLock?.readAuthenticationState) {
       throw new Error(
         'platform: The database lifecycle lock cannot read authoritative authentication settings.',
@@ -386,7 +401,10 @@ export async function runInstalledPlatformCommand(args: PlatformArgs): Promise<v
         }),
       client,
       databaseRollbackSource: rollbackSourceRuntime ?? undefined,
-      onProgress: (message) => progress?.message(message),
+      onProgress: (message) => {
+        markPhase(message);
+        progress?.message(message);
+      },
       runtime: runtime!,
       replanWorkers: async (recoveryManifest) =>
         (
@@ -400,10 +418,12 @@ export async function runInstalledPlatformCommand(args: PlatformArgs): Promise<v
       revalidateBeforeWorkerDeploy: (manifest, action) =>
         revalidatePlatformInstallAction(client, plan, manifest, action, {
           repairMissing: args.subcommand === 'repair',
+          stableWorkerUpdate: args.subcommand === 'upgrade',
         }),
     });
     // Keep progress visible while the outer database session releases its lock.
     progress.message('Finalizing platform changes');
+    markPhase('installer complete');
     reportResult = () => {
       progress?.stop(
         result.waitingForDns || result.waitingForSandboxDrain
@@ -465,6 +485,7 @@ export async function runInstalledPlatformCommand(args: PlatformArgs): Promise<v
       current.id,
       current.ownershipNonce,
     );
+    markPhase('database lock');
     try {
       const authoritative = releaseDatabase.authoritativeManifest;
       const databaseCheckpointExists = authoritative !== null && authoritative !== undefined;
@@ -480,6 +501,7 @@ export async function runInstalledPlatformCommand(args: PlatformArgs): Promise<v
       await releaseDatabase();
     }
     reportResult?.();
+    markPhase('complete');
   } catch (error) {
     progress?.error(`Platform ${args.subcommand} failed.`);
     progress = undefined;
@@ -776,7 +798,7 @@ export async function uninstallPlatform(
       ? 'Delete safely identifiable installer-owned data (--purge-data); retain Workers, R2, AI Gateway, and external PostgreSQL for manual cleanup.'
       : 'Retain installer-owned data; external PostgreSQL is never deleted.';
   note(
-    `Disable all platform traffic through installation-owned routing storage.\nRetain DNS records, routes, and custom domains for explicit dashboard cleanup.\nDelete installer-owned Queues.\n${dataMessage}\n${
+    `Disable all platform traffic through installation-owned routing storage.\nRetain DNS records, routes, and custom domains for explicit dashboard cleanup.\nDelete installer-owned Queues unless a retained Worker still uses them.\n${dataMessage}\n${
       createdZone
         ? `Keep zone ${createdZone.name} for explicit manual cleanup.`
         : 'Never delete the adopted application zone.'
@@ -908,6 +930,15 @@ export async function uninstallPlatform(
         resourceDeletionPriority(left, deletionPriority) -
         resourceDeletionPriority(right, deletionPriority),
     );
+    // Uninstall retains Workers, and Cloudflare refuses to delete a Queue that
+    // a Worker still binds. Delete Queues only once none of this installation's
+    // Workers exist, so a retained Worker keeps its bindings intact.
+    const queuesInUse =
+      hasRoutingCheckpoint &&
+      resources.some(
+        (resource) => resource.kind === 'queue' && shouldDeleteResource(resource, retainData),
+      ) &&
+      (await hasLiveInstallationWorker(client, next));
     for (const resource of resources) {
       if (resource.state !== 'ready') {
         continue;
@@ -922,7 +953,7 @@ export async function uninstallPlatform(
         await writeLifecycleCheckpoint(client, next);
         continue;
       }
-      if (resource.kind === 'dns-record' && !zone) {
+      if ((resource.kind === 'dns-record' && !zone) || (resource.kind === 'queue' && queuesInUse)) {
         next = updateResourceState(next, resource.key, 'retained');
         await writeLifecycleCheckpoint(client, next);
         continue;
@@ -1092,6 +1123,26 @@ function shouldDeleteResource(resource: InstallationResource, retainData: boolea
     return false;
   }
   return !(retainData && DATA_RESOURCE_KINDS.has(resource.kind));
+}
+
+async function hasLiveInstallationWorker(
+  client: Pick<PlatformManagementClient, 'listWorkerNames'>,
+  manifest: PlatformInstallationManifest,
+): Promise<boolean> {
+  const names = manifest.deployment.resources;
+  const installationWorkers = new Set([
+    names.apiWorker,
+    names.proxyWorker,
+    names.emailGatewayWorker,
+    names.tailWorker,
+    names.dispatchWorker,
+    ...manifest.resources
+      .filter((resource) => resource.kind === 'worker')
+      .map((resource) => resource.name),
+  ]);
+  return (await client.listWorkerNames(manifest.account.id)).some((name) =>
+    installationWorkers.has(name),
+  );
 }
 
 function resourceDeletionPriority(

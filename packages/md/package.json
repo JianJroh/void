@@ -1,6 +1,6 @@
 {
   "name": "@void/md",
-  "version": "0.21.6",
+  "version": "0.21.9",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/voidzero-dev/void.git",
@@ -53,7 +53,7 @@
     "vite": "catalog:",
     "vite-plus": "catalog:",
     "void": "workspace:*",
-    "vue": "^3.5.42"
+    "vue": "^3.5.43"
   },
   "peerDependencies": {
     "vite": "^8.0.0",

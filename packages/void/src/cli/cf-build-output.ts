@@ -25,6 +25,7 @@ import ignore from 'ignore';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'pathslash';
 import { build } from 'vite';
 import { migrateBuiltWranglerConfig } from './cf-config-migrate.ts';
+import { buildContainerImage } from './container-image.ts';
 
 type JsonObject = Record<string, unknown>;
 
@@ -35,7 +36,7 @@ export interface CfBuildOutput {
     versionId: string;
     bindings: ReadonlyArray<{ name: string; type: 'secret_text' | 'secret_key' }>;
   };
-  dispose(): void;
+  dispose(): Promise<void>;
 }
 
 function object(value: unknown): JsonObject | null {
@@ -52,6 +53,11 @@ const moduleTypes: Record<string, ModuleType> = {
   '.cjs': 'cjs',
   '.wasm': 'wasm',
   '.bin': 'data',
+  '.woff': 'data',
+  '.woff2': 'data',
+  '.ttf': 'data',
+  '.otf': 'data',
+  '.eot': 'data',
   '.txt': 'text',
   '.html': 'text',
   '.sql': 'text',
@@ -96,8 +102,11 @@ function copyBundle(
     }
     const type = moduleTypes[extname(entry.name).toLowerCase()];
     if (!type) {
-      return null;
+      throw new Error(
+        `The built Worker contains an unsupported module ${JSON.stringify(name)}. Emit public assets into the client output or configure the plugin that produced this file to run only in the client environment.`,
+      );
     }
+
     const destinationPath = join(destination, name);
     mkdirSync(dirname(destinationPath), { recursive: true });
     if (entry.isSymbolicLink()) {
@@ -127,9 +136,24 @@ export async function prepareCfBuildOutput(
   if (!config.worker) {
     throw new Error('cf did not produce a Worker configuration.');
   }
-  const main = raw.main;
-  if (typeof main !== 'string' || basename(main) !== main || !existsSync(join(source, main))) {
-    return null;
+  if (typeof raw.main !== 'string' || !raw.main) {
+    throw new Error('The built Worker configuration is missing its main entry. Rebuild the app.');
+  }
+  const entry = raw.main.replaceAll('\\', '/');
+  const main = relative(source, resolve(source, entry));
+  if (
+    isAbsolute(entry) ||
+    /^[a-z]:/i.test(entry) ||
+    !main ||
+    main === '..' ||
+    main.startsWith('../')
+  ) {
+    throw new Error('The built Worker main entry must be inside its output directory.');
+  }
+  if (!existsSync(join(source, main))) {
+    throw new Error(
+      `The built Worker main entry ${JSON.stringify(main)} is missing. Rebuild the app.`,
+    );
   }
 
   const assets = object(raw.assets);
@@ -137,6 +161,7 @@ export async function prepareCfBuildOutput(
   if (assetsDirectory !== undefined && typeof assetsDirectory !== 'string') {
     return null;
   }
+  const images: Array<{ dispose(): Promise<void> }> = [];
   const directory = mkdtempSync(join(tmpdir(), 'void-cf-deploy-'));
   try {
     const bundle = getWorkerBundleDir(directory);
@@ -153,9 +178,26 @@ export async function prepareCfBuildOutput(
       manifest: { type: 'complete', mainModule: main, modules },
     });
     for (const container of config.containers ?? []) {
+      const builtContainer: Record<string, unknown> = { ...container };
+      if ('images' in container && container.images) {
+        const prepared: Record<string, unknown> = {};
+        for (const [name, image] of Object.entries(container.images)) {
+          if ('dockerfile' in image) {
+            const built = await buildContainerImage(
+              resolve(source, image.dockerfile),
+              image.buildContext ? resolve(source, image.buildContext) : undefined,
+            );
+            images.push(built);
+            prepared[name] = { localReference: built.localReference };
+          } else {
+            prepared[name] = image;
+          }
+        }
+        builtContainer.images = prepared;
+      }
       await writeContainerConfig({
         root: directory,
-        config: OutputContainerSchema.parse(container),
+        config: OutputContainerSchema.parse(builtContainer),
         directoryName: normalizeDirectoryName(container.name),
       });
     }
@@ -163,6 +205,7 @@ export async function prepareCfBuildOutput(
       const assetPath = resolve(source, assetsDirectory);
       if (!existsSync(assetPath)) {
         rmSync(directory, { recursive: true, force: true });
+        await Promise.all(images.map((image) => image.dispose()));
         return null;
       }
       await writeAssets({ root: directory, sourceDirectory: assetPath });
@@ -173,10 +216,14 @@ export async function prepareCfBuildOutput(
       ...(typeof assetsDirectory === 'string'
         ? { assetsDirectory: resolve(source, assetsDirectory) }
         : {}),
-      dispose: () => rmSync(directory, { recursive: true, force: true }),
+      dispose: async () => {
+        rmSync(directory, { recursive: true, force: true });
+        await Promise.all(images.map((image) => image.dispose()));
+      },
     };
   } catch (error) {
     rmSync(directory, { recursive: true, force: true });
+    await Promise.all(images.map((image) => image.dispose()));
     throw error;
   }
 }

@@ -4,28 +4,26 @@
  * orchestrators still use their established argument/result contracts; this
  * process translates them to the pinned cf CLI. It never invokes Wrangler.
  */
-import { spawnSync } from 'node:child_process';
-import {
-  copyFileSync,
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { readBuildOutput } from '@cloudflare/build-output-utils';
 import { parse } from 'jsonc-parser';
 import { dirname, join, resolve } from 'pathslash';
 import { EnvHttpProxyAgent, fetch as httpFetch } from 'undici';
 import { prepareCfBuildOutput } from './cf-build-output.ts';
+import { persistCfKeyringPreference, readCfSessionCredential } from './cf-session.ts';
+import { cloudflareDeviceCode, printCloudflareLoginPrompt } from './cloudflare-login-output.ts';
 
 type Result = { status: number; stdout: string; stderr: string };
 type Json = Record<string, unknown>;
 
 const cf = join(dirname(fileURLToPath(import.meta.resolve('cf/package.json'))), 'bin', 'cf');
 const args = process.argv.slice(2);
+// This dedicated transport process uses the same OAuth store for login,
+// deployment, and ancillary API calls. API-token overrides still win.
+process.env.CLOUDFLARE_AUTH_USE_KEYRING ??= 'true';
 
 function cfEnvironment(): NodeJS.ProcessEnv {
   // The pinned bin otherwise delegates to any cf installed by the project.
@@ -34,7 +32,7 @@ function cfEnvironment(): NodeJS.ProcessEnv {
     CF_DELEGATION: '1',
     CF_SEND_TELEMETRY: 'false',
     CF_NO_OSC_PROGRESS: '1',
-    CLOUDFLARE_AUTH_USE_KEYRING: 'true',
+    CLOUDFLARE_AUTH_USE_KEYRING: process.env.CLOUDFLARE_AUTH_USE_KEYRING,
   };
   // cf uses Node's built-in fetch for API operations. Node does not consult
   // HTTP(S)_PROXY for fetch unless its environment proxy support is enabled.
@@ -71,24 +69,65 @@ function runCf(command: Array<string>, cwd = process.cwd()): Result {
     maxBuffer: 32 * 1024 * 1024,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const stderr = (child.stderr || child.error?.message || '').replace(
-    /\[(\d{4,})\]/g,
-    '[code: $1]',
-  );
+  const stderr = [
+    child.stderr || '',
+    child.error?.message || '',
+    child.signal ? `Cloudflare CLI terminated by ${child.signal}.` : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+    .replace(/\[(\d{4,})\]/g, '[code: $1]');
   return result(child.status ?? 1, child.stdout ?? '', stderr);
 }
 
-function runInteractiveCf(command: Array<string>): Result {
-  const child = spawnSync(process.execPath, [cf, ...command, '--quiet'], {
-    cwd: process.cwd(),
-    // cf's global quiet flag hides its banner; OAuth's browser URL and device
-    // code are still printed by the login handler for the user to verify.
-    env: { ...cfEnvironment(), CF_QUIET: '1' },
-    shell: false,
-    stdio: 'inherit',
-    windowsHide: true,
+function runInteractiveCf(command: Array<string>): Promise<Result> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [cf, ...command, '--quiet'], {
+      cwd: process.cwd(),
+      env: { ...cfEnvironment(), CF_QUIET: '1' },
+      shell: false,
+      stdio: ['inherit', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    let output = '';
+    let announced = false;
+    let settled = false;
+    const finish = (value: Result) => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+    const collect = (chunk: Buffer) => {
+      output = (output + chunk.toString()).slice(-32_768);
+      if (!announced) {
+        const code = cloudflareDeviceCode(output);
+        if (code) {
+          announced = true;
+          printCloudflareLoginPrompt(code);
+        }
+      }
+    };
+    child.stdout.on('data', collect);
+    child.stderr.on('data', collect);
+    child.once('error', (error) => finish(result(1, '', error.message)));
+    child.once('close', (status, signal) => {
+      if (status === 0) {
+        if (!announced) {
+          printCloudflareLoginPrompt(null);
+        }
+        finish(result(0));
+      } else {
+        finish(
+          result(
+            status ?? 1,
+            '',
+            output.trim() || `Cloudflare login ended${signal ? ` (${signal})` : ''}.`,
+          ),
+        );
+      }
+    });
   });
-  return result(child.status ?? 1, '', child.error?.message ?? '');
 }
 
 async function withBuildOutput(
@@ -124,7 +163,7 @@ async function withBuildOutput(
       await assertExistingProvisionableResources(output.directory, accountId);
       return action(output.directory);
     } finally {
-      output.dispose();
+      await output.dispose();
     }
   } finally {
     rmSync(scratch, { recursive: true, force: true });
@@ -293,6 +332,52 @@ async function clearWorkerCronSchedules(worker: string): Promise<Result> {
   }
 }
 
+async function clearWorkerCustomDomains(worker: string): Promise<Result> {
+  const base = (
+    process.env.CLOUDFLARE_API_BASE_URL ?? 'https://api.cloudflare.com/client/v4'
+  ).replace(/\/$/, '');
+  const endpoint = `${base}/accounts/${encodeURIComponent(accountId())}/workers/scripts/${encodeURIComponent(worker)}/domains/records`;
+  const proxy =
+    process.env.HTTP_PROXY ||
+    process.env.HTTPS_PROXY ||
+    process.env.http_proxy ||
+    process.env.https_proxy
+      ? new EnvHttpProxyAgent()
+      : null;
+  try {
+    const response = await httpFetch(endpoint, {
+      method: 'PUT',
+      headers: { ...(await apiHeaders()), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        override_scope: true,
+        override_existing_origin: false,
+        override_existing_dns_record: false,
+        origins: [],
+      }),
+      redirect: 'error',
+      signal: AbortSignal.timeout(30_000),
+      ...(proxy ? { dispatcher: proxy } : {}),
+    });
+    if (!response.ok) {
+      throw new Error(`Cloudflare rejected the empty custom-domain set (HTTP ${response.status}).`);
+    }
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      throw new Error(
+        `Cloudflare returned HTTP ${response.status} with a non-JSON custom-domain response.`,
+      );
+    }
+    if (object(body).success !== true) {
+      throw new Error(`Cloudflare rejected the empty custom-domain set (HTTP ${response.status}).`);
+    }
+    return result(0);
+  } finally {
+    await proxy?.close();
+  }
+}
+
 async function assertExistingProvisionableResources(
   directory: string,
   account: string,
@@ -416,37 +501,17 @@ async function sessionCredential(): Promise<{ type: 'oauth' | 'api_token'; token
   if (state.authenticated !== true || state.tokenValid !== true) {
     return null;
   }
-  if (typeof state.authSource !== 'string' || !state.authSource.startsWith('OAuth token')) {
-    return null;
-  }
-  // cf's encrypted store is authoritative. Reading the path from whoami would
-  // fail after cf migrates and deletes the old plaintext credential file.
-  const dist = join(dirname(fileURLToPath(import.meta.resolve('cf/package.json'))), 'dist');
-  const entry = readdirSync(dist).find((name) => /^cf-[^/]+\.mjs$/.test(name));
-  if (!entry) {
-    throw new Error('The bundled Cloudflare credential reader is unavailable.');
-  }
-  const module = (await import(pathToFileURL(join(dist, entry)).href)) as {
-    t?: (options: { logger: Record<string, (...args: Array<unknown>) => void> }) => {
-      readAuthCredentials: () => unknown;
-    };
-  };
-  if (typeof module.t !== 'function') {
-    throw new Error('The bundled Cloudflare credential reader is unavailable.');
-  }
-  const noop = () => {};
-  const stored = module
-    .t({ logger: { debug: noop, info: noop, log: noop, warn: noop, error: noop } })
-    .readAuthCredentials();
-  const credential = stored && typeof stored === 'object' ? (stored as Json) : null;
-  return credential && typeof credential.oauth_token === 'string' && credential.oauth_token
-    ? { type: 'oauth', token: credential.oauth_token }
-    : null;
+  const credential = readCfSessionCredential(process.cwd(), state);
+  return credential ? { type: 'oauth', token: credential } : null;
 }
 
 async function auth(): Promise<Result> {
   if (args[0] === 'login') {
-    return runInteractiveCf(['auth', 'login', '--force']);
+    const loggedIn = await runInteractiveCf(['auth', 'login', '--force']);
+    if (loggedIn.status === 0) {
+      persistCfKeyringPreference(process.cwd());
+    }
+    return loggedIn;
   }
   if (args[0] === 'logout') {
     return runCf(['auth', 'logout']);
@@ -463,6 +528,9 @@ async function auth(): Promise<Result> {
         JSON.stringify({ loggedIn: false }),
         'Cloudflare authentication is required.',
       );
+    }
+    if (String(identity.authSource).startsWith('OAuth token from ')) {
+      persistCfKeyringPreference(process.cwd());
     }
     return result(
       0,
@@ -1047,6 +1115,14 @@ async function workerChanges(): Promise<Result> {
       throw new Error('Cloudflare trigger target changed.');
     }
     return await clearWorkerCronSchedules(name);
+  }
+  if (args[0] === 'triggers' && args[1] === 'clear-domains') {
+    const raw = config();
+    const name = workerName();
+    if (raw.name !== name || (raw.account_id !== undefined && raw.account_id !== accountId())) {
+      throw new Error('Cloudflare trigger target changed.');
+    }
+    return await clearWorkerCustomDomains(name);
   }
   if ((args[0] === 'versions' && args[1] === 'upload') || args[0] === 'deploy') {
     const raw = config();

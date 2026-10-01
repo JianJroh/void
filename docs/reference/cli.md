@@ -866,11 +866,11 @@ An upgrade completes after the new Workers pass health checks. If rollout fails,
 
 `platform rollback` restores a compatible earlier runtime without reversing database migrations. Pass its files with `--runtime`. If the installed version is a custom build, also supply that version with `--from-runtime`. Void refuses targets that are incompatible with the current database or predate installed authentication, sandbox-drain, or ownership-aware usage protocols. A later `upgrade` can move forward again.
 
-Uninstall verifies remote ownership before removing anything. Data resources are retained unless you pass `--purge-data`. Workers, R2, AI Gateway, DNS records, routes, custom domains, adopted resources, external PostgreSQL, and zones are always retained for manual review.
+Uninstall verifies remote ownership before removing anything. Data resources are retained unless you pass `--purge-data`. Workers, the Queues they use, R2, AI Gateway, DNS records, routes, custom domains, adopted resources, external PostgreSQL, and zones are always retained for manual review.
 
 Resources that may have been shared or repurposed are retained for manual review. Platform traffic stays blocked. External PostgreSQL and its data are never deleted.
 
-See [Disable and Uninstall](../guide/platform/installation/uninstall.md) for the full removal policy.
+See [Disable and Uninstall](../guide/platform/installation/uninstall.md#remove-retained-resources) for the full removal policy and the cleanup order.
 
 ## Deploy
 
@@ -1522,7 +1522,7 @@ Add a custom domain to the saved target. Hosted Void projects print the DNS reco
 void domain delete <hostname> [--project <name>]
 ```
 
-Direct Cloudflare projects apply the change immediately. Deleting the final custom domain requires `CLOUDFLARE_API_TOKEN` with Workers Scripts: Edit permission because the standard trigger operation does not reconcile an empty custom-domain set; Void fails before changing local or remote state when that token is unavailable.
+Direct Cloudflare projects apply the change immediately. Deleting the final custom domain uses your browser session from `void cloudflare login` or an API token with Workers Scripts: Edit permission. If Cloudflare rejects the change, Void attempts to restore the previous domain configuration and reports whether recovery succeeded.
 
 Remove a custom domain from the saved target. For Cloudflare, this removes the matching `custom_domain` route and synchronizes triggers. If Cloudflare rejects the update, Void restores the exact previous local config and immediately reapplies it remotely. If that second synchronization also fails, the CLI reports that remote route state may be partial instead of claiming a successful rollback.
 

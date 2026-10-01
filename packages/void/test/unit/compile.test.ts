@@ -7,6 +7,7 @@ import {
 import { Hono } from 'hono';
 import { describe, expect, it } from 'vite-plus/test';
 import {
+  compileAssetFallbackHelper,
   compileRouteTable,
   compileWorkerEntry,
   compileNodeApp,
@@ -2449,7 +2450,7 @@ describe('compileWorkerEntry', () => {
       'import { VoidPlatformSandbox as __VoidSandbox, __setSandboxBindingName } from "void/sandbox"',
     );
     expect(code).not.toContain('from "@cloudflare/sandbox"');
-    expect(code).toContain('export { __VoidSandbox as Sandbox };');
+    expect(code).toContain('export { __VoidSandbox as SandboxV1 };');
     expect(code).toContain('__setSandboxBindingName("SANDBOX");');
   });
 
@@ -2470,8 +2471,6 @@ describe('compileWorkerEntry', () => {
       'import { VoidPlatformSandbox as __VoidSandbox, __setSandboxBindingName } from "void/sandbox"',
     );
     expect(code).not.toContain('from "@cloudflare/sandbox"');
-    // User subclass syntax (`class X extends Sandbox`) stays unchanged because
-    // VoidPlatformSandbox itself extends Sandbox.
     expect(code).toContain('export class CodeSandbox extends __VoidSandbox {}');
     expect(code).toContain('__setSandboxBindingName("CODE");');
   });
@@ -2536,6 +2535,47 @@ describe('compileWorkerEntry', () => {
     expect(code).not.toContain('caches.default');
     expect(code).not.toContain('cache.match');
     expect(code).not.toContain('cache.put');
+  });
+
+  it('sets missing asset MIME types while preserving binding headers', async () => {
+    const source = `${compileAssetFallbackHelper()}\nexport { serveWithAssets };`;
+    const { serveWithAssets } = (await import(
+      `data:text/javascript,${encodeURIComponent(source)}`
+    )) as {
+      serveWithAssets: (
+        request: Request,
+        env: { ASSETS: { fetch: () => Promise<Response> } },
+        response: Response,
+      ) => Promise<Response>;
+    };
+
+    for (const [path, expected] of [
+      ['/assets/app.js', 'text/javascript; charset=utf-8'],
+      ['/assets/app.css', 'text/css; charset=utf-8'],
+      ['/assets/logo.webp', 'image/webp'],
+      ['/assets/font.woff2', 'font/woff2'],
+      ['/assets/unknown.xyz', null],
+    ] as const) {
+      const response = await serveWithAssets(
+        new Request(`https://app.test${path}`),
+        { ASSETS: { fetch: async () => new Response(new Uint8Array([1])) } },
+        new Response('not found', { status: 404 }),
+      );
+      expect(response.headers.get('Content-Type')).toBe(expected);
+    }
+
+    const originalType = 'application/javascript';
+    const response = await serveWithAssets(
+      new Request('https://app.test/assets/app.js'),
+      {
+        ASSETS: {
+          fetch: async () =>
+            new Response(new Uint8Array([1]), { headers: { 'Content-Type': originalType } }),
+        },
+      },
+      new Response('not found', { status: 404 }),
+    );
+    expect(response.headers.get('Content-Type')).toBe(originalType);
   });
 
   it('stamps no-store on non-hashed asset responses to avoid edge-cache poisoning across deploys', () => {
