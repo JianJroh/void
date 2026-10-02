@@ -10,6 +10,10 @@ import { Layout } from './views/Layout.tsx';
 
 const TITLES: Partial<Record<AdminPageId, string>> = {
   dashboard: 'Dashboard',
+  plans: 'Plans',
+  planEdit: 'Edit plan',
+  planPreview: 'Review plan change',
+  planResult: 'Plan update',
   users: 'Users',
   userDetail: 'User',
   projects: 'Projects',
@@ -27,6 +31,7 @@ const TITLES: Partial<Record<AdminPageId, string>> = {
   emailProject: 'Project email',
   emailOperation: 'Email operation',
   invitations: 'Invitations',
+  zeroTrust: 'Zero Trust',
 };
 
 export function AdminNavigationFallback({ initialPageData }: { initialPageData: PageObject }) {

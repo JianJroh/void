@@ -84,6 +84,13 @@ describe('CLI help resolver', () => {
     expect(hasHelpPage(['github', 'missing'])).toBe(false);
   });
 
+  it('resolves local resource discovery help and documents JSON output', () => {
+    expect(getHelpPath(['info', '--help'])).toEqual(['info']);
+    expect(hasHelpPage(['info'])).toBe(true);
+    printHelpPage(['info']);
+    expect(vi.mocked(note).mock.calls[0]?.[0]).toContain('void info [--json]');
+  });
+
   it('tracks Cloudflare authentication help pages', () => {
     expect(hasHelpPage(['cloudflare'])).toBe(true);
     expect(hasHelpPage(['cloudflare', 'login'])).toBe(true);
@@ -191,7 +198,7 @@ describe('rendered help advertises the flags the parser honours', () => {
     ]) {
       expect(page).toContain(verb);
     }
-    expect(page).toContain('--subdomain <label|host>');
+    expect(page).not.toContain('--subdomain');
     expect(page).toContain('--project <name>');
 
     for (const verb of ['add', 'status', 'list', 'sync', 'rotate-secret', 'remove']) {
@@ -200,6 +207,8 @@ describe('rendered help advertises the flags the parser honours', () => {
     expect(render(['email', 'domain', 'add'])).toContain(
       'void email domain add <domain> [options]',
     );
+    expect(render(['email', 'domain', 'add'])).not.toContain('--subdomain');
+    expect(render(['email', 'domain', 'add'])).toContain('--project <name>');
 
     const removePage = render(['email', 'domain', 'remove']);
     expect(removePage).not.toContain('--force');

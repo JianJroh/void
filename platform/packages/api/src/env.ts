@@ -100,6 +100,8 @@ export type ApiEnv = Env & {
     VOID_PROXY_TOKEN?: string;
     /** Trusted producer used by the API-owned sandbox lease counter. */
     USAGE_EVENTS_QUEUE?: Queue<unknown>;
+    DEPLOYMENTS_QUEUE?: Queue<{ deploymentId: string }>;
+    DEPLOYMENTS_QUEUE_NAME?: string;
     SITE_DOMAIN?: string;
     PLATFORM_APPLICATION?: string;
     DASHBOARD_URL?: string;
@@ -208,11 +210,18 @@ export type ApiEnv = Env & {
      * a stale runner can't deploy an older commit after being superseded.
      */
     deployBuild?: string;
+    /** Authenticated deploy credential expiry, used for derived build credentials. */
+    deployTokenExpiresAt?: number;
     /**
      * Durable credential provenance already validated by `authMiddleware`.
      * Set only for deploy tokens carrying a credential claim, after the
      * credential's project, owner, revocation, and expiry checks pass.
      */
     deployCredential?: string;
+    /** Only set by the Queue executor, never by request authentication. */
+    deploymentExecution?: {
+      operation: import('./deployment-operation-types.ts').DeploymentOperation;
+      workerFiles: Array<{ name: string; content: Blob }>;
+    };
   };
 };

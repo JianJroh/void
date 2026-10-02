@@ -2,6 +2,16 @@ import { beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 // DurableObject base class isn't available in unit tests — mock it like the
 // other DO suites (cron-scheduler, usage-counter).
+vi.mock('../../src/plans.ts', async () => {
+  const { createDefaultPlanCatalog } = await import('@void/platform/plans');
+  return {
+    readPlanCatalog: vi.fn(async () => createDefaultPlanCatalog()),
+    planFromCatalog: (catalog: ReturnType<typeof createDefaultPlanCatalog>, id: string) =>
+      catalog.plans.find((plan) => plan.id === id) ??
+      catalog.plans.find((plan) => plan.id === 'free')!,
+  };
+});
+
 vi.mock('cloudflare:workers', () => ({
   DurableObject: class {
     ctx: unknown;
@@ -172,6 +182,8 @@ vi.mock('../../src/db.ts', () => ({
         instanceType:
           build.instance_type ?? (plan === 'free' || plan === 'solo' ? 'standard-3' : 'standard-4'),
         ownerPlan: plan,
+        timeoutMinutes:
+          plan === 'custom' ? 0 : plan === 'sponsored' ? 20 : plan === 'free' ? 10 : 15,
       };
     },
   ),
@@ -388,7 +400,7 @@ describe('BuildScheduler.alarm', () => {
     expect(ctx.storage.setAlarm).not.toHaveBeenCalled();
   });
 
-  it('cancels an unproven legacy organization connection before claiming the build', async () => {
+  it('cancels a connection without current authority before claiming the build', async () => {
     db.users.set('u1', { plan: 'free', login: 'octocat' });
     enqueue({ id: 'b1', user_id: 'u1', project_id: 'p1' });
     db.unauthorizedConnectionIds.add('connection-p1');
@@ -402,7 +414,7 @@ describe('BuildScheduler.alarm', () => {
     expect(db.cancelled).toEqual([
       {
         id: 'b1',
-        error: 'github organization repository must be reconnected to renew authorization',
+        error: 'github repository authorization is no longer valid; reconnect the repository',
       },
     ]);
   });

@@ -72,7 +72,9 @@ function operatorHelpTree(): HelpTree {
                         },
                       ]
                     : []),
-                  ...(['list', 'events', 'logs', 'attempts'].includes(entry.action)
+                  ...(['list', 'events', 'logs', 'attempts', 'shared-recipients'].includes(
+                    entry.action,
+                  )
                     ? [
                         {
                           command: '--limit <number>',
@@ -97,11 +99,17 @@ function operatorHelpTree(): HelpTree {
                         ? 'Poll new logs until interrupted or the build ends'
                         : flag === 'ended'
                           ? 'Attest that the original provider execution has ended'
-                          : flag === 'token-stdin' && group === 'email'
-                            ? entry.action === 'domain-remove'
-                              ? 'Read a replacement Cloudflare token for blocked project cleanup from stdin'
-                              : 'Read a scoped Cloudflare API token from stdin'
-                            : 'Read a full API session from stdin for explicit operator session exchange',
+                          : flag === 'protect-new-projects'
+                            ? 'Protect newly created projects by default'
+                            : flag === 'check' && group === 'zero-trust'
+                              ? 'Also check the saved settings against Cloudflare Access (several API calls)'
+                              : flag === 'token-stdin' && group === 'zero-trust'
+                                ? 'Read the Access management API token from stdin'
+                                : flag === 'token-stdin' && group === 'email'
+                                  ? entry.action === 'domain-remove'
+                                    ? 'Read a replacement Cloudflare token for blocked project cleanup from stdin'
+                                    : 'Read a scoped Cloudflare API token from stdin'
+                                  : 'Read a full API session from stdin for explicit operator session exchange',
                   })),
                 ],
               },
@@ -279,6 +287,10 @@ const HELP_TREE: HelpTree = {
         command: 'config auth [command]',
         description: 'Configure login methods, company protection, and provider recovery',
       },
+      {
+        command: 'config plans [command]',
+        description: 'Manage plans, account limits, and the default plan',
+      },
       { command: 'list', description: 'List installed and connected platforms' },
       { command: 'use [id]', description: 'Select the default Void platform' },
       { command: 'status [id]', description: 'Inspect a platform and its health' },
@@ -302,8 +314,65 @@ const HELP_TREE: HelpTree = {
       ...operatorHelpTree(),
       config: {
         summary: 'Configure platform settings.',
-        usage: ['void platform config auth [command] [options]'],
+        usage: ['void platform config <auth|plans> [command] [options]'],
         children: {
+          plans: {
+            summary: 'Manage plans and limits. Without a command, opens interactive configuration.',
+            usage: [
+              'void platform config plans [show|add|set|reset|archive|restore|remove|default|sync] [plan-id] [options]',
+            ],
+            commands: [
+              {
+                command: 'show [id]',
+                description: 'Show the catalog or one plan and its account count',
+              },
+              {
+                command: 'add <id> --copy <id> --name <name>',
+                description: 'Copy an existing plan with a new stable ID',
+              },
+              {
+                command: 'set <id>',
+                description: 'Edit a plan name, limits, or build instance size',
+              },
+              {
+                command: 'reset <id>',
+                description: 'Restore a built-in plan’s original limits and build size',
+              },
+              {
+                command: 'archive <id>',
+                description: 'Keep current accounts while stopping new assignments',
+              },
+              {
+                command: 'restore <id>',
+                description: 'Allow assignments to an archived plan again',
+              },
+              {
+                command: 'remove <id>',
+                description: 'Remove an unused plan or move its accounts to a replacement',
+              },
+              { command: 'default <id>', description: 'Choose the plan new accounts receive' },
+              { command: 'sync', description: 'Continue pending account limit updates' },
+            ],
+            options: [
+              { command: '--connection <id-or-url>', description: 'Select a registered platform' },
+              {
+                command: '--file <path>',
+                description: 'Read plan settings and partial limits from JSON',
+              },
+              {
+                command: '--name <name>',
+                description: 'Set the display name when adding or editing',
+              },
+              { command: '--copy <id>', description: 'Copy this plan when adding a new one' },
+              {
+                command: '--replacement <id>',
+                description: 'Move accounts and any default before removing a plan',
+              },
+              { command: '--plan', description: 'Preview the change and affected accounts' },
+              { command: '--yes', description: 'Apply without prompting' },
+              { command: '--json', description: 'Print structured output' },
+            ],
+          },
           auth: {
             summary:
               'Manage login methods and independent platform protection. Without a command, opens interactive configuration.',
@@ -421,23 +490,48 @@ const HELP_TREE: HelpTree = {
             description:
               'Read login methods and signup policy from nonsecret JSON with environment secret references',
           },
+          {
+            command: '--login-methods <methods>',
+            description: 'Comma-separated github, google, oidc, or cloudflare-access login methods',
+          },
+          {
+            command: '--access-protection',
+            description: 'Protect platform UI and APIs with Cloudflare Access',
+          },
+          { command: '--no-access-protection', description: 'Skip Cloudflare Access protection' },
+          {
+            command: '--hyperdrive <create|id>',
+            description: 'Create Hyperdrive or use the specified existing configuration',
+          },
           { command: '--name <slug>', description: 'Installation name' },
           {
             command: '--workers-dev',
-            description: 'Use workers.dev for testing; add a domain later',
+            description: 'Use workers.dev for testing. Add a domain later.',
           },
           { command: '--display-name <name>', description: 'Human-readable platform name' },
           { command: '--account <id>', description: 'Cloudflare account id' },
           {
             command: '--application-domain <domain>',
-            description: 'Base domain for applications (zone apex is simplest)',
+            description: 'Base domain for applications',
           },
           { command: '--zone <domain>', description: 'Cloudflare zone containing the app domain' },
           {
             command: '--dedicated-zone',
             description: 'Allow zone-wide application catch-all routes',
           },
+          {
+            command: '--no-dedicated-zone',
+            description: 'Skip zone-wide application catch-all routes',
+          },
           { command: '--control-plane-domain <domain>', description: 'Optional API hostname' },
+          {
+            command: '--no-control-plane-domain',
+            description: 'Use the default workers.dev API hostname',
+          },
+          {
+            command: '--dashboard-url <origin>',
+            description: 'HTTPS origin of a separately deployed dashboard',
+          },
           { command: '--plan', description: 'Print the exact plan without changing Cloudflare' },
           { command: '--resume', description: 'Resume the matching local installation' },
           {
@@ -496,6 +590,10 @@ const HELP_TREE: HelpTree = {
       { command: 'list', description: 'List your projects' },
       { command: 'token <command>', description: 'Manage project-scoped CI deploy credentials' },
       { command: 'team <command>', description: 'Manage members and project invitations' },
+      {
+        command: 'zero-trust <command>',
+        description: 'Inspect or override Cloudflare Zero Trust protection',
+      },
       { command: 'logs', description: 'Show runtime logs from the deployed project' },
       { command: 'requests', description: 'Show request-level traffic (status, method, timing)' },
       { command: 'rollback [deployId]', description: 'Roll back to a previous deployment' },
@@ -590,6 +688,32 @@ const HELP_TREE: HelpTree = {
             'void project team decline <invitation-id>',
           ),
         },
+      },
+      'zero-trust': {
+        summary: 'Inspect and manage Zero Trust protection for a Void platform project.',
+        usage: ['void project zero-trust <status|protect|public|reconcile> [options]'],
+        commands: [
+          { command: 'status', description: 'Show desired and effective protection state' },
+          { command: 'protect', description: 'Protect the project' },
+          { command: 'public', description: 'Make the project public' },
+          { command: 'reconcile', description: 'Repair Cloudflare Access configuration drift' },
+        ],
+        options: [{ command: '--project <name>', description: 'Project name override' }],
+        children: Object.fromEntries(
+          ['status', 'protect', 'public', 'reconcile'].map((action) => [
+            action,
+            withProjectOption(
+              action === 'status'
+                ? 'Show desired and effective Zero Trust protection.'
+                : action === 'protect'
+                  ? 'Protect the project with the platform Access policy.'
+                  : action === 'public'
+                    ? 'Make the project public with a managed Access bypass.'
+                    : 'Repair Cloudflare Access configuration drift for the project.',
+              `void project zero-trust ${action} [options]`,
+            ),
+          ]),
+        ),
       },
       logs: {
         summary: 'Show runtime logs from the deployed project.',
@@ -759,7 +883,7 @@ const HELP_TREE: HelpTree = {
         'void email disallow <address> [options]',
       ),
       // The one nested group: verbs parse in email-args.ts (`domain <add|status|list|sync|rotate-secret|remove>`).
-      // Void-platform-only, so `--project` is global here; `--subdomain` is `add`-only.
+      // Void-platform-only; custom inbound requires a zone apex.
       domain: {
         summary: 'Send and receive at your own domain on a Cloudflare zone.',
         usage: ['void email domain <verb> [<domain>] [options]'],
@@ -786,25 +910,12 @@ const HELP_TREE: HelpTree = {
             description: 'Disable the domain assignment and reconcile shared resources',
           },
         ],
-        options: [
-          {
-            command: '--subdomain <label|host>',
-            description: 'On add: register this subdomain instead of the proposed mail.<domain>',
-          },
-          { command: '--project <name>', description: 'Project name override' },
-        ],
+        options: [{ command: '--project <name>', description: 'Project name override' }],
         children: {
           add: {
-            summary:
-              'Register a domain on a Cloudflare zone you own for sending and receiving. Proposes mail.<domain> when the apex already carries MX.',
+            summary: 'Register a Cloudflare zone apex you own for sending and receiving.',
             usage: ['void email domain add <domain> [options]'],
-            options: [
-              {
-                command: '--subdomain <label|host>',
-                description: 'Register this subdomain instead of the proposed mail.<domain>',
-              },
-              { command: '--project <name>', description: 'Project name override' },
-            ],
+            options: [{ command: '--project <name>', description: 'Project name override' }],
           },
           status: withProjectOption(
             'Show a registered domain and its recorded readiness.',
@@ -1221,6 +1332,17 @@ const HELP_TREE: HelpTree = {
       queue: basicSubcommand('Generate a queue consumer file.', 'void gen queue <name>'),
     },
   },
+  info: {
+    summary: 'Inspect persistent resource names in this project without deploying.',
+    usage: ['void info [--json]'],
+    options: [{ command: '--json', description: 'Write structured JSON to stdout' }],
+    examples: [
+      {
+        command: 'void info',
+        description: 'Find names to preserve before moving persistent definitions',
+      },
+    ],
+  },
   prepare: {
     summary: 'Generate .void artifacts without starting Vite.',
     usage: ['void prepare'],
@@ -1251,7 +1373,7 @@ function lifecycleHelp(
   return {
     summary,
     usage: [
-      `void platform ${command} [id] [--plan]${command === 'disable' ? '' : ' [--runtime <path>]'} [--yes]`,
+      `void platform ${command} [id] [--plan]${command === 'disable' ? '' : ' [--runtime <path>]'}${command === 'upgrade' || command === 'repair' ? ' [--dashboard-url <origin>]' : ''} [--yes]`,
     ],
     options: [
       { command: '--plan', description: 'Print the exact plan without making changes' },
@@ -1263,6 +1385,15 @@ function lifecycleHelp(
               description: 'Deploy an integrity-checked runtime directory instead of the package',
             },
           ]),
+      ...(command === 'upgrade' || command === 'repair'
+        ? [
+            {
+              command: '--dashboard-url <origin>',
+              description:
+                'Configure a separately deployed dashboard; omission keeps its saved origin',
+            },
+          ]
+        : []),
       { command: '--yes', description: 'Acknowledge non-interactive Cloudflare changes' },
     ],
   };
@@ -1277,6 +1408,8 @@ export function printGlobalHelp(): void {
       ...globalOptionLines(['init']),
       '',
       globalCommandLine(['migrate'], 'void migrate'),
+      '',
+      globalCommandLine(['info'], 'void info [--json]'),
       '',
       globalCommandLine(['connect'], 'void connect [url]'),
       ...globalOptionLines(['connect']),

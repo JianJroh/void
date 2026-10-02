@@ -342,14 +342,15 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
   const controlPlaneDomain = recorded
     ? (recorded.controlPlane.apiHostname ?? '')
     : args.controlPlaneDomain ||
-      (process.stdin.isTTY
-        ? await promptText('Optional custom API hostname (leave empty for workers.dev):', '', true)
+      (process.stdin.isTTY && !args.noControlPlaneDomain
+        ? await promptText('Custom API hostname. Leave empty for workers.dev:', '', true)
         : '');
   let dedicatedZone = recorded?.application.dedicatedZone ?? args.dedicatedZone;
   if (
     !workersDev &&
     !recorded &&
     !args.dedicatedZone &&
+    !args.dedicatedZoneSpecified &&
     applicationDomain === zoneName &&
     process.stdin.isTTY
   ) {
@@ -413,9 +414,13 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
           user: externalHyperdriveUser,
         }
       : undefined;
+    if (args.hyperdrive && externalHyperdrive && args.hyperdrive !== externalHyperdrive.id) {
+      throw new Error('platform: --hyperdrive conflicts with VOID_PLATFORM_HYPERDRIVE_ID.');
+    }
     if (
       !externalHyperdrive &&
-      process.stdin.isTTY &&
+      args.hyperdrive !== 'create' &&
+      (process.stdin.isTTY || args.hyperdrive) &&
       (!existing || isPlatformSetupDraft(existing)) &&
       !existing?.resources.some((resource) => resource.key === 'hyperdrive')
     ) {
@@ -426,45 +431,49 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
       const suggestedNameAvailable = !configurations.some(
         (resource) => resource.name === suggestedName,
       );
-      const choice = await select({
-        message: 'How should Void set up Hyperdrive?',
-        options: [
-          ...(configurations.length > 0
-            ? [{ value: 'existing', label: 'Use an existing Hyperdrive' }]
-            : []),
-          ...(suggestedNameAvailable
-            ? [{ value: 'create', label: 'Let Void create Hyperdrive', hint: 'recommended' }]
-            : []),
-          { value: 'setup', label: 'Set up a separately managed Hyperdrive' },
-        ],
-      });
+      const choice = args.hyperdrive
+        ? 'existing'
+        : await select({
+            message: 'How should Void set up Hyperdrive?',
+            options: [
+              ...(configurations.length > 0
+                ? [{ value: 'existing', label: 'Use an existing Hyperdrive' }]
+                : []),
+              ...(suggestedNameAvailable
+                ? [{ value: 'create', label: 'Let Void create Hyperdrive', hint: 'recommended' }]
+                : []),
+              { value: 'setup', label: 'Set up a separately managed Hyperdrive' },
+            ],
+          });
       if (isCancel(choice)) {
         throw new Error('platform: Cancelled.');
       }
       if (choice === 'setup') {
         note(
-          `Create a Hyperdrive in account ${accountId} with any unused name${suggestedNameAvailable ? ` (for example ${suggestedName})` : ''}. Point it at the same dedicated PostgreSQL database you will give Void, use a runtime database user, and disable SQL result caching. If your organization manages Hyperdrive, ask its administrator to create it. Then rerun this command and select it from the list.\nSetup: https://developers.cloudflare.com/hyperdrive/get-started/`,
+          `Create a Hyperdrive in account ${accountId} with any unused name${suggestedNameAvailable ? ` such as ${suggestedName}` : ''}. Point it at the same dedicated PostgreSQL database you will give Void, use a runtime database user, and disable SQL result caching. If your organization manages Hyperdrive, ask its administrator to create it. Then rerun this command and select it from the list.\nSetup: https://developers.cloudflare.com/hyperdrive/get-started/`,
           'Set up Hyperdrive first',
         );
         outro('No Cloudflare or local installation state was changed.');
         return;
       }
       if (choice === 'existing') {
-        const selectedId = await select({
-          message: 'Which Hyperdrive should Void use?',
-          options: [...configurations]
-            .sort(
-              (a, b) =>
-                Number(b.name === suggestedName) - Number(a.name === suggestedName) ||
-                a.name.localeCompare(b.name) ||
-                a.id.localeCompare(b.id),
-            )
-            .map((resource) => ({
-              value: resource.id,
-              label: resource.name,
-              hint: resource.name === suggestedName ? `suggested · ${resource.id}` : resource.id,
-            })),
-        });
+        const selectedId =
+          args.hyperdrive ??
+          (await select({
+            message: 'Which Hyperdrive should Void use?',
+            options: [...configurations]
+              .sort(
+                (a, b) =>
+                  Number(b.name === suggestedName) - Number(a.name === suggestedName) ||
+                  a.name.localeCompare(b.name) ||
+                  a.id.localeCompare(b.id),
+              )
+              .map((resource) => ({
+                value: resource.id,
+                label: resource.name,
+                hint: resource.name === suggestedName ? `suggested · ${resource.id}` : resource.id,
+              })),
+          }));
         if (isCancel(selectedId)) {
           throw new Error('platform: Cancelled.');
         }
@@ -487,10 +496,12 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
             `platform: Disable SQL result caching on existing Hyperdrive ${live.name} before installing.`,
           );
         }
-        const confirmed = await confirm({
-          message: `Use ${live.name} for this platform?`,
-          initialValue: true,
-        });
+        const confirmed = args.hyperdrive
+          ? true
+          : await confirm({
+              message: `Use ${live.name} for this platform?`,
+              initialValue: true,
+            });
         if (isCancel(confirmed) || !confirmed) {
           throw new Error('platform: Cancelled.');
         }
@@ -535,12 +546,14 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
     const authenticationSelection = await selectInstallationAuthentication(
       args.authConfig,
       existing?.deployment.authentication,
+      args,
     );
     const planInput = {
       authentication: authenticationSelection.authentication,
       accountId,
       applicationDomain,
       controlPlaneDomain,
+      ...(args.dashboardUrl !== undefined ? { dashboardUrl: args.dashboardUrl } : {}),
       dedicatedZone,
       displayName,
       ...(externalHyperdrive ? { externalHyperdrive } : {}),
@@ -559,6 +572,7 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
       allowUnverifiedAiGateway: true,
       includeEmailGateway: runtime.manifest.artifacts.emailGateway !== undefined,
       enableSandbox: runtime.manifest.safetyProtocols.sandboxDrain >= 3,
+      deploymentExecution: runtime.manifest.deploymentExecution === 1,
     });
     note(
       formatPlatformInstallPlan(plan),
@@ -567,9 +581,10 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
     note(formatPlatformRuntime(runtime), 'Platform runtime');
     if (args.plan) {
       console.log(formatPlatformSetupPlan(plan));
+      outro('Plan complete. No installation changes were made.');
       console.log(
-        `\n${existing ? 'To resume this installation later:' : 'To install with these settings later:'}\n${formatPlatformInstallCommand(
-          {
+        `\n${pc.bold(pc.cyan(existing ? 'Next step: run this command to resume' : 'Next step: run this command to install'))}\n\n${pc.cyan(
+          formatPlatformInstallCommand({
             commandName: cliCommandName(),
             accountId,
             installationSlug,
@@ -577,19 +592,21 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
             applicationDomain,
             zoneName,
             controlPlaneDomain,
+            ...(args.dashboardUrl !== undefined ? { dashboardUrl: args.dashboardUrl } : {}),
             dedicatedZone,
             workersDev,
             authConfig: args.authConfig,
+            authentication: authenticationSelection.authentication,
+            hyperdrive:
+              !existing || isPlatformSetupDraft(existing)
+                ? (externalHyperdrive?.id ?? 'create')
+                : undefined,
             runtime: args.runtime,
             ...(existing ? { resumeId: existing.id } : {}),
             yes: args.yes || process.stdin.isTTY !== true,
-          },
+          }),
         )}\n`,
       );
-      if (!existing && !args.authConfig && process.stdin.isTTY) {
-        console.log('Choose the same login methods when prompted.\n');
-      }
-      outro('No Cloudflare or local installation state was changed.');
       return;
     }
     assertPlatformOperatorCredentialCanApplyPlan(operatorCredential, plan);
@@ -908,6 +925,7 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
             repairMissing: true,
             includeEmailGateway: runtime.manifest.artifacts.emailGateway !== undefined,
             enableSandbox: runtime.manifest.safetyProtocols.sandboxDrain >= 3,
+            deploymentExecution: runtime.manifest.deploymentExecution === 1,
           })
         ).actions.filter((action) => action.kind === 'worker'),
       revalidateBeforeWorkerDeploy: (manifest, action) =>
@@ -931,7 +949,7 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
     });
     progress?.stop(
       result.waitingForDns || result.waitingForSandboxDrain
-        ? 'Installation paused; progress is saved.'
+        ? 'Installation paused. Progress is saved.'
         : 'Platform installed.',
     );
     progress = undefined;
@@ -947,7 +965,7 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
     }
     if (result.waitingForSandboxDrain) {
       note(
-        "The compatible candidate runtime is live in sandbox-drain maintenance mode and application traffic remains disabled. Preview bounded work with `void platform system sandbox-drain --plan`; follow any returned `nextCursor` with `--cursor '<value>'`. Then apply with `void platform system sandbox-drain --yes` and rerun until it reports DB-backed `complete: true`. Rerun this install command afterward to enable traffic.",
+        "The compatible candidate runtime is live in sandbox-drain maintenance mode and application traffic remains disabled. Preview bounded work with `void platform system sandbox-drain --plan`. Follow any returned `nextCursor` with `--cursor '<value>'`. Then apply with `void platform system sandbox-drain --yes` and rerun until it reports DB-backed `complete: true`. Rerun this install command afterward to enable traffic.",
         'Waiting for managed Sandbox drain',
       );
       outro(`Installation ${result.manifest.id} is safely checkpointed.`);
@@ -958,7 +976,7 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
     );
     log.info(`API URL: ${plan.apiUrl}`);
     if (result.emailOperationId) {
-      log.info(`Shared email routing ready (operation ${result.emailOperationId}).`);
+      log.info(`Shared email routing ready. Operation: ${result.emailOperationId}.`);
     }
     const completedAuthCode = readInstallationRecoverySecrets(result.manifest)?.authBootstrapCode;
     if (result.setupPending && completedAuthCode) {
@@ -1027,6 +1045,7 @@ export async function verifyPlatformAiGatewayPlan(
       authoritativeProvisionIntents,
       includeEmailGateway: preview.actions.some((entry) => entry.key === 'email-gateway-worker'),
       enableSandbox: preview.deployment.capabilities.sandbox,
+      deploymentExecution: preview.actions.some((entry) => entry.key === 'deployment-queue'),
     });
   } catch (error) {
     if (

@@ -303,7 +303,7 @@ export const projects = pgTable(
       .notNull()
       .references(() => users.id),
     slug: text('slug').notNull(),
-    type: text('mode').notNull().default('worker').$type<'void' | 'spa' | 'static' | 'framework'>(),
+    type: text('mode').notNull().default('void').$type<'void' | 'spa' | 'static' | 'framework'>(),
     active_deployment_id: text('active_deployment_id'),
     websocket_version: integer('websocket_version').notNull().default(0),
     status: text('status').notNull().default('active').$type<'active' | 'deleting'>(),
@@ -473,6 +473,51 @@ export const projectAccessEvents = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Project Cloudflare Access state. The desired/effective split is deliberate:
+// publication is a multi-system operation and dispatch must keep enforcing the
+// last completed state until the corresponding Access application mutation has
+// been verified. Application ids are durable recovery handles for retries and
+// project teardown.
+// ---------------------------------------------------------------------------
+export const projectZeroTrust = pgTable(
+  'project_zero_trust',
+  {
+    project_id: text('project_id')
+      .primaryKey()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    desired_protected: boolean('desired_protected').notNull().default(false),
+    effective_protected: boolean('effective_protected').notNull().default(false),
+    // `ready` means routes and Access applications match the desired protection.
+    status: text('status').notNull().default('ready').$type<'ready' | 'reconciling' | 'error'>(),
+    bypass_application_id: text('bypass_application_id'),
+    bypass_application_name: text('bypass_application_name'),
+    protected_application_id: text('protected_application_id'),
+    protected_application_name: text('protected_application_name'),
+    protected_application_audience: text('protected_application_audience'),
+    // Last custom hostname whose routing protection was cleared. Public
+    // projects can have more domains than fit in one reconciliation run.
+    routing_cursor: text('routing_cursor'),
+    // Id of the installation operation this row last completed. Public rows
+    // complete with their bypass; protected rows only after the wildcard phase.
+    reconciled_operation: text('reconciled_operation'),
+    last_error: text('last_error'),
+    created_at: timestamp('created_at', { mode: 'string' }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('idx_project_zero_trust_status').on(table.status, table.updated_at),
+    check(
+      'project_zero_trust_status_check',
+      sql`${table.status} IN ('ready', 'reconciling', 'error')`,
+    ),
+    check(
+      'project_zero_trust_ready_check',
+      sql`${table.status} <> 'ready' OR ${table.desired_protected} = ${table.effective_protected}`,
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // deployments
 // ---------------------------------------------------------------------------
 export const deployments = pgTable(
@@ -526,6 +571,50 @@ export const deployments = pgTable(
     index('idx_deployments_project_id').on(table.project_id, table.created_at),
     index('idx_deployments_project_status').on(table.project_id, table.status),
     index('idx_deployments_created_id').on(table.created_at, table.id),
+  ],
+);
+
+// The receipt survives a no-op deployment's placeholder deletion. Execution is
+// claimed once; an expired invocation is reconciled, never replayed.
+export const deploymentOperations = pgTable(
+  'deployment_operations',
+  {
+    id: text('id').primaryKey(),
+    project_id: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    actor_id: text('actor_id').notNull(),
+    build_id: text('build_id'),
+    original_active_id: text('original_active_id'),
+    cli_version: text('cli_version'),
+    idempotency_key: text('idempotency_key').notNull(),
+    input_digest: text('input_digest').notNull(),
+    input_prefix: text('input_prefix').notNull(),
+    payload: jsonb('payload')
+      .notNull()
+      .$type<import('./deployment-operation-types.ts').DeploymentInput>(),
+    status: text('status')
+      .notNull()
+      .default('queued')
+      .$type<'queued' | 'running' | 'recovering' | 'terminal'>(),
+    owner_id: text('owner_id'),
+    lease_expires_at: timestamp('lease_expires_at', { mode: 'string' }),
+    next_dispatch_at: timestamp('next_dispatch_at', { mode: 'string' }).notNull().defaultNow(),
+    events: jsonb('events')
+      .notNull()
+      .default(sql`'[]'::jsonb`)
+      .$type<Array<import('./deployment-operation-types.ts').DeploymentProgress>>(),
+    last_seq: integer('last_seq').notNull().default(0),
+    inputs_deleted: boolean('inputs_deleted').notNull().default(false),
+    created_at: timestamp('created_at', { mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('idx_deployment_operations_key').on(
+      table.project_id,
+      table.actor_id,
+      table.idempotency_key,
+    ),
+    index('idx_deployment_operations_dispatch').on(table.status, table.next_dispatch_at),
   ],
 );
 
@@ -1039,11 +1128,12 @@ export const projectDatabaseCredentials = pgTable('project_database_credentials'
 // ---------------------------------------------------------------------------
 // github_installations — GitHub App installations.
 //
-// `user_id` is nullable to support install-before-signin: a user can install
-// the GitHub App before (or instead of) signing in, in which case the
-// installation lands here unlinked and is backfilled in the GitHub OAuth
-// callback (`linkGitHubInstallationToUser`). `repositories` mirrors the
-// installation's repository selection as a JSON array of `{ full_name, id }`.
+// `user_id` is the owner of a personal (account_type='User') installation and
+// is always null for organization installations, which are reached only
+// through `github_installation_members`. A personal installation can also be
+// unlinked (install-before-signin) until the GitHub OAuth callback backfills it
+// (`linkGitHubInstallationToUser`). `repositories` mirrors the installation's
+// repository selection as a JSON array of `{ full_name, id }`.
 // ---------------------------------------------------------------------------
 export type GitHubInstallationRepository = Readonly<{
   full_name: string;
@@ -1110,19 +1200,13 @@ export const githubConnections = pgTable(
     // could match a DIFFERENT repository to this connection and deploy to the
     // wrong project. Webhook (`repository.id`) and OIDC (`claims.repository_id`)
     // resolution match on this immutable id, treating `repo_full_name` as
-    // display/fetch metadata. Nominally nullable, but the resolvers FAIL CLOSED:
-    // when the caller has an id, a null-id row is NOT matched by `repo_full_name`
-    // fallback (a renamed-and-reused name could otherwise authorize the wrong
-    // project). New connections always populate it at connect time; the only
-    // name fallback left is for callers with no id at all (malformed/partial
-    // webhook). A `repo_full_name` match is used solely in that no-id case.
+    // display/fetch metadata. Every connection populates it at connect time;
+    // a row without one never matches a resolver (fail closed).
     repository_id: text('repository_id'),
-    // The project owner or administrator whose own GitHub OAuth token proved
-    // repository access during connect. NULL on legacy rows. Runtime
-    // authorization accepts a current row only while this still names the
-    // owner or a project administrator. Legacy organization rows without
-    // per-repository proof fail closed; legacy personal rows retain their
-    // owner-installation fallback.
+    // The project owner or administrator who proved repository access during
+    // connect. Runtime authorization accepts the row only while this still
+    // names the owner or a project administrator; a row without one has no
+    // authority.
     authorized_by_user_id: text('authorized_by_user_id').references(() => users.id, {
       onDelete: 'set null',
     }),

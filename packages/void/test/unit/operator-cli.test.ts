@@ -19,6 +19,10 @@ import {
 } from '../../src/cli/platform-registry.ts';
 
 const keyring = vi.hoisted(() => ({ read: vi.fn(), write: vi.fn(), remove: vi.fn() }));
+const mutationPrompt = vi.hoisted(() => ({ question: vi.fn(), close: vi.fn() }));
+vi.mock('node:readline/promises', () => ({
+  createInterface: () => mutationPrompt,
+}));
 vi.mock('../../src/cli/keyring.ts', () => ({
   readKeyringPassword: keyring.read,
   writeKeyringPassword: keyring.write,
@@ -61,13 +65,127 @@ describe('operator argument and help coverage', () => {
       const parameters = (command.positional ?? []).map((name) =>
         name === 'type' ? 'email' : `${name}-value`,
       );
-      const result = parsePlatformArgs([command.group, command.action, ...parameters]);
+      const configureFlags =
+        command.group === 'zero-trust' && command.action === 'configure'
+          ? [
+              '--identity-providers',
+              'idp-1',
+              '--policies',
+              'policy-1',
+              '--existing-projects',
+              'public',
+              '--token-stdin',
+            ]
+          : [];
+      const result = parsePlatformArgs([
+        command.group,
+        command.action,
+        ...parameters,
+        ...configureFlags,
+      ]);
       expect(result).toMatchObject({
         subcommand: 'operator',
         group: command.group,
         action: command.action,
       });
     }
+  });
+  it('parses Zero Trust configuration and project overrides without accepting a token in argv', () => {
+    expect(
+      parseOperatorArgs([
+        'zero-trust',
+        'configure',
+        '--identity-providers',
+        'idp-1,idp-2',
+        '--policies',
+        'policy-1, policy-2',
+        '--existing-projects',
+        'public',
+        '--protect-new-projects',
+        '--token-stdin',
+      ]),
+    ).toMatchObject({
+      method: 'POST',
+      path: '/zero-trust/configure',
+      tokenStdin: true,
+      body: {
+        identityProviderIds: ['idp-1', 'idp-2'],
+        policyIds: ['policy-1', 'policy-2'],
+        existingProjects: 'public',
+        protectNewProjects: true,
+      },
+    });
+    expect(parseOperatorArgs(['zero-trust', 'project-protect', 'project/id'])).toMatchObject({
+      path: '/zero-trust/projects/project%2Fid',
+      body: { protected: true },
+    });
+    expect(parseOperatorArgs(['zero-trust', 'project-public', 'project/id'])).toMatchObject({
+      body: { protected: false },
+    });
+    // Reconfiguring an enabled installation omits the existing-project choice.
+    const reconfigure = parseOperatorArgs([
+      'zero-trust',
+      'configure',
+      '--identity-providers',
+      'idp-1',
+      '--policies',
+      'policy-1',
+      '--token-stdin',
+    ]);
+    expect(reconfigure.body).toEqual({
+      identityProviderIds: ['idp-1'],
+      policyIds: ['policy-1'],
+      protectNewProjects: false,
+    });
+    expect(() =>
+      parseOperatorArgs([
+        'zero-trust',
+        'configure',
+        '--account',
+        'account-1',
+        '--identity-providers',
+        'idp-1',
+        '--policies',
+        'policy-1',
+        '--token-stdin',
+      ]),
+    ).toThrow("Unknown flag '--account'");
+    expect(parseOperatorArgs(['zero-trust', 'status'])).toMatchObject({
+      method: 'GET',
+      path: '/zero-trust',
+      query: {},
+      body: {},
+    });
+    expect(parseOperatorArgs(['zero-trust', 'status', '--check'])).toMatchObject({
+      method: 'GET',
+      query: { check: 'true' },
+      body: {},
+    });
+    expect(() =>
+      parseOperatorArgs([
+        'zero-trust',
+        'configure',
+        '--identity-providers',
+        'idp-1',
+        '--policies',
+        'policy-1',
+        '--existing-projects',
+        'public',
+      ]),
+    ).toThrow('requires --token-stdin');
+    expect(() =>
+      parseOperatorArgs([
+        'zero-trust',
+        'configure',
+        '--identity-providers',
+        'idp-1',
+        '--policies',
+        'policy-1',
+        '--existing-projects',
+        'invalid',
+        '--token-stdin',
+      ]),
+    ).toThrow('--existing-projects must be protected or public');
   });
   it('accepts explicit flags before the operator group and encodes IDs', () => {
     expect(
@@ -169,6 +287,47 @@ describe('operator argument and help coverage', () => {
     expect(() => parseOperatorArgs(['email', 'logs', 'project', '--limit', '101'])).toThrow();
     expect(() => parseOperatorArgs(['email', 'logs', 'project', '--follow'])).toThrow();
   });
+  it('routes deployment asset migration and its resume cursor through mutation help', () => {
+    expect(
+      parsePlatformArgs([
+        'deployment',
+        'migrate-assets',
+        'deployment / id',
+        '--cursor',
+        'opaque-cursor',
+        '--plan',
+      ]),
+    ).toMatchObject({
+      method: 'POST',
+      path: '/deployments/deployment%20%2F%20id/migrate-assets',
+      body: { cursor: 'opaque-cursor' },
+      plan: true,
+    });
+    expect(hasHelpPage(['platform', 'deployment', 'migrate-assets'])).toBe(true);
+    expect(() =>
+      parseOperatorArgs(['deployment', 'migrate-assets', 'id', '--plan', '--yes']),
+    ).toThrow('--plan and --yes cannot be combined');
+  });
+  it('routes asset migration inventory with bounded pagination and nested help', () => {
+    expect(
+      parsePlatformArgs(['system', 'asset-migrations', '--page', '2', '--limit', '100']),
+    ).toMatchObject({
+      method: 'GET',
+      path: '/system/asset-migrations',
+      query: { page: '2', limit: '100' },
+      body: {},
+    });
+    expect(hasHelpPage(['platform', 'system', 'asset-migrations'])).toBe(true);
+    expect(() => parseOperatorArgs(['system', 'asset-migrations', '--limit', '101'])).toThrow(
+      '--limit must be an integer from 1 to 100',
+    );
+    expect(() => parseOperatorArgs(['system', 'asset-migrations', '--page', '0'])).toThrow(
+      '--page must be an integer from 1 to 1000000',
+    );
+    expect(() => parseOperatorArgs(['system', 'asset-migrations', '--yes'])).toThrow(
+      "Unknown flag '--yes'",
+    );
+  });
   it('routes attempt inspection and attested resolution with a bounded audit reason', () => {
     expect(
       parseOperatorArgs(['email', 'attempts', '--project', 'my-project', '--page', '2']),
@@ -216,6 +375,40 @@ describe('operator argument and help coverage', () => {
     });
   });
   it('routes the email domain verbs', () => {
+    expect(
+      parseOperatorArgs([
+        'email',
+        'shared-recipients',
+        '--project',
+        'app',
+        '--page',
+        '2',
+        '--limit',
+        '10',
+      ]),
+    ).toMatchObject({
+      method: 'GET',
+      path: '/email/shared-recipients',
+      query: { project: 'app', page: '2', limit: '10' },
+    });
+    expect(
+      parseOperatorArgs([
+        'email',
+        'shared-recipient-resolve',
+        'erec/id',
+        '--ended',
+        '--outcome',
+        'not-applied',
+        '--reason',
+        'Provider audit confirms absence',
+        '--yes',
+      ]),
+    ).toMatchObject({
+      method: 'POST',
+      path: '/email/shared-recipients/erec%2Fid/resolve',
+      body: { ended: true, outcome: 'not-applied', reason: 'Provider audit confirms absence' },
+      yes: true,
+    });
     expect(parseOperatorArgs(['email', 'domains', '--project', 'hr-portal'])).toMatchObject({
       method: 'GET',
       path: '/email/domains',
@@ -319,6 +512,251 @@ describe('operator credential isolation', () => {
     );
     keyring.write.mockReturnValue(false);
     expect(() => saveOperatorToken('https://one.example', 'operator')).toThrow('keychain');
+  });
+});
+
+describe('deployment asset migration', () => {
+  const target = 'deployment / id';
+  const preview = (expected = 'digest-1') => ({
+    dryRun: true,
+    action: 'deployment.migrate-assets',
+    target,
+    expected,
+    assets: 2,
+  });
+  const applied = (nextCursor: string | null) => ({
+    dryRun: false,
+    action: 'deployment.migrate-assets',
+    target,
+    complete: nextCursor === null,
+    nextCursor,
+    verified: 2,
+  });
+  beforeEach(() => {
+    vi.stubEnv('VOID_API_URL', 'https://one.example');
+    vi.stubEnv('VOID_OPERATOR_TOKEN', 'operator');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  });
+  it.each([false, true])(
+    'reads asset inventory without a mutation in JSON=%s mode',
+    async (json) => {
+      const inventory = {
+        deployments: [
+          {
+            id: 'deployment-1',
+            projectId: 'project-1',
+            slug: 'example',
+            active: true,
+            retained: true,
+            bundleStored: true,
+            assets: 2,
+            needsMigration: 2,
+            invalid: false,
+          },
+        ],
+        pagination: { page: 2, limit: 100, total: 102, totalPages: 2 },
+      };
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(inventory));
+      vi.stubGlobal('fetch', fetcher);
+      await runOperatorCommand(
+        parseOperatorArgs([
+          'system',
+          'asset-migrations',
+          '--page',
+          '2',
+          '--limit',
+          '100',
+          ...(json ? ['--json'] : []),
+        ]),
+      );
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      expect(String(fetcher.mock.calls[0]![0])).toBe(
+        'https://one.example/operator/v1/system/asset-migrations?page=2&limit=100',
+      );
+      expect(fetcher.mock.calls[0]![1]).toMatchObject({ method: 'GET' });
+      expect(fetcher.mock.calls[0]![1]!.body).toBeUndefined();
+      if (json) {
+        expect(console.log).toHaveBeenCalledWith(JSON.stringify(inventory));
+      } else {
+        const printed = vi
+          .mocked(console.log)
+          .mock.calls.map(([line]) => String(line))
+          .join('\n');
+        expect(printed).toContain('needs Migration: 2');
+        expect(printed).toContain('invalid: false');
+        expect(printed).toContain('bundle Stored: true');
+        expect(printed).toContain('total Pages: 2');
+      }
+    },
+  );
+  it('previews only the requested starting batch in plan mode', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(preview()));
+    vi.stubGlobal('fetch', fetcher);
+    await runOperatorCommand(
+      parseOperatorArgs([
+        'deployment',
+        'migrate-assets',
+        target,
+        '--cursor',
+        'resume-cursor',
+        '--plan',
+        '--json',
+      ]),
+    );
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(String(fetcher.mock.calls[0]![0])).toBe(
+      'https://one.example/operator/v1/deployments/deployment%20%2F%20id/migrate-assets',
+    );
+    expect(JSON.parse(String(fetcher.mock.calls[0]![1]!.body))).toEqual({
+      cursor: 'resume-cursor',
+      dryRun: true,
+    });
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining('all remaining asset batches'),
+    );
+  });
+  it('previews and pins every batch until complete, retaining each successful cursor', async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(preview('digest-1')))
+      .mockResolvedValueOnce(Response.json(applied('cursor-1')))
+      .mockResolvedValueOnce(Response.json(preview('digest-2')))
+      .mockResolvedValueOnce(Response.json(applied(null)));
+    vi.stubGlobal('fetch', fetcher);
+    await runOperatorCommand(
+      parseOperatorArgs(['deployment', 'migrate-assets', target, '--yes', '--json']),
+    );
+    expect(fetcher.mock.calls.map(([, init]) => JSON.parse(String(init!.body)))).toEqual([
+      { dryRun: true },
+      { expected: 'digest-1' },
+      { cursor: 'cursor-1', dryRun: true },
+      { cursor: 'cursor-1', expected: 'digest-2' },
+    ]);
+    expect(vi.mocked(console.log).mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+      applied('cursor-1'),
+      applied(null),
+    ]);
+    expect(process.stderr.write).not.toHaveBeenCalled();
+  });
+  it('applies the exact resumed cursor and stops at completed migration', async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(preview()))
+      .mockResolvedValueOnce(Response.json(applied(null)));
+    vi.stubGlobal('fetch', fetcher);
+    await runOperatorCommand(
+      parseOperatorArgs([
+        'deployment',
+        'migrate-assets',
+        target,
+        '--cursor',
+        'resume-cursor',
+        '--yes',
+      ]),
+    );
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(String(fetcher.mock.calls[1]![1]!.body))).toEqual({
+      cursor: 'resume-cursor',
+      expected: 'digest-1',
+    });
+  });
+  it('asks once before continuing all previewed batches in an interactive terminal', async () => {
+    vi.stubGlobal('process', {
+      ...process,
+      stdin: { ...process.stdin, isTTY: true },
+      stderr: { ...process.stderr, isTTY: true, write: vi.fn() },
+    });
+    mutationPrompt.question.mockResolvedValue('yes');
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(preview()))
+      .mockResolvedValueOnce(Response.json(applied('cursor-1')))
+      .mockResolvedValueOnce(Response.json(preview('digest-2')))
+      .mockResolvedValueOnce(Response.json(applied(null)));
+    vi.stubGlobal('fetch', fetcher);
+    await runOperatorCommand(parseOperatorArgs(['deployment', 'migrate-assets', target]));
+    expect(mutationPrompt.question).toHaveBeenCalledTimes(1);
+    expect(mutationPrompt.close).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(process.stderr.write).toHaveBeenCalledTimes(2);
+  });
+  it.each([
+    { action: 'deployment.delete' },
+    { target: 'another-deployment' },
+    { expected: '' },
+    { expected: null },
+    { dryRun: false },
+  ])('rejects an invalid asset preview %j before applying', async (changes) => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(Response.json({ ...preview(), ...changes }));
+    vi.stubGlobal('fetch', fetcher);
+    await expect(
+      runOperatorCommand(parseOperatorArgs(['deployment', 'migrate-assets', target, '--yes'])),
+    ).rejects.toMatchObject({ code: 'invalid_preview' });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    { nextCursor: undefined },
+    { nextCursor: '' },
+    { nextCursor: 1 },
+    { nextCursor: 'resume-cursor' },
+    { complete: true },
+    { action: 'deployment.delete' },
+    { target: 'another-deployment' },
+  ])('stops after a malformed or repeated continuation %j without retrying', async (changes) => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(preview()))
+      .mockResolvedValueOnce(Response.json({ ...applied('cursor-1'), ...changes }));
+    vi.stubGlobal('fetch', fetcher);
+    await expect(
+      runOperatorCommand(
+        parseOperatorArgs([
+          'deployment',
+          'migrate-assets',
+          target,
+          '--cursor',
+          'resume-cursor',
+          '--yes',
+        ]),
+      ),
+    ).rejects.toMatchObject({
+      code: 'invalid_response',
+      details: { lastSuccessfulCursor: 'resume-cursor' },
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+  it('detects a cursor cycle after multiple successful batches', async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(preview()))
+      .mockResolvedValueOnce(Response.json(applied('cursor-1')))
+      .mockResolvedValueOnce(Response.json(preview('digest-2')))
+      .mockResolvedValueOnce(Response.json(applied('cursor-2')))
+      .mockResolvedValueOnce(Response.json(preview('digest-3')))
+      .mockResolvedValueOnce(Response.json(applied('cursor-1')));
+    vi.stubGlobal('fetch', fetcher);
+    await expect(
+      runOperatorCommand(parseOperatorArgs(['deployment', 'migrate-assets', target, '--yes'])),
+    ).rejects.toMatchObject({ code: 'invalid_response' });
+    expect(fetcher).toHaveBeenCalledTimes(6);
+    expect(console.log).toHaveBeenCalledTimes(2);
+  });
+  it('keeps the last successful cursor and never retries an ambiguous later apply', async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(preview()))
+      .mockResolvedValueOnce(Response.json(applied('cursor-1')))
+      .mockResolvedValueOnce(Response.json(preview('digest-2')))
+      .mockRejectedValueOnce(new Error('connection lost'));
+    vi.stubGlobal('fetch', fetcher);
+    await expect(
+      runOperatorCommand(parseOperatorArgs(['deployment', 'migrate-assets', target, '--yes'])),
+    ).rejects.toMatchObject({ code: 'connection_failed' });
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining('cursor-1'));
   });
 });
 
@@ -442,6 +880,22 @@ describe('operator transport and execution', () => {
     expect(JSON.parse(String(fetcher.mock.calls[1]![1]!.body))).toEqual({
       versions: { api: 'version-a' },
     });
+  });
+  it('pins project normalization to its previewed database changes', async () => {
+    vi.stubEnv('VOID_API_URL', 'https://one.example');
+    vi.stubEnv('VOID_OPERATOR_TOKEN', 'operator');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const changes = { activeDeployment: { from: null, to: 'dpl_older' }, queues: [] };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () =>
+        Response.json({ dryRun: true, action: 'project.normalize', target: 'proj_1', changes }),
+      );
+    vi.stubGlobal('fetch', fetcher);
+    await runOperatorCommand(parseOperatorArgs(['project', 'normalize', 'proj_1', '--yes']));
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(String(fetcher.mock.calls[1]![1]!.body))).toEqual({ expected: changes });
   });
   it.each(['--plan', '--yes'])(
     'reads a cleanup token once for %s without printing it',
@@ -604,6 +1058,47 @@ describe('operator transport and execution', () => {
       routeId: 'edr_1',
       routeDesiredGeneration: 3,
     });
+  });
+  it('pins shared recipient recovery to the inspected preview and rejects missing fences', async () => {
+    vi.stubEnv('VOID_API_URL', 'https://one.example');
+    vi.stubEnv('VOID_OPERATOR_TOKEN', 'operator-token');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({
+          dryRun: true,
+          action: 'email.shared-recipient.resolve',
+          target: { recoveryFence: 'a'.repeat(64) },
+        }),
+      )
+      .mockResolvedValueOnce(Response.json({ status: 'pending' }));
+    vi.stubGlobal('fetch', fetcher);
+    const args = parseOperatorArgs([
+      'email',
+      'shared-recipient-resolve',
+      'erec_1',
+      '--ended',
+      '--outcome',
+      'not-applied',
+      '--reason',
+      'Provider audit completed',
+      '--yes',
+    ]);
+    await runOperatorCommand(args);
+    expect(JSON.parse(String(fetcher.mock.calls[1]![1]!.body))).toEqual({
+      ended: true,
+      outcome: 'not-applied',
+      reason: 'Provider audit completed',
+      recoveryFence: 'a'.repeat(64),
+    });
+    fetcher
+      .mockReset()
+      .mockResolvedValueOnce(
+        Response.json({ dryRun: true, action: 'email.shared-recipient.resolve', target: {} }),
+      );
+    await expect(runOperatorCommand(args)).rejects.toMatchObject({ code: 'invalid_preview' });
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
   it('drains runtime cursors and rejects repeated cursors instead of spinning', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -863,22 +1358,54 @@ describe('operator transport and execution', () => {
     expect(fetcher).toHaveBeenCalledTimes(3);
   });
 
-  it('uses a bounded quiet window for legacy terminal responses without completion state', async () => {
-    vi.spyOn(console, 'log').mockImplementation(() => {});
-    let now = 0;
-    vi.spyOn(Date, 'now').mockImplementation(() => now);
-    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => {
-      now += 10_000;
-      return Response.json({ lines: [], lastSeq: 3, terminal: true });
-    });
+  it.each([undefined, null])(
+    'requires an upgrade instead of declaring logs complete for a terminal response with %s completion state',
+    async (logsComplete) => {
+      const write = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+        Response.json({
+          lines: [{ seq: 3, line: 'retained final row' }],
+          lastSeq: 3,
+          terminal: true,
+          logsComplete,
+        }),
+      );
 
-    await followOperatorLogs(
-      new OperatorClient('https://one.example', 'token', fetcher),
-      parseOperatorArgs(['build', 'logs', 'id', '--follow', '--since', '3', '--json']),
-      undefined,
-      0,
+      await expect(
+        followOperatorLogs(
+          new OperatorClient('https://one.example', 'token', fetcher),
+          parseOperatorArgs(['build', 'logs', 'id', '--follow', '--since', '2', '--json']),
+          undefined,
+          0,
+        ),
+      ).rejects.toMatchObject({
+        code: 'log_completion_unavailable',
+        message: expect.stringContaining('Upgrade the platform runtime'),
+      });
+
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      expect(write.mock.calls.map(([line]) => String(line)).join('\n')).toContain(
+        'retained final row',
+      );
+    },
+  );
+
+  it('reads historical build logs without following when completion state is absent', async () => {
+    const write = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({
+        lines: [{ seq: 3, line: 'historical row' }],
+        lastSeq: 3,
+        terminal: true,
+      }),
     );
+    vi.stubGlobal('fetch', fetcher);
+    vi.stubEnv('VOID_OPERATOR_TOKEN', 'operator-token');
+    vi.stubEnv('VOID_API_URL', 'https://one.example');
 
-    expect(fetcher).toHaveBeenCalledTimes(4);
+    await runOperatorCommand(parseOperatorArgs(['build', 'logs', 'id', '--json']));
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(write.mock.calls.map(([line]) => String(line)).join('\n')).toContain('historical row');
   });
 });

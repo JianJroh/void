@@ -79,6 +79,7 @@ export default defineConfig({
       'src/edge.ts',
       'src/runtime/handler.ts',
       'src/runtime/response.ts',
+      'src/runtime/routing.ts',
       'src/runtime/validator.ts',
       'src/routes-stub.ts',
       'src/runtime/client.ts',
@@ -88,6 +89,7 @@ export default defineConfig({
       'src/runtime/client-solid.ts',
       'src/runtime/fetch.ts',
       'src/runtime/fetch-stream.ts',
+      'src/runtime/route-url.ts',
       'src/runtime/sse.ts',
       'src/runtime/sse-client.ts',
       'src/runtime/live.ts',
@@ -149,8 +151,8 @@ export default defineConfig({
       // child (via import.meta.url) to derive the env-insensitive schema facts (server and
       // required-secret names) under a scrubbed env — a stable dist filename for the spawn.
       'src/cli/env-schema-probe.ts',
-      // Private Cloudflare command transport, spawned by deployment orchestrators.
-      'src/cli/cf-compat.ts',
+      // Private typed Cloudflare transport, spawned by deployment orchestrators.
+      'src/cli/cloudflare-operation-process.ts',
     ],
     format: 'esm',
     dts: true,

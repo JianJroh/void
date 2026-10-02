@@ -43,6 +43,7 @@ const DEPLOY_TOKEN_ALLOWLIST: ReadonlyArray<DeployAllowEntry> = [
   { method: 'POST', segments: ['projects', null, 'database'] },
   { method: 'POST', segments: ['projects', null, 'prerender-token'] },
   { method: 'GET', segments: ['projects', null, 'deployments'] },
+  { method: 'GET', segments: ['projects', null, 'deployments', ':deploymentId', 'events'] },
   { method: 'GET', segments: ['projects', null, 'secrets'] },
   { method: 'POST', segments: ['projects', null, 'deploy', 'preflight'] },
   { method: 'POST', segments: ['projects', null, 'deploy', 'upload-urls'] },
@@ -63,7 +64,11 @@ function isDeployTokenAllowed(method: string, path: string, projectScope: string
       return false;
     }
     return entry.segments.every((expected, index) =>
-      expected === null ? segments[index] === projectScope : segments[index] === expected,
+      expected === ':deploymentId'
+        ? /^[A-Za-z0-9_-]{1,128}$/.test(segments[index]!)
+        : expected === null
+          ? segments[index] === projectScope
+          : segments[index] === expected,
     );
   });
 }
@@ -163,6 +168,7 @@ export const authMiddleware: MiddlewareHandler<ApiEnv> = async (context, next) =
     // deploy. Undefined for legacy deploy tokens with no build claim — the
     // guard only fires when this is set.
     context.set('deployBuild', payload.build);
+    context.set('deployTokenExpiresAt', payload.exp);
     if (payload.credential) {
       const credential = await context
         .get('db')

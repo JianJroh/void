@@ -27,48 +27,16 @@ relative to `platform/` unless they begin with `../`.
 - Public SDK: repository-level `packages/`. If work involves the SDK, read the root `AGENTS.md` and the affected package instructions first.
 - Public-facing docs: repository-level `docs/` (VitePress site).
 
-## Best Practices That Must Be Followed
+## Contributor guidance
 
-1. General
-
-- **Always** read `meta/lessons.md` at the start of each session before taking any action.
+- Read [the operating lessons](./meta/lessons.md) before changing the platform.
 - **Never** commit without asking for confirmation.
-- When writing technical design docs or implementation plans to disk, place them in `meta/design-docs` and follow existing file name and frontmatter conventions. Keep commercial strategy, pricing research, competitor analysis, and private operational inventories out of the repository.
-- When adding new dependencies to the project, always run `npm view [package] version` to get the latest version.
-
-2. Subagent Strategy
-   - Use subagents liberally to keep the main context window clean.
-   - Offload research, exploration, and parallel analysis to subagents.
-   - For complex problems, allocate more compute via subagents.
-   - Assign one task per subagent to ensure focused execution.
-
-3. Self-Improvement Loop
-   - After any correction from the user, update meta/lessons.md with the relevant pattern.
-   - Create rules for yourself that prevent repeating the same mistake.
-   - Iterate on these lessons rigorously until the mistake rate declines.
-
-4. Principles
-   - Simplicity First: Make every change as simple as possible. Minimize code impact.
-   - No Laziness: Identify root causes. Avoid temporary fixes. Apply senior developer standards.
-   - Minimal Impact: Touch only what is necessary. Avoid introducing new bugs.
-   - For non-trivial changes, pause and ask whether there is a more elegant solution.
-   - If a fix feels hacky, implement the solution you would choose knowing everything you now know.
-   - Do not over-engineer simple or obvious fixes.
-   - Critically evaluate your own work before presenting it.
-
-5. Planning
-   - Enter plan mode for any non-trivial task (three or more steps, or involving architectural decisions).
-   - If something goes wrong, stop and re-plan immediately rather than continuing blindly.
-   - Every implementation plan should include the following:
-   - During plan generation: ask clarifying questions when necessary, especially around developer-experience defining design decisions.
-   - Verification:
-     - Run `vp run check` from the repository root for typechecking after completing a batch of tasks.
-     - Run `vp test run` on tests relevant to the current feature only during feature development. Only run the full test suite when everything is done for final verification.
-     - If there are tests hanging or running particularly slow, investigate right there and attempt to fix. Testing velocity is something that should be maintained or improved at every opportunity.
-   - Documentation: after verification, update all docs if relevant and applicable:
-     - `README.md` (this file)
-     - affected packages's `README.md` or `AGENTS.md`
-   - Record implementation progress in the relevant current technical design or issue.
+- Keep technical design records in `meta/design-docs/`, following its naming and
+  frontmatter conventions. Keep commercial strategy, pricing research,
+  competitor analysis, and private operational inventories out of the repository.
+- Follow the root [instructions](../AGENTS.md) and
+  [testing guide](../TESTING.md) for verification. Update the affected package
+  guide when its behavior or contributor workflow changes.
 
 ## Quick Reference
 
@@ -102,7 +70,7 @@ void platform system health
 Commands use the selected platform connection. Add `--plan` to preview a change,
 `--yes` to apply it in a script, and `--json` to read structured results. The
 [Platform Administration guide](../docs/guide/platform-administration.md) covers
-the workflows; the [CLI reference](../docs/reference/cli.md#operator-commands)
+the workflows; the [CLI reference](../docs/reference/cli/platform.md#operator-commands)
 lists all commands and options.
 
 The CLI and browser admin UI share the same server operations and record their
@@ -115,6 +83,11 @@ Allowed administrator removals revoke access before resource cleanup and preserv
 that revocation if cleanup fails, so concurrent removals cannot lock out the
 remaining administrator.
 
+Administrators can manage installation plans from **Plans** in `/admin/` or
+`void platform config plans`. Both interfaces review changes before applying
+them and let you resume pending account updates. See
+[Plans and Limits](../docs/guide/platform/administration/plans.md).
+
 When upgrading an installation that previously enabled managed Sandbox, run
 `void platform system sandbox-drain --plan`, then apply it and rerun until it
 reports `complete: true`. Preview later bounded pages by passing the returned
@@ -125,6 +98,17 @@ abandoned. A protected cutover remains fenced for 90 minutes before the drain
 can compensate it, while an interrupted rollback is adopted through its
 database lease. These retries restore the committed deployment before deleting
 the managed Sandbox container.
+
+Project state upgrades use `0054_project_mode` to normalize the old `worker` mode
+and default to `void`. Before rolling out this runtime, finish any protected
+cutover or rollback recovery whose project has no active deployment pointer on
+the previous compatible runtime. Recovery remains fenced when that identity is
+missing. After rollout, `void platform project normalize <id> --plan` verifies
+the serving route and recorded queue names; `--yes` applies only the previewed
+PostgreSQL repairs. It does not choose the newest historical deployment or write
+routing/provider state. Existing active pointers are preserved. A verified queue
+name that differs from the expected delivery routing name blocks normalization
+until its queue routing is reconciled.
 
 ## Local Development
 
@@ -174,30 +158,8 @@ Void is one repository with an explicit dependency boundary:
 | `meta/design-docs`                                             | Historical design archive                                                 |
 | `meta/operations.md`                                           | Operations/runbook                                                        |
 
-### Where Code for X Lives
-
-| Feature                                                                        | Primary code paths                                                                                                                                                                                                                                                                                  |
-| ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Vite plugin and local runtime                                                  | `../packages/void/src/index.ts`, `plugin-*`, `runtime/*`                                                                                                                                                                                                                                            |
-| CLI commands                                                                   | `../packages/void/src/cli/*`                                                                                                                                                                                                                                                                        |
-| File-based API routing                                                         | `../packages/void/src/router/*`, `runtime/handler.ts`                                                                                                                                                                                                                                               |
-| Pages routing, loaders, actions, named actions, deferred props                 | `../packages/void/src/pages/*`, adapter runtimes in `../packages/{vue,react,svelte,solid}/src/runtime/*`                                                                                                                                                                                            |
-| Typed route/page/action codegen                                                | `../packages/void/src/codegen/*`, `routes-stub.ts`                                                                                                                                                                                                                                                  |
-| Binding inference                                                              | `../packages/void/src/plugin-inference.ts`, `../packages/void/src/inference/*`                                                                                                                                                                                                                      |
-| Drizzle integration and migrations                                             | `../packages/void/src/drizzle/*`, `../packages/void/src/migrations/*`                                                                                                                                                                                                                               |
-| Framework detection and deploy presets                                         | `../packages/void/src/plugin-inference.ts`, `../packages/void/src/cli/preset.ts`                                                                                                                                                                                                                    |
-| Platform auth and project APIs                                                 | `packages/api/src/routes/*`, `packages/api/src/auth/*`, `packages/api/src/middleware/*`                                                                                                                                                                                                             |
-| Administrator UI                                                               | `packages/api/src/admin/*`                                                                                                                                                                                                                                                                          |
-| Deploy pipeline                                                                | `../packages/void/src/cli/deploy.ts`, `packages/api/src/routes/deploy.ts`, `packages/api/src/assets.ts`, `packages/api/src/provisioning/*`                                                                                                                                                          |
-| Deploy on GitHub (App connect, webhooks, OIDC, build containers)               | `packages/api/src/routes/{github,webhooks,auth-oidc}.ts`, `packages/api/src/github/*`, `packages/api/src/build-scheduler.ts`, `packages/api/src/build-manager.ts`, `packages/api/container/*`, `packages/api/src/auth/deploy-token.ts`                                                              |
-| Hostname routing, static serving, ISR, redirects, rewrites, headers, metering  | `packages/dispatch/src/*`                                                                                                                                                                                                                                                                           |
-| AI metering, BYOK AI gateway, remote D1/KV/R2 access, revalidation bridge      | `packages/proxy/src/*`                                                                                                                                                                                                                                                                              |
-| Email (shared sender, custom domains, recipient policy, admin-managed domains) | `packages/email-gateway/src/*`, `packages/proxy/src/email*.ts`, `packages/api/src/routes/email.ts`, `packages/api/src/email/*`, `packages/api/src/operator/email-routes.ts`, `packages/api/src/admin/routes/email.tsx`, `../packages/void/src/cli/email*.ts`, `../packages/void/src/runtime/email*` |
-| Runtime logs and live tailing                                                  | `packages/tail/src/index.ts`, `packages/api/src/admin/routes/deployments.tsx`                                                                                                                                                                                                                       |
-| User-facing dashboard                                                          | `packages/dashboard/pages/*`, `packages/dashboard/middleware/01.auth.ts`, `packages/dashboard/lib/api.ts`                                                                                                                                                                                           |
-| Dashboard styling                                                              | `packages/dashboard/ui/styles/base.css`, `packages/dashboard/ui/styles/tokens.css`                                                                                                                                                                                                                  |
-
-The dashboard depends on `void` and `@void/react` through normal `workspace:*` dependencies. Those packages export only their `dist/` output, so run `vp run build` before `vp run --filter @voidcloud/platform deploy` on a fresh checkout. The platform workflows do this; the task graph does not.
+The dashboard consumes built `void` and `@void/react` workspace packages. Run
+`vp run build` before deploying it from a fresh checkout.
 
 ## SDK guidance
 
@@ -207,63 +169,10 @@ Public SDK architecture and adapter guidance live in the
 Use the [framework integration guide](../docs/integrations/frameworks/overview.md)
 for the supported framework list.
 
-## Platform Package Overview
-
-### `packages/api`
-
-The control plane.
-
-- Owns users, OAuth accounts, projects, deployments, resources, domains, and platform events.
-- Stores platform metadata in PostgreSQL via Hyperdrive.
-- Exposes the API used by the CLI and dashboard.
-- Runs deploys, rollbacks, provisioning, routing updates, queue setup, and retention cleanup.
-- Also contains the administrator UI in `src/admin/`.
-- When configured, hosts **Deploy on GitHub**: connect a repo via a GitHub App, and a `git push` triggers an automatic build + deploy. Routes under `/github`, `/webhooks/github`, `/auth/github-oidc`, and `/projects/:id/github` handle App install/connect, webhook verification, and GitHub Actions OIDC. An Access-protected API uses the optional standalone source ingress for GitHub deliveries; the core installer does not deploy it. GitHub's **Re-run** / **Re-run all checks** buttons on the "Void Build" check re-enqueue a container build through the same push pipeline (see the pitfall below — the App must subscribe to `check_run`/`check_suite`). Builds run in one of two executors — a Cloudflare Container (default) or GitHub Actions — coordinated by the `BuildScheduler` and `BuildManager` Durable Objects. The build environment runs the real `void deploy` CLI with a short-lived scoped deploy token, so the deploy pipeline itself is unchanged.
-
-### `packages/dashboard`
-
-The optional authentication frontend, built with Void React Pages. It provides
-sign-in, callback, sign-out, and a minimal authenticated page. The administrator
-UI and full operator API live in the API Worker.
-
-See the [dashboard README](./packages/dashboard/README.md) for source development.
-The core installer does not deploy this app. Void Cloud deploys it after its
-other Workers so its API dependency is available.
-
-### `packages/dispatch`
-
-The edge router.
-
-- Reads slug/domain routing from KV.
-- Sends worker projects to Workers for Platforms.
-- Serves current static/SPA deployments directly from R2, while retaining KV reads for small assets carried forward from legacy deploys.
-- Handles ISR, edge caching, redirect/rewrite rules, header rules, and signed request metering.
-- Relays Cloudflare Queue batches to user workers.
-
-Request and sandbox usage queue messages are authenticated with a
-purpose-separated key held in the platform's private routing KV. The API health
-check initializes that key before installation traffic is enabled. Sandbox
-elapsed time is measured from API-owned lease transitions; tenant Workers do
-not receive the usage queue producer binding. After an upgrade, unsigned frames
-from older deployed SDK runtimes are acknowledged and ignored. Redeploy those
-apps to remove the dormant legacy binding.
-
-### `packages/proxy`
-
-The shared proxy layer.
-
-- Routes all AI traffic through AI Gateway for metering.
-- Supports BYOK provider models in addition to Workers AI.
-- Provides authenticated remote D1/KV/R2 access for local development.
-- Forwards ISR revalidation requests from user workers to the API.
-
-### `packages/tail`
-
-The runtime log pipeline.
-
-- Receives tail events from dispatch/user workers.
-- Writes logs to Analytics Engine.
-- The API reads stored events for runtime log inspection; CLI following polls those results.
+The package READMEs above describe each component's implementation and tests.
+Use [the architecture guide](./meta/architecture.md) for the runtime and data-flow
+map, and [the development guide](../docs/guide/platform-development.md) for local
+setup and source deployments.
 
 ## Tooling
 

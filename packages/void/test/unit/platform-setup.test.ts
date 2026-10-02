@@ -1,5 +1,6 @@
 import { createPlatformDeploymentManifest } from '@void/platform';
 import { describe, it, expect, vi } from 'vite-plus/test';
+import { parsePlatformArgs } from '../../src/cli/platform-args.ts';
 import type { PlatformInstallPlan } from '../../src/cli/platform-plan.ts';
 import {
   formatPlatformInstallCommand,
@@ -41,6 +42,32 @@ function plan(domain = ''): PlatformInstallPlan {
   };
 }
 describe('platform credential setup links', () => {
+  it('round-trips planned defaults, Hyperdrive, dashboard, and login choices into install arguments', () => {
+    const command = formatPlatformInstallCommand({
+      commandName: 'void',
+      accountId: 'account',
+      installationSlug: 'team',
+      displayName: 'Team',
+      applicationDomain: 'example.com',
+      zoneName: 'example.com',
+      controlPlaneDomain: '',
+      dashboardUrl: 'https://dash.example.com:8443',
+      dedicatedZone: false,
+      workersDev: false,
+      authentication: { providers: ['google', 'oidc'], configurable: true, accessProtection: true },
+      hyperdrive: 'drive-id',
+      runtime: '',
+      yes: false,
+    });
+    expect(parsePlatformArgs(command.split(' ').slice(2))).toMatchObject({
+      noControlPlaneDomain: true,
+      dedicatedZoneSpecified: true,
+      hyperdrive: 'drive-id',
+      loginMethods: ['google', 'oidc'],
+      accessProtection: true,
+      dashboardUrl: 'https://dash.example.com:8443',
+    });
+  });
   it('keeps planned domain, authentication, and runtime choices in a copyable command', () => {
     const command = formatPlatformInstallCommand({
       commandName: 'void-dev',
@@ -53,13 +80,14 @@ describe('platform credential setup links', () => {
       dedicatedZone: true,
       workersDev: false,
       authConfig: './auth config.json',
+      dashboardUrl: 'https://dash.example.com:8443',
       runtime: './build output',
       yes: true,
     });
     const quotedName =
       process.platform === 'win32' ? "'Team''s Platform'" : "'Team'\\''s Platform'";
     expect(command).toBe(
-      `void-dev platform install --name team --account account --display-name ${quotedName} --application-domain apps.example.com --zone example.com --dedicated-zone --control-plane-domain api.example.com --auth-config './auth config.json' --runtime './build output' --yes`,
+      `void-dev platform install --name team --account account --display-name ${quotedName} --application-domain apps.example.com --zone example.com --dedicated-zone --control-plane-domain api.example.com --auth-config './auth config.json' --dashboard-url https://dash.example.com:8443 --runtime './build output' --yes`,
     );
   });
 
@@ -125,8 +153,9 @@ describe('platform credential setup links', () => {
     const page = platformSetupPages(plan()).r2;
     const url = new URL(page.url);
     expect([...url.searchParams.keys()]).toEqual(['to', 'type']);
-    expect(page.instructions).toContain('the form defaults to read-only');
-    expect(page.instructions).toContain('including newly created buckets');
+    expect(page.instructions).toContain('Select Object Read & Write.');
+    expect(page.instructions).toContain('Keep Apply to all buckets in this account selected.');
+    expect(page.instructions).not.toMatch(/[();]/);
     expect(page.instructions).toContain('Access Key ID and Secret Access Key');
     expect(page.instructions).not.toContain('Admin Read');
   });
@@ -198,11 +227,15 @@ describe('platform credential setup links', () => {
     expect(platformSetupPages(plan()).github.instructions).toContain(
       plan().apiUrl + '/auth/callback',
     );
-    expect(preview).toContain('Redirect URI: ' + plan().apiUrl + '/auth/callback');
+    expect(preview).toContain('Login callback: ' + plan().apiUrl + '/auth/callback');
+    expect(preview).toContain('PostgreSQL database URL');
+    expect(preview).toContain('JWT signing key and project encryption key');
     expect(preview).toContain(
-      'GitHub Auth will be used by the users of your Void Platform instance. Register a GitHub app and generate a client secret.',
+      'Installation collects and validates missing credentials after you confirm the plan.',
     );
-    expect(preview).not.toContain('Callback:');
+    expect(preview).not.toMatch(/paste|copy|Workers Scripts|Object Read|Register a GitHub/);
+    expect(preview).not.toMatch(/[();]/);
+    expect(preview.split('\n').length).toBeLessThanOrEqual(10);
   });
   it('includes zone permissions only for an application domain', () => {
     const page = platformSetupPages(plan('example.com')).runtime;

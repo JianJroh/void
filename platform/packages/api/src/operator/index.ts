@@ -9,7 +9,9 @@ import { authenticatedSessionRoutes, operatorAuth, operatorSessionRoutes } from 
 import { OperatorError } from './common.ts';
 import { emailOperatorRoutes } from './email-routes.ts';
 import { operationsRoutes } from './operations-routes.ts';
+import { planOperatorRoutes } from './plans-routes.ts';
 import { tenantRoutes } from './tenant-routes.ts';
+import { zeroTrustOperatorRoutes } from './zero-trust-routes.ts';
 
 export const operatorApi = new Hono<ApiEnv>();
 operatorApi.onError((error, context) => {
@@ -62,7 +64,9 @@ operatorApi.route('/', operatorAuditRoutes);
 operatorApi.route('/', tenantRoutes);
 operatorApi.route('/', operationsRoutes);
 operatorApi.route('/', authenticationConfigRoutes);
+operatorApi.route('/', planOperatorRoutes);
 operatorApi.route('/', emailOperatorRoutes);
+operatorApi.route('/', zeroTrustOperatorRoutes);
 operatorApi.notFound((context) =>
   context.json({ error: 'not_found', message: 'Unknown operator API endpoint.' }, 404),
 );

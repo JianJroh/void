@@ -95,15 +95,19 @@ pnpm void deploy
 - **Typed durable state** — modules in `durable-objects/` get inferred SQLite-backed bindings and typed RPC methods
 - **Local dev parity** — `vite dev` runs handlers in the real `workerd` runtime with local D1, KV, and R2
 
+Before moving deployed Durable State or WebSocket definitions, run `void info` and pin the displayed `name`. Existing unnamed definitions keep their defaults. See the [Durable State](./docs/guide/durable-state.md#rename-a-file-while-keeping-its-state) and [WebSocket](./docs/guide/websockets.md#move-a-route-while-keeping-its-state) migration guides.
+
 ## Documentation
 
 Full docs at [void.cloud](https://void.cloud). Run `vp run dev:docs` in this repo to view the documentation locally.
 
-Run `void connect` to choose a deployment destination and sign in, `void connect --platform cloudflare` for your own account, or `void connect <url>` for your team's platform. See the [connection reference](./docs/reference/cli.md#connect).
+Run `void connect` to choose a deployment destination and sign in, `void connect --platform cloudflare` for your own account, or `void connect <url>` for your team's platform. See the [connection reference](./docs/reference/cli/auth.md#connect).
 
 To install a shared company platform, start with [Install a Void Platform](./docs/guide/self-hosted-platform.md). The installation pages cover Cloudflare setup, a domain, PostgreSQL, credentials, and your choice of GitHub, Google, OIDC, or Cloudflare Access sign-in, then preview the installation with `void platform install --plan`. Void creates the core API, routing, proxy, and telemetry resources.
 
 Platform upgrades verify migrations and check the new Workers before completing the rollout. If a rollout fails, Void can restore the previous Workers against the compatible database schema. See the platform guide for recovery and upgrade details.
+
+Administrators can use `void platform config plans` to define account plans, change enforced limits, and choose the default for new accounts. See [Plans and Limits](./docs/guide/platform/administration/plans.md).
 
 For a test platform before your domain is ready, use `void platform install --workers-dev`. Later, `void platform domain set example.com` guides DNS setup and verifies HTTPS while preserving existing app URLs and the platform API connection.
 

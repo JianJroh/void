@@ -26,6 +26,7 @@ import {
   telemetrySources,
 } from './telemetry.ts';
 export type {
+  AdminPlans,
   AdminUsersPage,
   AdminProjectsPage,
   AdminDeploymentsPage,
@@ -41,6 +42,7 @@ export type {
   AdminAuthEdit,
   AdminEmailSettings,
   AdminEmailProject,
+  AdminZeroTrust,
 } from './page-server.ts';
 export type { AdminBuildLogs, AdminBuildStatus, AdminDeploymentLogs } from './telemetry.ts';
 

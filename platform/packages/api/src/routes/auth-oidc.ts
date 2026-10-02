@@ -14,9 +14,9 @@ import {
   getRepoInstallation,
 } from '../github/installation-token.ts';
 import { verifyGithubOidcToken } from '../github/oidc-verify.ts';
+import { resolvePlanLimits } from '../plans.ts';
 import { PROJECT_PERMISSION_MESSAGES } from '../project-access.ts';
 import { isAdminSuspended } from '../suspension.ts';
-import { getPlanLimits } from '../tiers.ts';
 
 const app = new Hono<ApiEnv>();
 
@@ -119,16 +119,12 @@ app.post('/github-oidc', async (context) => {
   const db = context.get('db');
   const connections = await getGitHubActionsConnectionsByRepo(
     db,
-    claims.repository,
     claims.repository_id,
     claims.repository_owner_id,
   );
   if (connections.length === 0) {
     return context.json(
-      {
-        error:
-          'no authorized github actions connection for repository; reconnect the organization repository',
-      },
+      { error: 'no authorized github actions connection for repository; reconnect the repository' },
       401,
     );
   }
@@ -455,7 +451,9 @@ app.post('/github-oidc', async (context) => {
     context.env.JWT_SECRET,
     {
       ttlSeconds: deployTokenTtlSecondsForBuildMinutes(
-        getPlanLimits(billingOwner.plan).buildTimeoutMinutes,
+        result.outcome === 'created'
+          ? result.timeoutMinutes
+          : (await resolvePlanLimits(db, billingOwner.plan)).buildTimeoutMinutes,
       ),
     },
   );

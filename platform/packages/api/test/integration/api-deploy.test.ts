@@ -1,4 +1,5 @@
 import { SHARED_CACHE_POLICY_VERSION } from '@void/isr/core';
+import { createDefaultPlanCatalog } from '@void/platform/plans';
 import { desc, eq, sql } from 'drizzle-orm';
 import {
   describe,
@@ -19,10 +20,13 @@ import {
   getProject,
   removeProjectMember,
   updateDeploymentStatus,
+  updateUserPlan,
   type Db,
 } from '../../src/db.ts';
 import app from '../../src/index.ts';
+import { writePlanCatalog } from '../../src/plans.ts';
 import * as projectAccess from '../../src/project-access.ts';
+import * as projectIngress from '../../src/project-ingress.ts';
 import { validateManifestShape } from '../../src/routes/deploy.ts';
 import {
   builds,
@@ -32,7 +36,9 @@ import {
   projects,
   projectMigrations,
   projectMembers,
+  projectZeroTrust,
   projectSecrets,
+  platformSettings,
   users,
 } from '../../src/schema.ts';
 import {
@@ -40,6 +46,7 @@ import {
   teardownEnv,
   clearTables,
   createTestUser,
+  createOperatorToken,
   createTestProject,
   createTestDeployment,
   createTestProjectSecret,
@@ -53,6 +60,26 @@ import { setTestDb } from './setup.ts';
 
 const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
 const enc = new TextEncoder();
+
+const SQLITE_MIGRATIONS = {
+  dialect: 'sqlite',
+  pending: 1,
+  protocolVersion: 2,
+  classifierVersion: 1,
+  migrationListHash: 'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+  stability: 'stable',
+};
+
+function sqliteMigrationCapabilities(): Response {
+  return Response.json({
+    ...SQLITE_MIGRATIONS,
+    destructiveValidation: 'passed',
+    endpoints: {
+      app: '/__void/migrate/app',
+      reconcile: '/__void/migrate/app/attempt/:attemptId',
+    },
+  });
+}
 
 let env: TestEnv;
 
@@ -337,6 +364,264 @@ function createWaitUntilTrackingCtx(): {
 }
 
 describe('POST /projects/:id/deploy', () => {
+  it('restores committed code while retaining a completed operator plan update after cutover fails', async () => {
+    const user = await createTestUser(env.db);
+    const admin = await createTestUser(
+      env.db,
+      'policy-admin',
+      'github',
+      undefined,
+      'custom',
+      'admin',
+    );
+    const token = await createOperatorToken(env.db, admin);
+    const project = await createTestProject(env.db, user.id, 'compensate-current-policy');
+    mockCfApi();
+    const initial = await app.fetch(
+      await buildDeployRequest(env, project.id, user.jwt, {
+        workers: { 'index.js': 'export default {fetch(){return new Response("first")}}' },
+      }),
+      env,
+    );
+    expect(parseDeployStream(await initial.text()).at(-1)).toMatchObject({ event: 'done' });
+    const source = (await getProject(env.db, project.id))!.active_deployment_id;
+    const sourceRouting = (await env.ROUTING.get(project.slug, 'json')) as { workerName: string };
+    const originalPut = env.ROUTING.put.bind(env.ROUTING);
+    let changed = false;
+    vi.spyOn(env.ROUTING, 'put').mockImplementation(async (key, value, options) => {
+      if (key.startsWith('cutover-ready:') && !changed) {
+        changed = true;
+        const applied = await app.fetch(
+          new Request('http://localhost/operator/v1/config/plans/free/set', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              expectedRevision: 0,
+              limits: {
+                cpuMsPerRequest: 77,
+                maxCpuMsPerRequest: 100,
+                subRequestsPerInvocation: 70,
+              },
+            }),
+          }),
+          env,
+        );
+        expect(applied.status).toBe(200);
+        expect(await applied.json()).toMatchObject({
+          ok: true,
+          reconciliation: { complete: true },
+        });
+        throw new Error('injected failure after completed policy update');
+      }
+      return originalPut(key, value, options);
+    });
+    const replacement = await app.fetch(
+      await buildDeployRequest(env, project.id, user.jwt, {
+        workers: { 'index.js': 'export default {fetch(){return new Response("second")}}' },
+      }),
+      env,
+    );
+    expect(parseDeployStream(await replacement.text()).at(-1)).toMatchObject({
+      event: 'error',
+      message: 'injected failure after completed policy update',
+    });
+    expect(changed).toBe(true);
+    expect((await getProject(env.db, project.id))!.active_deployment_id).toBe(source);
+    expect(await env.ROUTING.get(project.slug, 'json')).toMatchObject({
+      workerName: sourceRouting.workerName,
+      version: source,
+      limits: { cpuMs: 77, subRequests: 70 },
+    });
+  });
+
+  it.each([
+    { backend: 'worker', changePlan: false },
+    { backend: 'worker', changePlan: true },
+    { backend: 'static', changePlan: true },
+  ] as const)(
+    'publishes current plan policy after a completed update during $backend preparation (assignment: $changePlan)',
+    async ({ backend, changePlan }) => {
+      const user = await createTestUser(env.db);
+      const project = await createTestProject(
+        env.db,
+        user.id,
+        `late-policy-${backend}-${changePlan}`,
+      );
+      await env.db.insert(domains).values({
+        id: 'late-policy-domain',
+        project_id: project.id,
+        hostname: 'late-policy.example.com',
+        cf_hostname_id: 'late-policy-cf-hostname',
+        status: 'active',
+      });
+      mockCfApi();
+      let updated = false;
+      const scheduler = {
+        idFromName: (name: string) => ({ toString: () => name }),
+        get: () => ({
+          fetch: async (request: Request) => {
+            if (new URL(request.url).pathname === '/snapshot' && !updated) {
+              const catalog = createDefaultPlanCatalog();
+              const source = catalog.plans.find((plan) => plan.id === 'free')!;
+              const changed = {
+                ...source,
+                id: changePlan ? 'team' : 'free',
+                name: changePlan ? 'Team' : 'free',
+                limits: {
+                  ...source.limits,
+                  cpuMsPerRequest: 77,
+                  maxCpuMsPerRequest: 100,
+                  subRequestsPerInvocation: 70,
+                },
+              };
+              await writePlanCatalog(env.db, {
+                ...catalog,
+                revision: 1,
+                plans: changePlan
+                  ? [...catalog.plans, changed]
+                  : catalog.plans.map((plan) => (plan.id === 'free' ? changed : plan)),
+              });
+              if (changePlan) {
+                await updateUserPlan(env.db, user.id, 'team');
+              }
+              // The completed update is already published before this deployment takes its cutover fence.
+              await env.ROUTING.put(
+                project.slug,
+                JSON.stringify({
+                  workerName: 'previous-worker',
+                  projectId: project.id,
+                  userId: user.id,
+                  limits: { cpuMs: 77, subRequests: 70 },
+                }),
+              );
+              updated = true;
+              return Response.json({ state: null });
+            }
+            return Response.json({ ok: true });
+          },
+        }),
+      } as unknown as DurableObjectNamespace;
+      const request =
+        backend === 'static'
+          ? await buildStaticDeployRequest(env, project.id, user.jwt, { type: 'static' })
+          : await buildDeployRequest(env, project.id, user.jwt);
+      const response = await app.fetch(request, { ...env, CRON_SCHEDULER: scheduler });
+      expect(parseDeployStream(await response.text()).at(-1)).toMatchObject({ event: 'done' });
+      expect(updated).toBe(true);
+      const routing = await env.ROUTING.get(project.slug, 'json');
+      expect(routing).toMatchObject({
+        userId: user.id,
+        ...(backend === 'worker'
+          ? { limits: { cpuMs: 77, subRequests: 70 } }
+          : { staticDeploymentId: expect.any(String) }),
+      });
+      expect(await env.ROUTING.get('domain:late-policy.example.com', 'json')).toEqual(routing);
+      expect(await env.ROUTING.get(`project:${project.id}`)).toBeNull();
+    },
+  );
+
+  it('does not require migration metadata when no SQL will run', async () => {
+    const user = await createTestUser(env.db);
+    const project = await createTestProject(env.db, user.id, 'no-migrations');
+    mockCfApi();
+    const originalDispatch = env.DISPATCH;
+    const dispatch = vi.fn();
+    env.DISPATCH = { get: dispatch } as unknown as DispatchNamespace;
+    try {
+      const response = await app.fetch(
+        await buildDeployRequest(env, project.id, user.jwt, {
+          manifest: {
+            version: 3,
+            bindings: {},
+            migrations: { dialect: 'sqlite', pending: 0, files: [] },
+          },
+        }),
+        env,
+      );
+      expect(response.status).toBe(200);
+      expect(parseDeployStream(await response.text()).at(-1)).toMatchObject({ event: 'done' });
+      expect(dispatch).not.toHaveBeenCalled();
+    } finally {
+      env.DISPATCH = originalDispatch;
+    }
+  });
+
+  it.each([
+    ['old protocol', { dialect: 'sqlite', pending: 1 }],
+    ['missing classifier', { ...SQLITE_MIGRATIONS, classifierVersion: undefined }],
+    ['unsupported classifier', { ...SQLITE_MIGRATIONS, classifierVersion: 2 }],
+    ['missing list hash', { ...SQLITE_MIGRATIONS, migrationListHash: undefined }],
+    ['invalid list hash', { ...SQLITE_MIGRATIONS, migrationListHash: 'sha256:invalid' }],
+    ['missing stability', { ...SQLITE_MIGRATIONS, stability: undefined }],
+  ])(
+    'rejects new SQLite builds with %s before mutations and preserves old deployments',
+    async (_label, migrations) => {
+      const user = await createTestUser(env.db);
+      const project = await createTestProject(env.db, user.id, 'migration-upgrade');
+      const retained = await createTestDeployment(env.db, project.id);
+      const active = await createTestDeployment(env.db, project.id);
+      const oldManifest = JSON.stringify({
+        version: 3,
+        bindings: { d1: ['DB'] },
+        migrations: { dialect: 'sqlite', pending: 1 },
+      });
+      await env.db
+        .update(deployments)
+        .set({ manifest: oldManifest, retained: true })
+        .where(eq(deployments.project_id, project.id));
+      const routing = JSON.stringify({
+        deploymentId: active.id,
+        version: active.id,
+        projectId: project.id,
+      });
+      await env.ROUTING.put(project.slug, routing);
+      const originalRows = await env.db
+        .select()
+        .from(deployments)
+        .where(eq(deployments.project_id, project.id))
+        .orderBy(deployments.id);
+      const provider = mockCfApi();
+      const ingress = vi.spyOn(projectIngress, 'ensureProjectIngress');
+      const originalDispatch = env.DISPATCH;
+      const dispatch = vi.fn();
+      env.DISPATCH = { get: dispatch } as unknown as DispatchNamespace;
+      try {
+        const response = await app.fetch(
+          await buildDeployRequest(env, project.id, user.jwt, {
+            manifest: { version: 3, bindings: { d1: ['DB'] }, migrations },
+          }),
+          env,
+        );
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({
+          event: 'error',
+          message:
+            'SQLite migrations require an updated Void runtime. Upgrade void, rebuild the app, and deploy again.',
+        });
+        expect(provider).not.toHaveBeenCalled();
+        expect(ingress).not.toHaveBeenCalled();
+        expect(dispatch).not.toHaveBeenCalled();
+        expect(
+          await env.db
+            .select()
+            .from(deployments)
+            .where(eq(deployments.project_id, project.id))
+            .orderBy(deployments.id),
+        ).toEqual(originalRows);
+        expect((await getProject(env.db, project.id))?.active_deployment_id).toBe(active.id);
+        expect(await env.ROUTING.get(project.slug)).toBe(routing);
+        expect(originalRows.map((row) => row.id)).toEqual(
+          expect.arrayContaining([active.id, retained.id]),
+        );
+        expect(
+          await env.db.select().from(resources).where(eq(resources.project_id, project.id)),
+        ).toEqual([]);
+      } finally {
+        env.DISPATCH = originalDispatch;
+      }
+    },
+  );
+
   it('returns 401 without auth', async () => {
     const res = await app.fetch(
       new Request('http://localhost/projects/proj_fake/deploy', {
@@ -564,6 +849,85 @@ describe('POST /projects/:id/deploy', () => {
   });
 
   it.each([
+    { backend: 'worker' as const, slug: 'zero-trust-cutover-worker' },
+    { backend: 'static' as const, slug: 'zero-trust-cutover-static' },
+  ])(
+    'publishes the Zero Trust state committed before the $backend cutover lock',
+    async ({ backend, slug }) => {
+      const user = await createTestUser(env.db, `owner-${backend}`);
+      const project = await createTestProject(env.db, user.id, slug);
+      mockCfApi();
+
+      const configuration = (audience: string, revision: number) => ({
+        version: 1,
+        revision,
+        enabled: true,
+        protectNewProjects: true,
+        accountId: env.CF_ACCOUNT_ID,
+        teamDomain: 'https://company.cloudflareaccess.com',
+        identityProviderIds: ['idp-1'],
+        policyIds: ['policy-1'],
+        credential: { ciphertext: 'unused', iv: 'unused', keyVersion: 'v1' },
+        wildcardApplicationName: 'void-test-projects',
+        wildcardApplication: {
+          id: 'access-wildcard',
+          name: 'void-test-projects',
+          audience,
+          destinations: ['*.void.app'],
+        },
+        lastError: null,
+        updatedAt: new Date().toISOString(),
+      });
+      await env.db.insert(platformSettings).values({
+        key: 'zeroTrust.configuration',
+        value: configuration('stale-audience', 1),
+      });
+      // Deploy admission requires settled protection; the audience then
+      // changes while the deploy runs, before its cutover lock.
+      await env.db.insert(projectZeroTrust).values({
+        project_id: project.id,
+        desired_protected: true,
+        effective_protected: true,
+        status: 'ready',
+      });
+
+      let protectionCommitted = false;
+      const cronScheduler = {
+        idFromName: (name: string) => ({ toString: () => name }),
+        get: () => ({
+          fetch: async (request: Request) => {
+            if (new URL(request.url).pathname === '/snapshot' && !protectionCommitted) {
+              await env.db
+                .update(platformSettings)
+                .set({ value: configuration('access-audience', 2) })
+                .where(eq(platformSettings.key, 'zeroTrust.configuration'));
+              protectionCommitted = true;
+              return Response.json({ state: null });
+            }
+            return Response.json({ ok: true });
+          },
+        }),
+      } as unknown as DurableObjectNamespace;
+      const testEnv = { ...env, CRON_SCHEDULER: cronScheduler };
+      const request =
+        backend === 'static'
+          ? await buildStaticDeployRequest(env, project.id, user.jwt, { type: 'static' })
+          : await buildDeployRequest(env, project.id, user.jwt);
+
+      const response = await app.fetch(request, testEnv);
+      expect(response.status).toBe(200);
+      expect(parseDeployStream(await response.text()).at(-1)).toMatchObject({ event: 'done' });
+      expect(protectionCommitted).toBe(true);
+      expect(await env.ROUTING.get(project.slug, 'json')).toMatchObject({
+        zeroTrust: {
+          teamDomain: 'https://company.cloudflareaccess.com',
+          audiences: [{ hostname: '*.void.app', audience: 'access-audience' }],
+        },
+      });
+    },
+  );
+
+  it.each([
     { notFoundHandling: 'single-page-application', framework: undefined, type: 'void' },
     { notFoundHandling: '404-page', framework: undefined, type: 'void' },
     { notFoundHandling: 'single-page-application', framework: 'nuxt', type: 'framework' },
@@ -739,6 +1103,13 @@ describe('POST /projects/:id/deploy', () => {
       hasCrons: true,
     });
     await env.ROUTING.put(project.slug, previousRouting);
+    await env.db.insert(domains).values({
+      id: 'dom_compensation_failure',
+      project_id: project.id,
+      hostname: 'undo-failure.example.com',
+      cf_hostname_id: 'ch-compensation-failure',
+      status: 'active',
+    });
     const previousCronState = {
       workerName: 'user-cron-sync-failure-dpl_live',
       schedules: [{ name: 'old', cron: '0 * * * *' }],
@@ -762,11 +1133,11 @@ describe('POST /projects/:id/deploy', () => {
       }),
     } as unknown as DurableObjectNamespace;
     const originalDelete = env.ROUTING.delete.bind(env.ROUTING);
-    const projectAccountKey = `project:${project.id}`;
-    let projectAccountRestoreFailed = false;
+    const domainKey = 'domain:undo-failure.example.com';
+    let domainRestoreFailed = false;
     vi.spyOn(env.ROUTING, 'delete').mockImplementation(async (key) => {
-      if (key === projectAccountKey && !projectAccountRestoreFailed) {
-        projectAccountRestoreFailed = true;
+      if (key === domainKey && !domainRestoreFailed) {
+        domainRestoreFailed = true;
         throw new Error('injected first compensation failure');
       }
       return originalDelete(key);
@@ -786,8 +1157,8 @@ describe('POST /projects/:id/deploy', () => {
 
     expect(events.some((event) => (event as DeployEvent).event === 'done')).toBe(false);
     expect(events.some((event) => (event as DeployEvent).event === 'error')).toBe(true);
-    expect(projectAccountRestoreFailed).toBe(true);
-    // The failed project-account undo is first in reverse order. The slug
+    expect(domainRestoreFailed).toBe(true);
+    // The failed custom-domain undo is first in reverse order. The slug
     // restoration must still run instead of being skipped after that error.
     expect(await env.ROUTING.get(project.slug)).toBe(previousRouting);
     expect(syncedStates.at(-1)).toEqual(previousCronState);
@@ -1106,11 +1477,16 @@ describe('POST /projects/:id/deploy', () => {
       get: () => ({
         fetch: async (req: Request) => {
           const url = new URL(req.url);
+          if (url.pathname === '/__void/migrate/capabilities') {
+            return sqliteMigrationCapabilities();
+          }
           if (url.pathname === '/__void/ready') {
             return Response.json({ ready: true });
           }
           return Response.json({
             ok: true,
+            protocolVersion: 2,
+            confirmedApplied: ['001_create_table.sql'],
             migrations: [{ name: '001_create_table.sql', applied: true, durationMs: 5 }],
           });
         },
@@ -1123,7 +1499,7 @@ describe('POST /projects/:id/deploy', () => {
           manifest: {
             version: 3,
             bindings: { d1: ['DB'] },
-            migrations: { dialect: 'sqlite', pending: 1 },
+            migrations: SQLITE_MIGRATIONS,
           },
         }),
         env,
@@ -1209,6 +1585,11 @@ describe('POST /projects/:id/deploy', () => {
       });
     }
 
+    await env.db
+      .update(projects)
+      .set({ active_deployment_id: 'dpl_limit_99' })
+      .where(eq(projects.id, project.id));
+
     const res = await app.fetch(await buildDeployRequest(env, project.id, user.jwt), env);
     expect(res.status).toBe(200);
     const events = await readAllEvents(res);
@@ -1231,6 +1612,11 @@ describe('POST /projects/:id/deploy', () => {
         created_at: sql`now()`,
       });
     }
+
+    await env.db
+      .update(projects)
+      .set({ active_deployment_id: 'dpl_under_98' })
+      .where(eq(projects.id, project.id));
 
     const res = await app.fetch(await buildDeployRequest(env, project.id, user.jwt), env);
     expect(res.status).toBe(200);
@@ -1984,6 +2370,9 @@ describe('POST /projects/:id/deploy', () => {
         get: () => ({
           fetch: async (req: Request) => {
             const url = new URL(req.url);
+            if (url.pathname === '/__void/migrate/capabilities') {
+              return sqliteMigrationCapabilities();
+            }
             if (url.pathname === '/__void/ready') {
               readyCalls++;
               if (readyCalls <= 3) {
@@ -1991,7 +2380,7 @@ describe('POST /projects/:id/deploy', () => {
               }
               return Response.json({ ready: true });
             }
-            // /__void/migrate
+            // /__void/migrate/app
             migrateCalls++;
             return Response.json({
               ok: true,
@@ -2007,7 +2396,7 @@ describe('POST /projects/:id/deploy', () => {
             manifest: {
               version: 3,
               bindings: { d1: ['DB'] },
-              migrations: { dialect: 'sqlite', pending: 1 },
+              migrations: SQLITE_MIGRATIONS,
             },
           }),
           env,
@@ -2044,6 +2433,9 @@ describe('POST /projects/:id/deploy', () => {
         get: () => ({
           fetch: async (req: Request) => {
             const url = new URL(req.url);
+            if (url.pathname === '/__void/migrate/capabilities') {
+              return sqliteMigrationCapabilities();
+            }
             if (url.pathname === '/__void/ready') {
               await env.db
                 .update(projectMembers)
@@ -2066,7 +2458,7 @@ describe('POST /projects/:id/deploy', () => {
             manifest: {
               version: 3,
               bindings: { d1: ['DB'] },
-              migrations: { dialect: 'sqlite', pending: 1 },
+              migrations: SQLITE_MIGRATIONS,
             },
           }),
           env,
@@ -2084,158 +2476,6 @@ describe('POST /projects/:id/deploy', () => {
       }
     });
 
-    it('treats 404 from readiness probe as compatible (older worker without /__void/ready)', async () => {
-      const user = await createTestUser(env.db);
-      const project = await createTestProject(env.db, user.id, 'migrate-compat-404-test');
-      mockCfApi({
-        createD1: () => cfSuccess({ uuid: 'd1-compat-uuid', name: 'test-db' }),
-      });
-
-      let readyCalls = 0;
-      let migrateCalls = 0;
-      const originalDispatch = env.DISPATCH;
-      env.DISPATCH = {
-        get: () => ({
-          fetch: async (req: Request) => {
-            const url = new URL(req.url);
-            if (url.pathname === '/__void/ready') {
-              readyCalls++;
-              // Older worker returns 404 — endpoint doesn't exist
-              return new Response('Not Found', { status: 404 });
-            }
-            // /__void/migrate
-            migrateCalls++;
-            return Response.json({
-              ok: true,
-              migrations: [{ name: '001_create_table.sql', applied: true, durationMs: 2 }],
-            });
-          },
-        }),
-      } as unknown as DispatchNamespace;
-
-      try {
-        const res = await app.fetch(
-          await buildDeployRequest(env, project.id, user.jwt, {
-            manifest: {
-              version: 3,
-              bindings: { d1: ['DB'] },
-              migrations: { dialect: 'sqlite', pending: 1 },
-            },
-          }),
-          env,
-        );
-        expect(res.status).toBe(200);
-        const events = parseDeployStream(await res.text());
-        expect(events.at(-1)).toMatchObject({ event: 'done' });
-        // 404 treated as "ready" on first attempt — no retries
-        expect(readyCalls).toBe(1);
-        // Migration dispatched once
-        expect(migrateCalls).toBe(1);
-      } finally {
-        env.DISPATCH = originalDispatch;
-      }
-    });
-
-    it('treats non-stub 2xx readiness HTML as compatible with older workers', async () => {
-      const user = await createTestUser(env.db);
-      const project = await createTestProject(env.db, user.id, 'migrate-compat-html-test');
-      mockCfApi({
-        createD1: () => cfSuccess({ uuid: 'd1-compat-html-uuid', name: 'test-db' }),
-      });
-
-      let readyCalls = 0;
-      let migrateCalls = 0;
-      const originalDispatch = env.DISPATCH;
-      env.DISPATCH = {
-        get: () => ({
-          fetch: async (req: Request) => {
-            const url = new URL(req.url);
-            if (url.pathname === '/__void/ready') {
-              readyCalls++;
-              return new Response(
-                '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"></head><body>app</body></html>',
-                { headers: { 'content-type': 'text/html' } },
-              );
-            }
-            migrateCalls++;
-            return Response.json({
-              ok: true,
-              migrations: [{ name: '001_create_table.sql', applied: true, durationMs: 2 }],
-            });
-          },
-        }),
-      } as unknown as DispatchNamespace;
-
-      try {
-        const res = await app.fetch(
-          await buildDeployRequest(env, project.id, user.jwt, {
-            manifest: {
-              version: 3,
-              bindings: { d1: ['DB'] },
-              migrations: { dialect: 'sqlite', pending: 1 },
-            },
-          }),
-          env,
-        );
-        expect(res.status).toBe(200);
-        const events = parseDeployStream(await res.text());
-        expect(events.at(-1)).toMatchObject({ event: 'done' });
-        expect(readyCalls).toBe(1);
-        expect(migrateCalls).toBe(1);
-      } finally {
-        env.DISPATCH = originalDispatch;
-      }
-    });
-
-    it('normalizes legacy migration responses with applied and skipped arrays', async () => {
-      const user = await createTestUser(env.db);
-      const project = await createTestProject(env.db, user.id, 'migrate-legacy-shape-test');
-      mockCfApi({
-        createD1: () => cfSuccess({ uuid: 'd1-legacy-shape-uuid', name: 'test-db' }),
-      });
-
-      const originalDispatch = env.DISPATCH;
-      env.DISPATCH = {
-        get: () => ({
-          fetch: async (req: Request) => {
-            const url = new URL(req.url);
-            if (url.pathname === '/__void/ready') {
-              return Response.json({ ready: true });
-            }
-            return Response.json({
-              ok: true,
-              applied: [],
-              skipped: ['001_create_table.sql'],
-            });
-          },
-        }),
-      } as unknown as DispatchNamespace;
-
-      try {
-        const res = await app.fetch(
-          await buildDeployRequest(env, project.id, user.jwt, {
-            manifest: {
-              version: 3,
-              bindings: { d1: ['DB'] },
-              migrations: { dialect: 'sqlite', pending: 1 },
-            },
-          }),
-          env,
-        );
-        expect(res.status).toBe(200);
-        const events = parseDeployStream(await res.text());
-        expect(events.at(-1)).toMatchObject({ event: 'done' });
-
-        const rows = await env.db
-          .select({ name: projectMigrations.name })
-          .from(projectMigrations)
-          .where(eq(projectMigrations.project_id, project.id));
-        expect(rows).toEqual([{ name: '001_create_table.sql' }]);
-      } finally {
-        env.DISPATCH = originalDispatch;
-      }
-    });
-
     it('returns a clear migration error when the worker response has no migration names', async () => {
       const user = await createTestUser(env.db);
       const project = await createTestProject(env.db, user.id, 'migrate-invalid-shape-test');
@@ -2248,6 +2488,9 @@ describe('POST /projects/:id/deploy', () => {
         get: () => ({
           fetch: async (req: Request) => {
             const url = new URL(req.url);
+            if (url.pathname === '/__void/migrate/capabilities') {
+              return sqliteMigrationCapabilities();
+            }
             if (url.pathname === '/__void/ready') {
               return Response.json({ ready: true });
             }
@@ -2262,7 +2505,7 @@ describe('POST /projects/:id/deploy', () => {
             manifest: {
               version: 3,
               bindings: { d1: ['DB'] },
-              migrations: { dialect: 'sqlite', pending: 1 },
+              migrations: SQLITE_MIGRATIONS,
             },
           }),
           env,
@@ -2280,94 +2523,99 @@ describe('POST /projects/:id/deploy', () => {
       }
     });
 
-    it('uses protocol v2 app and auth migration endpoints after capability negotiation', async () => {
-      const user = await createTestUser(env.db);
-      const project = await createTestProject(env.db, user.id, 'migrate-v2-test');
-      mockCfApi({
-        createD1: () => cfSuccess({ uuid: 'd1-v2-uuid', name: 'test-db' }),
-      });
+    it.each(['stable', 'legacy'])(
+      'uses protocol v2 app and auth migration endpoints after capability negotiation (%s SQL)',
+      async (stability) => {
+        const user = await createTestUser(env.db);
+        const project = await createTestProject(env.db, user.id, 'migrate-v2-test');
+        mockCfApi({
+          createD1: () => cfSuccess({ uuid: 'd1-v2-uuid', name: 'test-db' }),
+        });
 
-      const calls: Array<string> = [];
-      const originalDispatch = env.DISPATCH;
-      env.DISPATCH = {
-        get: () => ({
-          fetch: async (req: Request) => {
-            const url = new URL(req.url);
-            calls.push(`${req.method} ${url.pathname}`);
-            if (url.pathname === '/__void/ready') {
-              return Response.json({ ready: true });
-            }
-            if (url.pathname === '/__void/migrate/capabilities') {
-              return Response.json({
-                protocolVersion: 2,
-                endpoints: {
-                  app: '/__void/migrate/app',
-                  auth: '/__void/migrate/auth',
-                  reconcile: '/__void/migrate/app/attempt/:attemptId',
-                },
-                dialect: 'sqlite',
-                classifierVersion: 1,
-                migrationListHash: 'sha256:test-list',
-                destructiveValidation: 'passed',
-              });
-            }
-            if (url.pathname === '/__void/migrate/app') {
-              return Response.json({
-                ok: true,
-                protocolVersion: 2,
-                attemptId: 'attempt_test',
-                confirmedApplied: ['001_create_table.sql'],
-                confirmedSkipped: [],
-                stability: 'stable',
-                migrations: [
-                  {
-                    name: '001_create_table.sql',
-                    applied: true,
-                    status: 'applied',
-                    stability: 'stable',
-                    durationMs: 2,
+        const calls: Array<string> = [];
+        const originalDispatch = env.DISPATCH;
+        env.DISPATCH = {
+          get: () => ({
+            fetch: async (req: Request) => {
+              const url = new URL(req.url);
+              calls.push(`${req.method} ${url.pathname}`);
+              if (url.pathname === '/__void/ready') {
+                return Response.json({ ready: true });
+              }
+              if (url.pathname === '/__void/migrate/capabilities') {
+                return Response.json({
+                  protocolVersion: 2,
+                  endpoints: {
+                    app: '/__void/migrate/app',
+                    auth: '/__void/migrate/auth',
+                    reconcile: '/__void/migrate/app/attempt/:attemptId',
                   },
-                ],
-              });
-            }
-            if (url.pathname === '/__void/migrate/auth') {
-              return Response.json({ ok: true, protocolVersion: 2 });
-            }
-            return new Response('unexpected', { status: 500 });
-          },
-        }),
-      } as unknown as DispatchNamespace;
-
-      try {
-        const res = await app.fetch(
-          await buildDeployRequest(env, project.id, user.jwt, {
-            manifest: {
-              version: 3,
-              auth: true,
-              bindings: { d1: ['DB'] },
-              migrations: {
-                dialect: 'sqlite',
-                pending: 1,
-                protocolVersion: 2,
-                classifierVersion: 1,
-                migrationListHash: 'sha256:test-list',
-                stability: 'stable',
-              },
+                  dialect: 'sqlite',
+                  classifierVersion: 1,
+                  migrationListHash:
+                    'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                  destructiveValidation: 'passed',
+                });
+              }
+              if (url.pathname === '/__void/migrate/app') {
+                return Response.json({
+                  ok: true,
+                  protocolVersion: 2,
+                  attemptId: 'attempt_test',
+                  confirmedApplied: ['001_create_table.sql'],
+                  confirmedSkipped: [],
+                  stability,
+                  migrations: [
+                    {
+                      name: '001_create_table.sql',
+                      applied: true,
+                      status: 'applied',
+                      stability,
+                      durationMs: 2,
+                    },
+                  ],
+                });
+              }
+              if (url.pathname === '/__void/migrate/auth') {
+                return Response.json({ ok: true, protocolVersion: 2 });
+              }
+              return new Response('unexpected', { status: 500 });
             },
           }),
-          env,
-        );
-        expect(res.status).toBe(200);
-        const events = parseDeployStream(await res.text());
-        expect(events.at(-1)).toMatchObject({ event: 'done' });
-        expect(calls).toContain('GET /__void/migrate/capabilities');
-        expect(calls).toContain('POST /__void/migrate/app');
-        expect(calls).toContain('POST /__void/migrate/auth');
-        expect(calls).not.toContain('POST /__void/migrate');
-      } finally {
-        env.DISPATCH = originalDispatch;
-      }
-    });
+        } as unknown as DispatchNamespace;
+
+        try {
+          const res = await app.fetch(
+            await buildDeployRequest(env, project.id, user.jwt, {
+              manifest: {
+                version: 3,
+                auth: true,
+                bindings: { d1: ['DB'] },
+                migrations: {
+                  dialect: 'sqlite',
+                  pending: 1,
+                  protocolVersion: 2,
+                  classifierVersion: 1,
+                  migrationListHash:
+                    'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+                  stability,
+                },
+              },
+            }),
+            env,
+          );
+          expect(res.status).toBe(200);
+          const events = parseDeployStream(await res.text());
+          expect(events.at(-1)).toMatchObject({ event: 'done' });
+          expect(calls).toContain('GET /__void/migrate/capabilities');
+          expect(calls).toContain('POST /__void/migrate/app');
+          expect(calls).toContain('POST /__void/migrate/auth');
+          expect(calls).not.toContain('POST /__void/migrate');
+        } finally {
+          env.DISPATCH = originalDispatch;
+        }
+      },
+    );
 
     it('persists confirmed app migrations before a protocol v2 auth failure', async () => {
       const user = await createTestUser(env.db);
@@ -2394,7 +2642,8 @@ describe('POST /projects/:id/deploy', () => {
                 },
                 dialect: 'sqlite',
                 classifierVersion: 1,
-                migrationListHash: 'sha256:auth-failure',
+                migrationListHash:
+                  'sha256:2222222222222222222222222222222222222222222222222222222222222222',
                 destructiveValidation: 'passed',
               });
             }
@@ -2437,7 +2686,8 @@ describe('POST /projects/:id/deploy', () => {
                 pending: 1,
                 protocolVersion: 2,
                 classifierVersion: 1,
-                migrationListHash: 'sha256:auth-failure',
+                migrationListHash:
+                  'sha256:2222222222222222222222222222222222222222222222222222222222222222',
                 stability: 'stable',
               },
             },
@@ -2473,86 +2723,55 @@ describe('POST /projects/:id/deploy', () => {
       }
     });
 
-    it('negotiates protocol v2 and runs MySQL migrations', async () => {
-      const user = await createTestUser(env.db);
-      const project = await createTestProject(env.db, user.id, 'migrate-v2-mysql-test');
-      mockCfApi();
-
-      const calls: Array<string> = [];
-      const originalDispatch = env.DISPATCH;
-      env.DISPATCH = {
-        get: () => ({
-          fetch: async (req: Request) => {
-            const url = new URL(req.url);
-            calls.push(`${req.method} ${url.pathname}`);
-            if (url.pathname === '/__void/ready') {
-              return Response.json({ ready: true });
-            }
-            if (url.pathname === '/__void/migrate/capabilities') {
-              return Response.json({
-                protocolVersion: 2,
-                endpoints: {
-                  app: '/__void/migrate/app',
-                  reconcile: '/__void/migrate/app/attempt/:attemptId',
-                },
-                dialect: 'mysql',
-                classifierVersion: 1,
-                migrationListHash: 'sha256:mysql-list',
-                destructiveValidation: 'passed',
-              });
-            }
-            if (url.pathname === '/__void/migrate/app') {
-              return Response.json({
-                ok: true,
-                protocolVersion: 2,
-                attemptId: 'attempt_mysql',
-                confirmedApplied: ['001_create_table.sql'],
-                confirmedSkipped: [],
-                stability: 'stable',
-                migrations: [
-                  {
-                    name: '001_create_table.sql',
-                    applied: true,
-                    status: 'applied',
-                    stability: 'stable',
-                    durationMs: 2,
-                  },
-                ],
-              });
-            }
-            return new Response('unexpected', { status: 500 });
-          },
-        }),
-      } as unknown as DispatchNamespace;
-
-      try {
-        const res = await app.fetch(
-          await buildDeployRequest(env, project.id, user.jwt, {
-            manifest: {
-              version: 3,
-              bindings: {},
-              migrations: {
-                dialect: 'mysql',
-                pending: 1,
-                protocolVersion: 2,
-                classifierVersion: 1,
-                migrationListHash: 'sha256:mysql-list',
-                stability: 'stable',
-              },
+    it.each(['postgresql', 'mysql'])(
+      'runs current %s migrations without a SQLite plan',
+      async (dialect) => {
+        const user = await createTestUser(env.db);
+        const project = await createTestProject(env.db, user.id, 'migrate-external-' + dialect);
+        mockCfApi();
+        const calls: Array<string> = [];
+        const originalDispatch = env.DISPATCH;
+        env.DISPATCH = {
+          get: () => ({
+            fetch: async (request: Request) => {
+              const url = new URL(request.url);
+              calls.push(request.method + ' ' + url.pathname);
+              if (url.pathname === '/__void/ready') {
+                return Response.json({ ready: true });
+              }
+              if (url.pathname === '/__void/migrate') {
+                return Response.json({
+                  ok: true,
+                  migrations: [{ name: '001_create_table.sql', applied: true, durationMs: 2 }],
+                });
+              }
+              return new Response('unexpected', { status: 500 });
             },
           }),
-          env,
-        );
-        expect(res.status).toBe(200);
-        const events = parseDeployStream(await res.text());
-        expect(events.at(-1)).toMatchObject({ event: 'done' });
-        expect(calls).toContain('GET /__void/migrate/capabilities');
-        expect(calls).toContain('POST /__void/migrate/app');
-        expect(calls).not.toContain('POST /__void/migrate');
-      } finally {
-        env.DISPATCH = originalDispatch;
-      }
-    });
+        } as unknown as DispatchNamespace;
+        try {
+          const response = await app.fetch(
+            await buildDeployRequest(env, project.id, user.jwt, {
+              manifest: { version: 3, bindings: {}, migrations: { dialect, pending: 1 } },
+            }),
+            env,
+          );
+          expect(response.status).toBe(200);
+          expect(parseDeployStream(await response.text()).at(-1)).toMatchObject({
+            event: 'done',
+            migrations: 1,
+          });
+          expect(calls).toEqual(['GET /__void/ready', 'POST /__void/migrate']);
+          const rows = await env.db
+            .select({ name: projectMigrations.name })
+            .from(projectMigrations)
+            .where(eq(projectMigrations.project_id, project.id));
+          expect(rows).toEqual([{ name: '001_create_table.sql' }]);
+        } finally {
+          env.DISPATCH = originalDispatch;
+        }
+      },
+    );
 
     it('capability negotiation surfaces the classifierVersion skew reason', async () => {
       const user = await createTestUser(env.db);
@@ -2580,7 +2799,8 @@ describe('POST /projects/:id/deploy', () => {
                 },
                 dialect: 'sqlite',
                 classifierVersion: 2,
-                migrationListHash: 'sha256:test-list',
+                migrationListHash:
+                  'sha256:1111111111111111111111111111111111111111111111111111111111111111',
                 destructiveValidation: 'passed',
               });
             }
@@ -2600,7 +2820,8 @@ describe('POST /projects/:id/deploy', () => {
                 pending: 1,
                 protocolVersion: 2,
                 classifierVersion: 1,
-                migrationListHash: 'sha256:test-list',
+                migrationListHash:
+                  'sha256:1111111111111111111111111111111111111111111111111111111111111111',
                 stability: 'stable',
               },
             },
@@ -2662,7 +2883,8 @@ describe('POST /projects/:id/deploy', () => {
                 pending: 1,
                 protocolVersion: 2,
                 classifierVersion: 1,
-                migrationListHash: 'sha256:test-list',
+                migrationListHash:
+                  'sha256:1111111111111111111111111111111111111111111111111111111111111111',
                 stability: 'stable',
               },
             },
@@ -2680,56 +2902,47 @@ describe('POST /projects/:id/deploy', () => {
       }
     });
 
-    it('compat path retries migration with longer window when readiness probe returns 404', async () => {
-      const user = await createTestUser(env.db);
-      const project = await createTestProject(env.db, user.id, 'migrate-compat-retry-test');
-      mockCfApi({
-        createD1: () => cfSuccess({ uuid: 'd1-compat-retry-uuid', name: 'test-db' }),
-      });
-
-      let migrateCalls = 0;
-      const originalDispatch = env.DISPATCH;
-      env.DISPATCH = {
-        get: () => ({
-          fetch: async (req: Request) => {
-            const url = new URL(req.url);
-            if (url.pathname === '/__void/ready') {
-              return new Response('Not Found', { status: 404 });
-            }
-            // /__void/migrate — first 3 calls hit CF propagation lag
-            migrateCalls++;
-            if (migrateCalls <= 3) {
-              return new Response('Assets have already been uploaded.');
-            }
-            return Response.json({
-              ok: true,
-              migrations: [{ name: '001_create_table.sql', applied: true, durationMs: 4 }],
-            });
-          },
-        }),
-      } as unknown as DispatchNamespace;
-
-      try {
-        const res = await app.fetch(
-          await buildDeployRequest(env, project.id, user.jwt, {
-            manifest: {
-              version: 3,
-              bindings: { d1: ['DB'] },
-              migrations: { dialect: 'sqlite', pending: 1 },
+    it.each([
+      [404, 'Not Found'],
+      [200, '<!DOCTYPE html><html><body>app</body></html>'],
+    ])(
+      'requires the current readiness response instead of accepting HTTP %s app output',
+      async (status, body) => {
+        const user = await createTestUser(env.db);
+        const project = await createTestProject(env.db, user.id, 'migrate-ready-contract');
+        mockCfApi({ createD1: () => cfSuccess({ uuid: 'd1-ready-contract', name: 'test-db' }) });
+        let migrateCalls = 0;
+        const originalDispatch = env.DISPATCH;
+        env.DISPATCH = {
+          get: () => ({
+            fetch: async (request: Request) => {
+              if (new URL(request.url).pathname === '/__void/ready') {
+                return new Response(body, { status });
+              }
+              migrateCalls++;
+              return new Response('unexpected', { status: 500 });
             },
           }),
-          env,
-        );
-        expect(res.status).toBe(200);
-        const events = parseDeployStream(await res.text());
-        expect(events.at(-1)).toMatchObject({ event: 'done' });
-        // 3 CF plain-text retries + 1 success = 4 calls.
-        // This would fail with CF_MIGRATION_RETRY (maxRetries: 2, only 3 attempts).
-        expect(migrateCalls).toBe(4);
-      } finally {
-        env.DISPATCH = originalDispatch;
-      }
-    });
+        } as unknown as DispatchNamespace;
+        try {
+          const response = await app.fetch(
+            await buildDeployRequest(env, project.id, user.jwt, {
+              manifest: { version: 3, bindings: { d1: ['DB'] }, migrations: SQLITE_MIGRATIONS },
+            }),
+            env,
+          );
+          expect(response.status).toBe(200);
+          expect(parseDeployStream(await response.text()).at(-1)).toMatchObject({
+            event: 'error',
+            step: 'migration',
+            message: expect.stringContaining('worker readiness probe failed'),
+          });
+          expect(migrateCalls).toBe(0);
+        } finally {
+          env.DISPATCH = originalDispatch;
+        }
+      },
+    );
 
     it(
       'fails at readiness probe when worker never becomes reachable',
@@ -2762,7 +2975,7 @@ describe('POST /projects/:id/deploy', () => {
               manifest: {
                 version: 3,
                 bindings: { d1: ['DB'] },
-                migrations: { dialect: 'sqlite', pending: 1 },
+                migrations: SQLITE_MIGRATIONS,
               },
             }),
             env,
@@ -2819,8 +3032,8 @@ describe('POST /projects/:id/deploy', () => {
     });
     for (const args of deleteCalls) {
       const url = args[0] as string;
-      // Legacy cleanup (user-{slug}) is OK; versioned cleanup (user-{slug}-dpl_*) for OLD
-      // deployments is OK. But the new deployment's worker must not be deleted.
+      // Retention may delete older versioned Workers. The new deployment's
+      // Worker must not be deleted.
       // New deployment IDs start with "dpl_test" from createTestDeployment,
       // but deploy route creates its own ID. Just verify no delete targets a
       // versioned worker for this project (no previous deploys exist).
@@ -2839,12 +3052,17 @@ describe('Deploy deduplication (skip identical deploys)', () => {
   // for-byte (the dedupe-skip path compares the persisted JSON strings).
   const manifest = { assetManifestVersion: 2, version: 3, bindings: {} };
   const assetContent = '<h1>hi</h1>';
-  let assetManifest: Record<string, { hash: string; size: number }>;
+  let assetManifest: Record<string, { hash: string; size: number; store: 'r2'; scope: 'project' }>;
 
   beforeEach(async () => {
     const buffer = await new Blob([assetContent]).arrayBuffer();
     assetManifest = {
-      '/index.html': { hash: computeAssetHash(buffer, '/index.html'), size: buffer.byteLength },
+      '/index.html': {
+        hash: computeAssetHash(buffer, '/index.html'),
+        size: buffer.byteLength,
+        store: 'r2',
+        scope: 'project',
+      },
     };
   });
 
@@ -2905,8 +3123,8 @@ describe('Deploy deduplication (skip identical deploys)', () => {
     // Simulate a previously stored merged manifest whose insertion order no
     // longer matches the raw JSON string the client sends on retry.
     const liveAssetManifest = {
-      '/assets/app.js': { hash: appHash, size: appBody.length },
-      '/index.html': { hash: indexHash, size: indexBody.length },
+      '/assets/app.js': { hash: appHash, size: appBody.length, store: 'r2', scope: 'project' },
+      '/index.html': { hash: indexHash, size: indexBody.length, store: 'r2', scope: 'project' },
     };
     const liveDeployId = 'dpl_live_dedupe_order';
     await env.db.insert(deployments).values({
@@ -2923,8 +3141,8 @@ describe('Deploy deduplication (skip identical deploys)', () => {
       .set({ active_deployment_id: liveDeployId })
       .where(eq(projects.id, project.id));
 
-    await env.STATIC_ASSETS.put(`assets/${project.id}/${indexHash}`, indexBody);
-    await env.STATIC_ASSETS.put(`assets/${project.id}/${appHash}`, appBody);
+    await env.STATIC_ASSETS_R2.put(`assets/${project.id}/${indexHash}`, indexBody);
+    await env.STATIC_ASSETS_R2.put(`assets/${project.id}/${appHash}`, appBody);
 
     const res = await app.fetch(
       await buildDeployRequest(env, project.id, user.jwt, {
@@ -3268,6 +3486,11 @@ describe('Deploy serialization (concurrent deploy guard)', () => {
       created_at: sql`now()`,
     });
 
+    await env.db
+      .update(projects)
+      .set({ active_deployment_id: 'dpl_done' })
+      .where(eq(projects.id, project.id));
+
     const res = await app.fetch(await buildDeployRequest(env, project.id, user.jwt), env);
     expect(res.status).toBe(200);
     // Drain the NDJSON stream so the deploy IIFE (which holds deployments-table
@@ -3548,7 +3771,7 @@ describe('POST /projects/:id/deploy (static)', () => {
     expect(activeId).toBeTruthy();
     const active = await getDeployment(env.db, activeId!);
     expect(JSON.parse(active!.asset_hashes!)).toEqual({
-      '/index.html': { hash, size: bytes.length, store: 'r2' },
+      '/index.html': { hash, size: bytes.length, store: 'r2', scope: 'project' },
     });
   });
 
@@ -3610,16 +3833,18 @@ describe('POST /projects/:id/deploy (static)', () => {
     }) as Db;
     setTestDb(wrappedDb);
 
-    mockCfApi({
-      deleteWorker: async (url) => {
-        if (url.endsWith(`/scripts/user-${project.slug}`)) {
-          await realDb
-            .update(deployments)
-            .set({ status: 'pending' })
-            .where(eq(deployments.id, protectedDeployment.id));
-        }
-        return cfSuccess(null);
-      },
+    mockCfApi();
+    const originalDelete = env.ROUTING.delete.bind(env.ROUTING);
+    let insertedPending = false;
+    vi.spyOn(env.ROUTING, 'delete').mockImplementation(async (key) => {
+      await originalDelete(key);
+      if (!insertedPending && key.startsWith('cutover-ready:')) {
+        insertedPending = true;
+        await realDb
+          .update(deployments)
+          .set({ status: 'pending' })
+          .where(eq(deployments.id, protectedDeployment.id));
+      }
     });
 
     try {
@@ -3629,6 +3854,7 @@ describe('POST /projects/:id/deploy (static)', () => {
       );
       expect(response.status).toBe(200);
       expect(parseDeployStream(await response.text()).at(-1)).toMatchObject({ event: 'done' });
+      expect(insertedPending).toBe(true);
       expect(await env.STATIC_ASSETS_R2.head(protectedKey)).not.toBeNull();
     } finally {
       setTestDb(realDb);
@@ -3710,19 +3936,19 @@ describe('POST /projects/:id/deploy (static)', () => {
       .set({ active_deployment_id: rollbackTarget.id, type: 'void' })
       .where(eq(projects.id, project.id));
 
-    // A static deploy deletes the obsolete unversioned legacy Worker just
-    // before it computes retention. Use that boundary to model a rollback
-    // committing after the static cutover but before the eviction pass.
-    const fetchMock = mockCfApi({
-      deleteWorker: async (url) => {
-        if (url.endsWith(`/scripts/user-${project.slug}`)) {
-          await env.db
-            .update(projects)
-            .set({ active_deployment_id: rollbackTarget.id, type: 'void' })
-            .where(eq(projects.id, project.id));
-        }
-        return cfSuccess(null);
-      },
+    // Model rollback after cutover commits, before the retention inventory.
+    const fetchMock = mockCfApi();
+    const originalDelete = env.ROUTING.delete.bind(env.ROUTING);
+    let rolledBack = false;
+    vi.spyOn(env.ROUTING, 'delete').mockImplementation(async (key) => {
+      await originalDelete(key);
+      if (!rolledBack && key.startsWith('cutover-ready:')) {
+        rolledBack = true;
+        await env.db
+          .update(projects)
+          .set({ active_deployment_id: rollbackTarget.id, type: 'void' })
+          .where(eq(projects.id, project.id));
+      }
     });
 
     const res = await app.fetch(
@@ -3732,6 +3958,7 @@ describe('POST /projects/:id/deploy (static)', () => {
     expect(res.status).toBe(200);
     expect(parseDeployStream(await res.text()).at(-1)).toMatchObject({ event: 'done' });
 
+    expect(rolledBack).toBe(true);
     const targetWorkerUrl = `/scripts/user-${project.slug}-${rollbackTarget.id}`;
     const targetDeletes = fetchMock.mock.calls.filter((call: Array<unknown>) => {
       const url = typeof call[0] === 'string' ? call[0] : '';
@@ -3847,7 +4074,7 @@ describe('ambiguous go-live commit outcomes', () => {
     const originalPut = env.ROUTING.put.bind(env.ROUTING);
     let injected = false;
     const putSpy = vi.spyOn(env.ROUTING, 'put').mockImplementation(async (key, value, options) => {
-      if (key === `project:${project.id}` && !injected) {
+      if (key === project.slug && !injected) {
         injected = true;
         throw new Error('injected stale replay surface failure');
       }
@@ -3902,7 +4129,7 @@ describe('ambiguous go-live commit outcomes', () => {
     const originalPut = env.ROUTING.put.bind(env.ROUTING);
     let failuresRemaining = 2;
     const putSpy = vi.spyOn(env.ROUTING, 'put').mockImplementation(async (key, value, options) => {
-      if (key === `project:${project.id}` && failuresRemaining > 0) {
+      if (key === project.slug && failuresRemaining > 0) {
         failuresRemaining--;
         throw new Error('injected replay and compensation failure');
       }
@@ -3925,7 +4152,7 @@ describe('ambiguous go-live commit outcomes', () => {
     expect(await getDeployment(env.db, abandoned.id)).toMatchObject({ status: 'failed' });
   });
 
-  it('preserves and backfills a legacy live deployment during protected recovery', async () => {
+  it('blocks a missing active pointer before protected recovery changes the fence', async () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id, 'legacy-cutover-compensation');
     const source = await createTestDeployment(env.db, project.id, 'live');
@@ -3984,10 +4211,13 @@ describe('ambiguous go-live commit outcomes', () => {
       }),
       env,
     );
-    expect(response.status).toBe(200);
-    expect(parseDeployStream(await response.text()).at(-1)).toMatchObject({ event: 'error' });
-    expect(await getDeployment(env.db, abandoned.id)).toMatchObject({ status: 'failed' });
-    expect((await getProject(env.db, project.id))?.active_deployment_id).toBe(source.id);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: 'project_requires_normalization' });
+    expect(await getDeployment(env.db, abandoned.id)).toMatchObject({ status: 'compensating' });
+    expect((await getProject(env.db, project.id))?.active_deployment_id).toBeNull();
+    expect(JSON.parse((await env.ROUTING.get(`cutover-intent:${abandoned.id}`))!)).toMatchObject({
+      ownerId: 'dead-owner',
+    });
     expect(JSON.parse((await env.ROUTING.get(project.slug))!)).toMatchObject({
       workerName: `user-${project.slug}-${source.id}`,
       projectId: project.id,
@@ -5252,6 +5482,9 @@ describe('asset_hashes storage', () => {
       get: () => ({
         fetch: async (req: Request) => {
           const url = new URL(req.url);
+          if (url.pathname === '/__void/migrate/capabilities') {
+            return sqliteMigrationCapabilities();
+          }
           if (url.pathname === '/__void/ready') {
             return Response.json({ ready: true });
           }
@@ -5277,7 +5510,7 @@ describe('asset_hashes storage', () => {
           manifest: {
             version: 3,
             bindings: { d1: ['DB'] },
-            migrations: { dialect: 'sqlite', pending: 1 },
+            migrations: SQLITE_MIGRATIONS,
           },
           assets: { 'index.html': '<h1>recappi</h1>' },
         }),
@@ -5451,6 +5684,8 @@ describe('POST /projects/:id/deploy/preflight', () => {
     }
     await env.ROUTING.put(`manifest:${prevDeploy.id}`, JSON.stringify(servingManifest));
 
+    await env.STATIC_ASSETS_R2.put(`assets/${project.id}/${'a'.repeat(32)}`, new Uint8Array(100));
+
     const res = await app.fetch(
       new Request(`http://localhost/projects/${project.id}/deploy/preflight`, {
         method: 'POST',
@@ -5461,7 +5696,7 @@ describe('POST /projects/:id/deploy/preflight', () => {
         body: JSON.stringify({
           assetManifest: {
             '/index.html': { hash: 'a'.repeat(32), size: 100 }, // unchanged
-            '/app.js': { hash: 'x'.repeat(32), size: 250 }, // changed
+            '/app.js': { hash: 'f'.repeat(32), size: 250 }, // changed
             '/new.js': { hash: 'd'.repeat(32), size: 400 }, // new
             // style.css removed
           },
@@ -5539,7 +5774,7 @@ describe('POST /projects/:id/deploy/preflight', () => {
     });
   });
 
-  it('backfills a legacy rollback target before preflight deduplication', async () => {
+  it('requires explicit pointer normalization before preflight deduplication', async () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id, 'legacy-preflight-rollback');
     const rollbackTarget = await createTestDeployment(env.db, project.id, 'live');
@@ -5594,13 +5829,9 @@ describe('POST /projects/:id/deploy/preflight', () => {
       }),
       env,
     );
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      needed: ['/index.html'],
-      total: 1,
-      skipped: 0,
-    });
-    expect((await getProject(env.db, project.id))?.active_deployment_id).toBe(rollbackTarget.id);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: 'project_requires_normalization' });
+    expect((await getProject(env.db, project.id))?.active_deployment_id).toBeNull();
   });
 
   // Removed: "merges previous asset manifest when preflight flag is set on
@@ -5747,7 +5978,7 @@ describe('POST /projects/:id/deploy/preflight', () => {
   });
 
   describe('static → WfP project type transition', () => {
-    it('returns all assets as needed when previous deploy was static and current has worker', async () => {
+    it('requires scoped R2 uploads when a historical static deployment gains a Worker', async () => {
       const user = await createTestUser(env.db);
       const project = await createTestProject(env.db, user.id);
 
@@ -5778,9 +6009,7 @@ describe('POST /projects/:id/deploy/preflight', () => {
       }
       await env.ROUTING.put(`manifest:${prevDeploy.id}`, JSON.stringify(servingManifest));
 
-      // Preflight with hasWorker=true (converting to a Void/WfP deploy)
-      // All assets should be returned as needed since they must be uploaded
-      // to CF's asset API (they only exist in KV/R2 from the static deploy)
+      // Historical serving metadata alone cannot prove scoped R2 availability.
       const res = await app.fetch(
         new Request(`http://localhost/projects/${project.id}/deploy/preflight`, {
           method: 'POST',
@@ -5802,7 +6031,7 @@ describe('POST /projects/:id/deploy/preflight', () => {
 
       expect(res.status).toBe(200);
       const data = (await res.json()) as { needed: Array<string>; total: number; skipped: number };
-      // All assets must be re-uploaded — they're in KV/R2, not CF's asset store
+      // Every asset is absent from the scoped R2 store.
       expect(data.needed.sort()).toEqual(['/app.js', '/index.html', '/style.css']);
       expect(data.total).toBe(3);
       expect(data.skipped).toBe(0);
@@ -5837,6 +6066,8 @@ describe('POST /projects/:id/deploy/preflight', () => {
       await env.ROUTING.put(`manifest:${prevDeploy.id}`, JSON.stringify(servingManifest));
 
       // Preflight WITHOUT hasWorker (staying as static deploy)
+      await env.STATIC_ASSETS_R2.put(`assets/${project.id}/${'a'.repeat(32)}`, new Uint8Array(100));
+
       const res = await app.fetch(
         new Request(`http://localhost/projects/${project.id}/deploy/preflight`, {
           method: 'POST',
@@ -5847,7 +6078,7 @@ describe('POST /projects/:id/deploy/preflight', () => {
           body: JSON.stringify({
             assetManifest: {
               '/index.html': { hash: 'a'.repeat(32), size: 100 }, // unchanged
-              '/app.js': { hash: 'x'.repeat(32), size: 250 }, // changed
+              '/app.js': { hash: 'f'.repeat(32), size: 250 }, // changed
             },
           }),
         }),
@@ -5862,7 +6093,7 @@ describe('POST /projects/:id/deploy/preflight', () => {
       expect(data.skipped).toBe(1);
     });
 
-    it('does not crash on deploy when converting static project to WfP with preflight', async () => {
+    it('reuses scoped R2 assets when converting a current static deployment to WfP', async () => {
       const user = await createTestUser(env.db);
       const project = await createTestProject(env.db, user.id, 'static-to-void');
 
@@ -5882,8 +6113,9 @@ describe('POST /projects/:id/deploy/preflight', () => {
       );
       expect(staticDone).toBeDefined();
 
-      // 2. Now convert to a WfP deploy with preflight
-      // Preflight should return all assets as needed (hasWorker=true)
+      // Both deployment modes use the same scoped R2 bytes.
+      const indexBytes = new TextEncoder().encode('<h1>hello</h1>');
+      const appBytes = new TextEncoder().encode('console.log(1)');
       const preflightRes = await app.fetch(
         new Request(`http://localhost/projects/${project.id}/deploy/preflight`, {
           method: 'POST',
@@ -5893,8 +6125,14 @@ describe('POST /projects/:id/deploy/preflight', () => {
           },
           body: JSON.stringify({
             assetManifest: {
-              '/index.html': { hash: 'a'.repeat(32), size: 100 },
-              '/app.js': { hash: 'b'.repeat(32), size: 200 },
+              '/index.html': {
+                hash: computeAssetHash(indexBytes.buffer, '/index.html'),
+                size: indexBytes.length,
+              },
+              '/app.js': {
+                hash: computeAssetHash(appBytes.buffer, '/app.js'),
+                size: appBytes.length,
+              },
             },
             hasWorker: true,
           }),
@@ -5907,11 +6145,10 @@ describe('POST /projects/:id/deploy/preflight', () => {
         total: number;
         skipped: number;
       };
-      // All assets should be needed — they exist in KV/R2, not CF asset store
-      expect(pfData.skipped).toBe(0);
-      expect(pfData.needed.length).toBe(2);
+      expect(pfData.skipped).toBe(2);
+      expect(pfData.needed).toEqual([]);
 
-      // 3. Deploy as WfP with all assets (since preflight returned all as needed)
+      // Worker finalization hydrates the existing scoped R2 copy for Cloudflare.
       mockCfApi();
       const deployRes = await app.fetch(
         await buildDeployRequest(env, project.id, user.jwt, {

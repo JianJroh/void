@@ -9,9 +9,12 @@ import type {
   RoomDefinition,
   SocketDefinition,
   WebSocketConnection,
+  WebSocketInstanceKey,
 } from './ws.ts';
 
 export type WebSocketRouteMeta = {
+  name?: string;
+  key?: WebSocketInstanceKey;
   pattern: string;
   params: Array<string>;
   className: string;
@@ -101,11 +104,24 @@ function getRouteMatch(request: Request, route: WebSocketRouteMeta): Record<stri
 }
 
 export function buildWebSocketInstanceId(
-  route: Pick<WebSocketRouteMeta, 'params'>,
+  route: Pick<WebSocketRouteMeta, 'params' | 'key'>,
   params: Record<string, string>,
 ): string {
+  if (route.key) {
+    const key = route.key({ params });
+    if (typeof key !== 'string') {
+      throw new Error('ws: key must return a string synchronously.');
+    }
+    return key;
+  }
   if (route.params.length === 0) {
     return 'default';
+  }
+  const entries = route.params.map((name) => [name, params[name] ?? ''] as const);
+  if (entries.length > 1 && entries.some(([, value]) => value.includes('&'))) {
+    // Keep unambiguous legacy identities. Ambiguous tuples must not adopt the
+    // old shared object's data, or collide with literal percent-encoded values.
+    return `v2:${JSON.stringify(entries)}`;
   }
   return route.params.map((name) => `${name}=${params[name] ?? ''}`).join('&');
 }
@@ -170,6 +186,17 @@ function getStoredConnection(webSocket: WebSocket): StoredConnection {
     user: null,
     authState: null,
   };
+}
+
+function completeWebSocketClose(webSocket: WebSocket, code: number, reason: string): void {
+  if (webSocket.readyState === 3) {
+    return;
+  }
+  if ([1004, 1005, 1006, 1015].includes(code)) {
+    webSocket.close();
+  } else {
+    webSocket.close(code, reason);
+  }
 }
 
 function setStoredConnection(webSocket: WebSocket, data: StoredConnection): void {
@@ -281,6 +308,12 @@ export function createWebSocketDurableObject(
   resolveAuthState?: ResolveVoidAuthState,
 ): WebSocketDurableObjectClass {
   assertDefinition(definition);
+  if (definition.name !== route.name) {
+    throw new Error(
+      'ws: name must be statically discoverable in the route definition. Run void info to inspect this route.',
+    );
+  }
+  const instanceRoute = { ...route, key: definition.key };
 
   class VoidWebSocketDurableObject implements WebSocketDurableObjectInstance {
     constructor(
@@ -294,7 +327,7 @@ export function createWebSocketDurableObject(
 
     private async handleFetch(request: Request): Promise<Response> {
       const params = getRouteMatch(request, route) ?? {};
-      const roomId = buildWebSocketInstanceId(route, params);
+      const roomId = buildWebSocketInstanceId(instanceRoute, params);
       const authState =
         authRuntime && resolveAuthState
           ? await resolveAuthState(request, this.env as VoidAuthEnv, authRuntime)
@@ -485,6 +518,7 @@ export function createWebSocketDurableObject(
       reason: string,
       wasClean: boolean,
     ): Promise<void> {
+      completeWebSocketClose(webSocket, code, reason);
       const stored = getStoredConnection(webSocket);
       const request = new Request(`https://void.local${route.pattern}`);
 
@@ -537,7 +571,9 @@ export function createWebSocketTombstoneDurableObject(
       webSocket.close(1012, 'WebSocket route removed');
     }
 
-    async webSocketClose(): Promise<void> {}
+    async webSocketClose(webSocket: WebSocket, code: number, reason: string): Promise<void> {
+      completeWebSocketClose(webSocket, code, reason);
+    }
   };
 }
 

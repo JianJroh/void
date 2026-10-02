@@ -11,7 +11,6 @@ import {
 } from 'vite-plus/test';
 import {
   acceptInvitationByEmail,
-  createBuild,
   createGitHubConnection,
   createInvitation,
   getBuild,
@@ -40,6 +39,7 @@ import {
 } from '../../src/schema.ts';
 import { getAllowlist } from '../../src/signup-allowlist.ts';
 import {
+  createTestBuild,
   clearTables,
   createOperatorToken,
   createTestDeployment,
@@ -529,10 +529,7 @@ describe('operator tenant mutations', () => {
       userId: target.id,
       suspended: 'operator_review',
     });
-    expect(JSON.parse((await env.ROUTING.get(`project:${project.id}`))!)).toEqual({
-      userId: target.id,
-      plan: 'pro',
-    });
+    expect(await env.ROUTING.get(`project:${project.id}`)).toBeNull();
 
     counterCalls.length = 0;
     const retry = await req(
@@ -640,7 +637,8 @@ describe('operator tenant mutations', () => {
       },
     ]);
     expect(transferCounterCalls[1]!.body).not.toHaveProperty('plan');
-    expect(planCounterCalls.map((call) => call.path)).toEqual(['/reevaluate-sandbox']);
+    expect(planCounterCalls.map((call) => call.path)).toEqual(['/init', '/reevaluate-limits']);
+    expect(planCounterCalls[1]!.body).toEqual({ userId: target.id });
     expect(JSON.parse((await env.ROUTING.get(project.slug))!).suspended).toBeUndefined();
 
     resumeSuspendDb.resolve();
@@ -652,10 +650,7 @@ describe('operator tenant mutations', () => {
       suspended: 'operator_review',
       limits: { cpuMs: 50, subRequests: 1000 },
     });
-    expect(JSON.parse((await env.ROUTING.get(`project:${project.id}`))!)).toEqual({
-      userId: target.id,
-      plan: 'pro',
-    });
+    expect(await env.ROUTING.get(`project:${project.id}`)).toBeNull();
 
     const retryDetachStarted = deferred();
     const resumeRetry = deferred();
@@ -1057,6 +1052,55 @@ describe('operator tenant mutations', () => {
     expect(await getUser(env.db, user.id)).toMatchObject({ suspended_reason: 'admin_suspended' });
   });
 
+  test('preserves quota suspension when a new plan cannot finish reevaluating usage', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const user = await createTestUser(env.db, 'quota-update-owner');
+    const project = await createTestProject(env.db, user.id, 'quota-update-project');
+    const originalUser = (await getUser(env.db, user.id))!;
+    const originalProject = (await dbModule.getProject(env.db, project.id))!;
+    await env.db
+      .update(users)
+      .set({ suspended_reason: 'requests_exceeded' })
+      .where(eq(users.id, user.id));
+    await env.ROUTING.put(
+      project.slug,
+      JSON.stringify({
+        workerName: 'worker',
+        projectId: project.id,
+        userId: user.id,
+        suspended: 'requests_exceeded',
+      }),
+    );
+    const calls: Array<{ ownerId: string; path: string; body: Record<string, unknown> }> = [];
+    const response = await req(
+      `/users/${user.id}/plan`,
+      { plan: 'pro' },
+      {
+        USAGE_COUNTER: captureUsageCounter(calls, '/reevaluate-limits'),
+      },
+    );
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({
+      error: 'partial_failure',
+      details: { plan: 'pro', cleanupComplete: false },
+    });
+    expect(await getUser(env.db, user.id)).toMatchObject({
+      plan: 'pro',
+      suspended_reason: 'requests_exceeded',
+      billing_cycle_start: originalUser.billing_cycle_start,
+    });
+    expect(JSON.parse((await env.ROUTING.get(project.slug))!)).toMatchObject({
+      suspended: 'requests_exceeded',
+    });
+    expect(calls.map((call) => call.path)).toEqual(['/init', '/reevaluate-limits']);
+    expect(calls[0]!.body).toMatchObject({
+      userId: user.id,
+      plan: 'pro',
+      projectSlugs: { [project.id]: project.slug },
+      projectOwnershipStarts: { [project.id]: originalProject.created_at },
+    });
+  });
+
   test('deletes a user and its projects with structured teardown results', async () => {
     skipOrphanSweepDelay();
     const user = await createTestUser(env.db, 'deleted-user');
@@ -1121,7 +1165,7 @@ describe('operator tenant mutations', () => {
       repositoryId: '8811',
       authorizedByUserId: authorizer.id,
     });
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: owner.id,
       executor: 'container',

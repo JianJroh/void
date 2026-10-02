@@ -13,6 +13,7 @@ import {
   readCloudflareTriggerConfig,
   type CloudflareCommandResult,
 } from '../../src/index.ts';
+import { operationFixture } from '../operation-fixture.ts';
 
 const CURRENT = '11111111-1111-4111-8111-111111111111';
 const NEXT = '22222222-2222-4222-8222-222222222222';
@@ -72,7 +73,7 @@ function runner(overrides?: {
     { version_id: CURRENT, percentage: 100 },
   ];
   let uploaded = false;
-  return vi.fn((args: Array<string>) => {
+  return operationFixture((args: Array<string>) => {
     if (args[0] === 'deployments') {
       statusCalls++;
       if (statusCalls === 1 && overrides?.status) {
@@ -190,7 +191,7 @@ describe('Cloudflare version activation', () => {
     const base = runner({
       bootstrap: ok(`Worker Version ID: ${NEXT}\nhttps://my-worker.example.workers.dev`),
     });
-    const runWrangler = vi.fn((args: Array<string>) =>
+    const runWrangler = operationFixture((args: Array<string>) =>
       args[0] === 'versions' && args[1] === 'view'
         ? ok(
             JSON.stringify({
@@ -283,7 +284,7 @@ describe('Cloudflare version activation', () => {
     try {
       const base = runner();
       const validateUploadedVersion = vi.fn().mockResolvedValue(undefined);
-      const runWrangler = vi.fn((args: Array<string>) => {
+      const runWrangler = operationFixture((args: Array<string>) => {
         if (args[0] === 'versions' && args[1] === 'deploy') {
           const config = JSON.parse(readFileSync(args[args.indexOf('-c') + 1]!, 'utf8'));
           expect(config).toEqual({ account_id: 'account', name: 'my-worker' });
@@ -376,7 +377,7 @@ describe('Cloudflare version activation', () => {
     const draft = '44444444-4444-4444-8444-444444444444';
     const base = runner();
     let uploaded = false;
-    const runWrangler = vi.fn((args: Array<string>) => {
+    const runWrangler = operationFixture((args: Array<string>) => {
       if (args[0] === 'versions' && args[1] === 'list') {
         return ok(
           JSON.stringify([
@@ -461,7 +462,7 @@ describe('Cloudflare version activation', () => {
           ]),
         ),
       });
-      const runWrangler = vi.fn((args: Array<string>) => {
+      const runWrangler = operationFixture((args: Array<string>) => {
         if (args[0] === 'versions' && args[1] === 'view') {
           const versionId = args[2]!;
           return ok(
@@ -501,7 +502,7 @@ describe('Cloudflare version activation', () => {
       status: { stdout: '', stderr: 'The Worker first has no deployments.', status: 1 },
       versions: ok(JSON.stringify([{ id: foreign, number: 1 }])),
     });
-    const runWrangler = vi.fn((args: Array<string>) => {
+    const runWrangler = operationFixture((args: Array<string>) => {
       if (args[0] === 'versions' && args[1] === 'view') {
         return ok(
           JSON.stringify({
@@ -534,7 +535,7 @@ describe('Cloudflare version activation', () => {
     const failed = '44444444-4444-4444-8444-444444444444';
     const base = runner();
     let uploaded = false;
-    const runWrangler = vi.fn((args: Array<string>) => {
+    const runWrangler = operationFixture((args: Array<string>) => {
       if (args[0] === 'versions' && args[1] === 'list') {
         return ok(
           JSON.stringify([
@@ -575,7 +576,7 @@ describe('Cloudflare version activation', () => {
     const abandoned = '44444444-4444-4444-8444-444444444444';
     const base = runner();
     let uploaded = false;
-    const runWrangler = vi.fn((args: Array<string>) => {
+    const runWrangler = operationFixture((args: Array<string>) => {
       if (args[0] === 'versions' && args[1] === 'list') {
         return ok(
           JSON.stringify([
@@ -628,7 +629,7 @@ describe('Cloudflare version activation', () => {
         ]),
       ),
     });
-    const runWrangler = vi.fn((args: Array<string>) => {
+    const runWrangler = operationFixture((args: Array<string>) => {
       if (args[0] === 'versions' && args[1] === 'view') {
         return ok(
           JSON.stringify({
@@ -693,7 +694,7 @@ describe('Cloudflare version activation', () => {
     const concurrent = '44444444-4444-4444-8444-444444444444';
     let listed = 0;
     const base = runner();
-    const runWrangler = vi.fn((args: Array<string>) => {
+    const runWrangler = operationFixture((args: Array<string>) => {
       if (args[0] === 'versions' && args[1] === 'list') {
         listed++;
         return ok(
@@ -726,7 +727,7 @@ describe('Cloudflare version activation', () => {
   it('detects an intervening version even when it is deleted before the second list', async () => {
     let listed = 0;
     const base = runner();
-    const runWrangler = vi.fn((args: Array<string>) => {
+    const runWrangler = operationFixture((args: Array<string>) => {
       if (args[0] === 'versions' && args[1] === 'list') {
         listed++;
         return ok(
@@ -759,7 +760,7 @@ describe('Cloudflare version activation', () => {
     let listed = 0;
     const failedCandidate = CONCURRENT;
     const base = runner();
-    const runWrangler = vi.fn((args: Array<string>) => {
+    const runWrangler = operationFixture((args: Array<string>) => {
       if (args[0] === 'versions' && args[1] === 'list') {
         listed++;
         return ok(
@@ -823,14 +824,14 @@ describe('Cloudflare version activation', () => {
       );
       let applied: Record<string, unknown> | undefined;
       await deployCloudflareVersionTriggers({
-        runWrangler: async (args) => {
+        runWrangler: operationFixture(async (args) => {
           const configIndex = args.indexOf('-c');
           applied = JSON.parse(readFileSync(args[configIndex + 1]!, 'utf-8')) as Record<
             string,
             unknown
           >;
           return ok();
-        },
+        }),
         workerName: 'app',
         configPath,
         triggerConfig,
@@ -898,7 +899,7 @@ describe('Cloudflare version activation', () => {
   it('uses the last published traffic values while adding an ordinary cron', async () => {
     let applied: Record<string, unknown> | undefined;
     const base = runner();
-    const runWrangler = vi.fn((args: Array<string>) => {
+    const runWrangler = operationFixture((args: Array<string>) => {
       if (args[0] === 'triggers') {
         applied = JSON.parse(readFileSync(args[args.indexOf('-c') + 1]!, 'utf8')) as Record<
           string,
@@ -1071,14 +1072,14 @@ describe('Cloudflare version activation', () => {
     let applied: Record<string, unknown> | undefined;
     await deployCloudflareVersionTriggers({
       manageRoutes: false,
-      runWrangler: async (args) => {
+      runWrangler: operationFixture(async (args) => {
         const configIndex = args.indexOf('-c');
         applied = JSON.parse(readFileSync(args[configIndex + 1]!, 'utf-8')) as Record<
           string,
           unknown
         >;
         return ok();
-      },
+      }),
       workerName: 'app',
       triggerConfig: {
         workers_dev: false,
@@ -1097,10 +1098,10 @@ describe('Cloudflare version activation', () => {
   it('removes queue consumers omitted from the desired trigger snapshot', async () => {
     const calls: Array<Array<string>> = [];
     const result = await deployCloudflareVersionTriggers({
-      runWrangler: async (args) => {
+      runWrangler: operationFixture(async (args) => {
         calls.push(args);
         return ok();
-      },
+      }),
       workerName: 'app',
       triggerConfig: {
         workers_dev: true,
@@ -1136,14 +1137,14 @@ describe('Cloudflare version activation', () => {
   it('clears schedules without deleting removed workflow state', async () => {
     let applied: Record<string, unknown> | undefined;
     await deployCloudflareVersionTriggers({
-      runWrangler: async (args) => {
+      runWrangler: operationFixture(async (args) => {
         const configIndex = args.indexOf('-c');
         applied = JSON.parse(readFileSync(args[configIndex + 1]!, 'utf-8')) as Record<
           string,
           unknown
         >;
         return ok();
-      },
+      }),
       workerName: 'app',
       triggerConfig: {
         workers_dev: true,
@@ -1171,7 +1172,7 @@ describe('Cloudflare version activation', () => {
   it('publishes an explicit empty set when removing the final custom domain', async () => {
     const publishEmptyCustomDomains = vi.fn(async () => ok());
     const result = await deployCloudflareVersionTriggers({
-      runWrangler: async () => ok(),
+      runWrangler: operationFixture(async () => ok()),
       workerName: 'app',
       triggerConfig: {
         workers_dev: true,
@@ -1197,9 +1198,13 @@ describe('Cloudflare version activation', () => {
   });
 
   it('publishes an explicit empty Cron Trigger set and fails when Cloudflare rejects it', async () => {
-    const publishEmptyCrons = vi.fn(async () => ({ status: 1, stdout: '', stderr: 'rejected' }));
+    const publishEmptyCrons = operationFixture(async () => ({
+      status: 1,
+      stdout: '',
+      stderr: 'rejected',
+    }));
     const result = await deployCloudflareVersionTriggers({
-      runWrangler: async () => ok(),
+      runWrangler: operationFixture(async () => ok()),
       workerName: 'app',
       triggerConfig: {
         workers_dev: true,
@@ -1284,14 +1289,14 @@ describe('Cloudflare version activation', () => {
     ): Promise<Record<string, unknown>> => {
       let config: Record<string, unknown> | undefined;
       await deployCloudflareVersionTriggers({
-        runWrangler: async (args) => {
+        runWrangler: operationFixture(async (args) => {
           const configIndex = args.indexOf('-c');
           config = JSON.parse(readFileSync(args[configIndex + 1]!, 'utf-8')) as Record<
             string,
             unknown
           >;
           return ok();
-        },
+        }),
         workerName: 'app',
         configPath,
         triggerConfig,
@@ -1340,14 +1345,14 @@ describe('Cloudflare version activation', () => {
       // just left. Encoding "handlers removed" as `[]` is therefore a product call, not a fix.
       let rollbackConfig: Record<string, unknown> | undefined;
       await deployCloudflareVersionTriggers({
-        runWrangler: async (args) => {
+        runWrangler: operationFixture(async (args) => {
           const configIndex = args.indexOf('-c');
           rollbackConfig = JSON.parse(readFileSync(args[configIndex + 1]!, 'utf-8')) as Record<
             string,
             unknown
           >;
           return ok();
-        },
+        }),
         workerName: 'app',
         configPath,
         triggerConfig: without,
@@ -1444,7 +1449,7 @@ describe('Cloudflare version activation', () => {
       queueConsumers: [{ queue: 'concurrent-jobs' }],
       workflows: [],
     };
-    const runWrangler = vi.fn(async (args: Array<string>) => {
+    const runWrangler = operationFixture(async (args: Array<string>) => {
       if (args[0] === 'deployments') {
         return ok(JSON.stringify({ versions: [{ version_id: activeVersionId, percentage: 100 }] }));
       }
@@ -1580,7 +1585,7 @@ describe('Cloudflare version activation', () => {
         workflows: [],
         ...(previousAddresses === undefined ? {} : { addresses: previousAddresses }),
       };
-      const runWrangler = async (args: Array<string>) => {
+      const runWrangler = operationFixture(async (args: Array<string>) => {
         if (args[0] === 'deployments') {
           return ok(
             JSON.stringify({ versions: [{ version_id: activeVersionId, percentage: 100 }] }),
@@ -1620,7 +1625,7 @@ describe('Cloudflare version activation', () => {
           return ok();
         }
         throw new Error(`Unexpected command: ${args.join(' ')}`);
-      };
+      });
 
       const pending = activateCloudflareVersion({
         runWrangler,
@@ -1674,7 +1679,7 @@ describe('Cloudflare version activation', () => {
       queueConsumers: [],
       workflows: [],
     });
-    const runWrangler = vi.fn(async (args: Array<string>) => {
+    const runWrangler = operationFixture(async (args: Array<string>) => {
       if (args[0] === 'deployments') {
         return ok(JSON.stringify({ versions: [{ version_id: activeVersionId, percentage: 100 }] }));
       }
@@ -1797,7 +1802,7 @@ describe('Cloudflare version activation', () => {
     const base = runner();
     let secretsPath: string | undefined;
     let uploadedSecrets: unknown;
-    const runWrangler = vi.fn((args: Array<string>) => {
+    const runWrangler = operationFixture((args: Array<string>) => {
       if (args[0] === 'versions' && args[1] === 'upload') {
         secretsPath = args[args.indexOf('--secrets-file') + 1];
         uploadedSecrets = JSON.parse(readFileSync(secretsPath!, 'utf8'));
@@ -2127,7 +2132,7 @@ describe('Cloudflare version activation', () => {
 
   it('does not stage over a production owner that changed after upload', async () => {
     let statusCalls = 0;
-    const runWrangler = vi.fn(async (args: Array<string>) => {
+    const runWrangler = operationFixture(async (args: Array<string>) => {
       if (args[0] === 'deployments') {
         statusCalls++;
         const versionId = statusCalls === 1 ? CURRENT : CONCURRENT;
@@ -2163,7 +2168,7 @@ describe('Cloudflare version activation', () => {
 
   it('does not use Access fallback staging after a concurrent activation', async () => {
     let statusCalls = 0;
-    const runWrangler = vi.fn(async (args: Array<string>) => {
+    const runWrangler = operationFixture(async (args: Array<string>) => {
       if (args[0] === 'deployments') {
         statusCalls++;
         const versionId = statusCalls === 1 ? CURRENT : CONCURRENT;
@@ -2231,7 +2236,7 @@ describe('Cloudflare version activation', () => {
   it('does not restore failed readiness staging over a concurrent candidate', async () => {
     let deploymentVersions = [{ version_id: CURRENT, percentage: 100 }];
     let deployCalls = 0;
-    const runWrangler = vi.fn(async (args: Array<string>) => {
+    const runWrangler = operationFixture(async (args: Array<string>) => {
       if (args[0] === 'deployments') {
         return ok(JSON.stringify({ versions: deploymentVersions }));
       }
@@ -2334,6 +2339,10 @@ describe('Cloudflare version activation', () => {
       'deployments',
       'versions',
       'deploy',
+      'deployments',
+      'triggers',
+      'deployments',
+      'deployments',
     ]);
   });
 
@@ -2398,6 +2407,72 @@ describe('Cloudflare version activation', () => {
     }
   });
 
+  it.each([
+    { atomic: false, becomesReady: true, timeout: 300_000 },
+    { atomic: false, becomesReady: false, timeout: 300_000 },
+    { atomic: true, becomesReady: false, timeout: 60_000 },
+  ])(
+    'bounds Custom Domain propagation to $timeout ms (atomic=$atomic, ready=$becomesReady)',
+    async ({ atomic, becomesReady, timeout }) => {
+      const runWrangler = runner({
+        ...(atomic
+          ? {}
+          : {
+              status: { stdout: '', stderr: 'Worker not found. [code: 10007]', status: 1 },
+              upload: { stdout: '', stderr: LOCAL_DURABLE_MIGRATION_ERROR, status: 1 },
+            }),
+        bootstrap: ok(`Current Version ID: ${NEXT}`),
+      });
+      let time = 0;
+      let probes = 0;
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => time);
+      try {
+        const result = await activateCloudflareVersion({
+          runWrangler,
+          verifyUploader: () => true,
+          workerName: 'custom-app',
+          atomic,
+          message: encodeCloudflareVersionMessage([], {
+            workers_dev: false,
+            preview_urls: false,
+            routes: [{ pattern: 'app.example.com', custom_domain: true }],
+            crons: [],
+            queueConsumers: [],
+            workflows: [],
+          }),
+          sleep: async (milliseconds) => {
+            time += milliseconds;
+          },
+          fetch: async (url, options) => {
+            expect(url).toBe('https://app.example.com/__void/ready');
+            expect(options?.headers).toEqual({ 'user-agent': 'void-deploy-readiness/1' });
+            probes++;
+            time += 2_000;
+            if (becomesReady && probes > 30) {
+              return Response.json({ ready: true });
+            }
+            throw new Error('getaddrinfo ENOTFOUND app.example.com');
+          },
+        });
+        if (becomesReady) {
+          expect(result).toMatchObject({ ok: true, versionId: NEXT });
+          expect(probes).toBe(31);
+          expect(time).toBeGreaterThan(60_000);
+        } else {
+          expect(result).toMatchObject({
+            ok: false,
+            reason: atomic ? 'atomic-readiness-failed' : 'bootstrap-readiness-failed',
+            diagnostic: expect.stringContaining('retry `void deploy --platform cloudflare`'),
+          });
+        }
+        expect(time).toBeLessThanOrEqual(timeout + 2_000);
+        expect(probes).toBeLessThanOrEqual(Math.ceil(timeout / 2_000));
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
   it('rolls traffic back when trigger activation fails', async () => {
     const runWrangler = runner({ triggers: { ...ok(), status: 1 } });
     const result = await activateCloudflareVersion({
@@ -2451,7 +2526,7 @@ describe('Cloudflare version activation', () => {
       triggers: { ...ok(), status: 1 },
     });
     const publications: Array<Record<string, unknown>> = [];
-    const runWrangler = vi.fn((args: Array<string>) => {
+    const runWrangler = operationFixture((args: Array<string>) => {
       if (args[0] === 'triggers') {
         publications.push(JSON.parse(readFileSync(args[args.indexOf('-c') + 1]!, 'utf8')));
       }
@@ -2636,7 +2711,7 @@ describe('Cloudflare version activation', () => {
       },
     });
     let uploaded = false;
-    const runWrangler = vi.fn((args: Array<string>) => {
+    const runWrangler = operationFixture((args: Array<string>) => {
       if (args[0] === 'versions' && args[1] === 'list') {
         return uploaded
           ? ok(JSON.stringify([{ id: NEXT, number: 1 }]))
@@ -2658,6 +2733,134 @@ describe('Cloudflare version activation', () => {
         fetch: async () => Response.json({ ready: true }),
       }),
     ).resolves.toMatchObject({ ok: true, previousVersionId: null });
+  });
+
+  it.each([undefined, CURRENT, CONCURRENT])(
+    'rejects a stale custom-route readiness version %s before candidate activation',
+    async (versionId) => {
+      const runWrangler = runner({ upload: ok(`Worker Version ID: ${NEXT}`) });
+      const result = await activateCloudflareVersion({
+        runWrangler,
+        verifyUploader: () => true,
+        workerName: 'private-app',
+        requireVersionMetadata: true,
+        readinessAttempts: 1,
+        message: encodeCloudflareVersionMessage([], {
+          workers_dev: false,
+          preview_urls: false,
+          routes: [{ pattern: 'app.example.com', custom_domain: true }],
+          crons: [],
+          queueConsumers: [],
+          workflows: [],
+        }),
+        fetch: async () => Response.json({ ready: true, versionId }),
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        reason: 'readiness-failed',
+        rollback: 'succeeded',
+      });
+      const deployments = runWrangler.mock.calls.filter(
+        ([args]) => args[0] === 'versions' && args[1] === 'deploy',
+      );
+      expect(deployments.some(([args]) => args.includes(`${NEXT}@100`))).toBe(false);
+      expect(deployments[0]?.[0]).toContain(`${NEXT}@0`);
+      expect(deployments.at(-1)?.[0]).toContain(`${CURRENT}@100`);
+    },
+  );
+
+  it('waits for the actual candidate on a private custom route and ignores disabled previews', async () => {
+    const runWrangler = runner();
+    const sleep = vi.fn(async () => {});
+    const fetcher = vi.fn(async () =>
+      Response.json({ ready: true, versionId: fetcher.mock.calls.length === 1 ? CURRENT : NEXT }),
+    );
+    const result = await activateCloudflareVersion({
+      runWrangler,
+      verifyUploader: () => true,
+      workerName: 'private-app',
+      requireVersionMetadata: true,
+      readinessAttempts: 2,
+      readinessHeaders: { 'CF-Access-Client-Secret': 'must-not-leak' },
+      message: encodeCloudflareVersionMessage([], {
+        workers_dev: false,
+        preview_urls: false,
+        routes: [{ pattern: 'app.example.com', custom_domain: true }],
+        crons: [],
+        queueConsumers: [],
+        workflows: [],
+      }),
+      fetch: fetcher,
+      sleep,
+    });
+    expect(result).toMatchObject({ ok: true, versionId: NEXT });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    for (const [url, init] of fetcher.mock.calls as unknown as Array<[string, RequestInit]>) {
+      expect(url).toBe('https://app.example.com/__void/ready');
+      expect(init.headers).not.toHaveProperty('CF-Access-Client-Secret');
+      expect(init.headers).toHaveProperty(
+        'Cloudflare-Workers-Version-Overrides',
+        `private-app="${NEXT}"`,
+      );
+    }
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['missing', 'stable', 'wrong-version', 'access-denied', 'atomic'])(
+    'fails closed for a binding-preserving handoff without a usable preview (%s)',
+    async (scenario) => {
+      const url =
+        scenario === 'stable'
+          ? 'https://handoff.example.workers.dev'
+          : scenario === 'wrong-version'
+            ? `https://${CURRENT.slice(0, 8)}-handoff.example.workers.dev`
+            : `https://${NEXT.slice(0, 8)}-handoff.example.workers.dev`;
+      const runWrangler = runner({
+        upload: ok(
+          `Worker Version ID: ${NEXT}${scenario === 'missing' ? '' : `\nVersion Preview URL: ${url}`}`,
+        ),
+      });
+      const fetcher = vi.fn(async () => new Response('error code: 1050', { status: 403 }));
+      const result = await activateCloudflareVersion({
+        runWrangler,
+        verifyUploader: () => true,
+        workerName: 'handoff',
+        preserveTriggers: true,
+        requirePreviewForReadiness: true,
+        atomic: scenario === 'atomic',
+        readinessAttempts: 1,
+        message: encodeCloudflareVersionMessage([]),
+        fetch: fetcher,
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        reason: scenario === 'access-denied' ? 'readiness-access-denied' : 'preview-unavailable',
+      });
+      expect(
+        runWrangler.mock.calls.some(([args]) => args[0] === 'versions' && args[1] === 'deploy'),
+      ).toBe(false);
+      expect(fetcher).toHaveBeenCalledTimes(scenario === 'access-denied' ? 1 : 0);
+    },
+  );
+
+  it('accepts a genuine immutable candidate preview without changing handoff bindings', async () => {
+    const url = `https://${NEXT.slice(0, 8)}-handoff.example.workers.dev`;
+    const runWrangler = runner({
+      upload: ok(`Worker Version ID: ${NEXT}\nVersion Preview URL: ${url}`),
+    });
+    const result = await activateCloudflareVersion({
+      runWrangler,
+      verifyUploader: () => true,
+      workerName: 'handoff',
+      preserveTriggers: true,
+      requirePreviewForReadiness: true,
+      message: encodeCloudflareVersionMessage([]),
+      fetch: async (value) => {
+        expect(value).toBe(`${url}/__void/ready`);
+        return Response.json({ ready: true });
+      },
+    });
+    expect(result).toMatchObject({ ok: true, versionId: NEXT });
   });
 
   it('probes a custom route when workers.dev and preview URLs are disabled', async () => {
@@ -2694,6 +2897,33 @@ describe('Cloudflare version activation', () => {
         },
       }),
     );
+  });
+
+  it.each([false, true])('requires the served UUID after bootstrap (atomic=%s)', async (atomic) => {
+    const runWrangler = runner({
+      ...(atomic
+        ? {}
+        : {
+            status: { stdout: '', stderr: 'Worker not found. [code: 10007]', status: 1 },
+            upload: { stdout: '', stderr: LOCAL_DURABLE_MIGRATION_ERROR, status: 1 },
+          }),
+      bootstrap: ok(`Current Version ID: ${NEXT}\nhttps://bootstrap.example.workers.dev`),
+    });
+    const result = await activateCloudflareVersion({
+      runWrangler,
+      verifyUploader: () => true,
+      workerName: 'bootstrap',
+      atomic,
+      requireVersionMetadata: true,
+      readinessAttempts: 1,
+      message: encodeCloudflareVersionMessage([]),
+      fetch: async () => Response.json({ ready: true, versionId: CURRENT }),
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      reason: atomic ? 'atomic-readiness-failed' : 'bootstrap-readiness-failed',
+      versionId: NEXT,
+    });
   });
 
   it('probes a custom route after first-deployment bootstrap', async () => {
@@ -2735,6 +2965,124 @@ describe('Cloudflare version activation', () => {
     );
   });
 
+  it('stops bootstrap before readiness when its custom domain cannot be published', async () => {
+    const runWrangler = runner({
+      status: { stdout: '', stderr: 'Worker not found. [code: 10007]', status: 1 },
+      upload: { stdout: '', stderr: LOCAL_DURABLE_MIGRATION_ERROR, status: 1 },
+      bootstrap: ok(`Current Version ID: ${NEXT}`),
+      triggers: { stdout: '', stderr: 'Domain publication failed.', status: 1 },
+    });
+    const fetcher = vi.fn();
+    const result = await activateCloudflareVersion({
+      runWrangler,
+      verifyUploader: () => true,
+      workerName: 'first-private',
+      message: encodeCloudflareVersionMessage([], {
+        workers_dev: false,
+        preview_urls: false,
+        routes: [{ pattern: 'app.example.com', custom_domain: true }],
+        crons: [],
+        queueConsumers: [],
+        workflows: [],
+      }),
+      fetch: fetcher,
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'triggers-failed',
+      versionId: NEXT,
+      activeVersionId: NEXT,
+      rollback: 'unavailable',
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    'repairs a concurrent bootstrap owner (during readiness=%s)',
+    async (duringReadiness) => {
+      const concurrentConfig = {
+        workers_dev: false,
+        preview_urls: false,
+        routes: [{ pattern: 'other.example.com', custom_domain: true }],
+        crons: [],
+        queueConsumers: [],
+        workflows: [],
+      };
+      const base = runner({
+        status: { stdout: '', stderr: 'Worker not found. [code: 10007]', status: 1 },
+        upload: { stdout: '', stderr: LOCAL_DURABLE_MIGRATION_ERROR, status: 1 },
+        bootstrap: ok(`Current Version ID: ${NEXT}`),
+      });
+      let bootstrapped = false;
+      let superseded = false;
+      const published: Array<unknown> = [];
+      const runWrangler = operationFixture((args: Array<string>) => {
+        if (superseded && args[0] === 'deployments') {
+          return ok(JSON.stringify({ versions: [{ version_id: CONCURRENT, percentage: 100 }] }));
+        }
+        if (bootstrapped && args[0] === 'versions' && args[1] === 'list') {
+          return ok(
+            JSON.stringify([
+              {
+                id: CONCURRENT,
+                annotations: {
+                  'workers/message': encodeCloudflareVersionMessage([], concurrentConfig),
+                },
+              },
+            ]),
+          );
+        }
+        if (args[0] === 'triggers') {
+          published.push(JSON.parse(readFileSync(args[args.indexOf('-c') + 1]!, 'utf8')));
+        }
+        const result = base(args);
+        if (args[0] === 'deploy') {
+          bootstrapped = true;
+          superseded = !duringReadiness;
+        }
+        return result;
+      });
+      const fetcher = vi.fn(async () => {
+        superseded = true;
+        return Response.json({ ready: true });
+      });
+      const result = await activateCloudflareVersion({
+        runWrangler,
+        verifyUploader: () => true,
+        workerName: 'first-private',
+        message: encodeCloudflareVersionMessage([], {
+          ...concurrentConfig,
+          routes: [{ pattern: 'superseded.example.com', custom_domain: true }],
+        }),
+        fetch: fetcher,
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        reason: 'deployment-changed',
+        activeVersionId: CONCURRENT,
+        rollback: 'not-needed',
+        triggerRepair: 'succeeded',
+      });
+      expect(published).toEqual([
+        ...(duringReadiness
+          ? [
+              expect.objectContaining({
+                routes: [{ pattern: 'superseded.example.com', custom_domain: true }],
+                workers_dev: false,
+                preview_urls: false,
+              }),
+            ]
+          : []),
+        expect.objectContaining({
+          routes: concurrentConfig.routes,
+          workers_dev: false,
+          preview_urls: false,
+        }),
+      ]);
+      expect(fetcher).toHaveBeenCalledTimes(duringReadiness ? 1 : 0);
+    },
+  );
+
   it.each(DURABLE_MIGRATION_ERRORS)(
     'bootstraps first-deploy Durable Object migrations for %s',
     async (error) => {
@@ -2751,7 +3099,7 @@ describe('Cloudflare version activation', () => {
       });
       const secretPayloads: Array<unknown> = [];
       const secretPaths: Array<string> = [];
-      const runWrangler = vi.fn((args: Array<string>) => {
+      const runWrangler = operationFixture((args: Array<string>) => {
         if (
           (args[0] === 'deploy' || (args[0] === 'versions' && args[1] === 'upload')) &&
           args.includes('--secrets-file')
@@ -2786,6 +3134,10 @@ describe('Cloudflare version activation', () => {
         ['deployments', 'status'],
         ['versions', 'upload'],
         ['deploy', '-c'],
+        ['deployments', 'status'],
+        ['triggers', 'deploy'],
+        ['deployments', 'status'],
+        ['deployments', 'status'],
       ]);
       expect(runWrangler.mock.calls[2]![0]).toContain('--autoconfig=false');
       expect(runWrangler.mock.calls[2]![0]).toContain('--assets');
@@ -2854,6 +3206,10 @@ describe('Cloudflare version activation', () => {
       'deployments',
       'versions',
       'deploy',
+      'deployments',
+      'triggers',
+      'deployments',
+      'deployments',
     ]);
   });
 
@@ -3121,7 +3477,7 @@ describe('Cloudflare version activation', () => {
       upload,
       bootstrap: ok(`Current Version ID: ${NEXT}\nhttps://first.example.workers.dev`),
     });
-    return vi.fn((args: Array<string>) => {
+    return operationFixture((args: Array<string>) => {
       if (args[0] === 'versions' && args[1] === 'view') {
         expect(args[2]).toBe(CURRENT);
         return inspection;

@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vite-plus/test';
+import type { CloudflareCommandResult } from '../../src/execute.ts';
 import {
   CloudflareWorkerInspectionError,
   assertCloudflareDurableObjectLifecycleSupported,
@@ -12,6 +13,7 @@ import {
   assertCloudflareBindingsPreserved,
   type ExistingCloudflareWorker,
 } from '../../src/existing.ts';
+import { operationFixture } from '../operation-fixture.ts';
 
 const worker: ExistingCloudflareWorker = {
   versionId: 'original',
@@ -28,6 +30,23 @@ const config = {
   compatibility_date: '2026-02-24',
   kv_namespaces: [{ binding: 'KV', id: 'existing-id' }],
 };
+
+it('preserves an existing authored version metadata binding without permitting additions', () => {
+  const metadata = { type: 'version_metadata', name: 'APP_VERSION' };
+  const existing = { ...worker, bindings: [...worker.bindings, metadata] };
+  const authored = { ...config, version_metadata: { binding: 'APP_VERSION' } };
+  expect(() => assertExistingCloudflareConfig(existing, authored)).not.toThrow();
+  expect(() => assertCloudflareBindingsPreserved(existing, existing)).not.toThrow();
+  expect(() => assertExistingCloudflareConfig(existing, config)).toThrow('version_metadata');
+  expect(() => assertExistingCloudflareConfig(worker, authored)).toThrow('cannot add or replace');
+  expect(() =>
+    assertExistingCloudflareConfig(existing, {
+      ...authored,
+      version_metadata: { binding: '__VOID_VERSION_METADATA' },
+    }),
+  ).toThrow('cannot add or replace');
+  expect(() => assertCloudflareBindingsPreserved(worker, existing)).toThrow('preserve');
+});
 
 describe('assets-only Worker handoff', () => {
   const assetsOnly: ExistingCloudflareWorker = {
@@ -309,7 +328,7 @@ describe('existing Worker preservation', () => {
   });
   it('reads the active version and detects changes during inspection', async () => {
     let statuses = 0;
-    const runWrangler = vi.fn((args: Array<string>) => ({
+    const runWrangler = operationFixture((args: Array<string>) => ({
       status: 0,
       stderr: '',
       stdout: JSON.stringify(
@@ -341,19 +360,21 @@ describe('existing Worker preservation', () => {
   });
 
   it('does not infer an active migration tag from an explicitly requested candidate', async () => {
-    const runWrangler = vi.fn((_args: Array<string>, _options: { capture: boolean }) => ({
-      status: 0,
-      stderr: '',
-      stdout: JSON.stringify({
-        id: 'candidate',
-        migration_tag: 'not-authoritative',
-        resources: {
-          bindings: [],
-          script: { handlers: ['fetch'] },
-          script_runtime: { migration_tag: 'still-not-authoritative' },
-        },
+    const runWrangler = operationFixture(
+      (_args: Array<string>, _options: { capture: boolean }) => ({
+        status: 0,
+        stderr: '',
+        stdout: JSON.stringify({
+          id: 'candidate',
+          migration_tag: 'not-authoritative',
+          resources: {
+            bindings: [],
+            script: { handlers: ['fetch'] },
+            script_runtime: { migration_tag: 'still-not-authoritative' },
+          },
+        }),
       }),
-    }));
+    );
     const candidate = await readExistingCloudflareWorker({
       runWrangler,
       workerName: 'site',
@@ -366,7 +387,7 @@ describe('existing Worker preservation', () => {
   });
   it.each([403, 404, 1])('never turns a failed read (%s) into Worker creation', async (status) => {
     const inspect = readExistingCloudflareWorker({
-      runWrangler: () => ({ status, stdout: '', stderr: 'private data' }),
+      runWrangler: operationFixture(() => ({ status, stdout: '', stderr: 'private data' })),
       workerName: 'site',
       configPath: '/app/wrangler.jsonc',
     });
@@ -385,7 +406,7 @@ describe('existing Worker preservation', () => {
         ],
       }),
     );
-    const runWrangler = vi.fn((args: Array<string>) => ({
+    const runWrangler = operationFixture((args: Array<string>) => ({
       status: 0,
       stderr: '',
       stdout: JSON.stringify(
@@ -436,12 +457,12 @@ describe('existing Worker preservation', () => {
       configPath,
       JSON.stringify({ migrations: [{ tag: 'v1', new_sqlite_classes: ['Room'] }] }),
     );
-    const missing = vi.fn(() => ({
+    const missing = operationFixture(() => ({
       status: 1,
       stdout: '',
       stderr: 'This Worker does not exist. [code: 10007]',
     }));
-    const active = vi.fn((args: Array<string>) => ({
+    const active = operationFixture((args: Array<string>) => ({
       status: 0,
       stderr: '',
       stdout: JSON.stringify(
@@ -482,6 +503,39 @@ describe('existing Worker preservation', () => {
     }
   });
 
+  it.each<Partial<CloudflareCommandResult>>([
+    { signal: 'SIGTERM' },
+    { error: 'provider process failed' },
+    { status: Number.NaN },
+  ])('never treats an interrupted lifecycle probe as an absent Worker: %j', async (provenance) => {
+    const root = mkdtempSync(join(tmpdir(), 'void-do-interrupted-'));
+    const configPath = join(root, 'wrangler.jsonc');
+    writeFileSync(
+      configPath,
+      JSON.stringify({ migrations: [{ tag: 'v1', new_sqlite_classes: ['Room'] }] }),
+    );
+    try {
+      await expect(
+        assertCloudflareDurableObjectLifecycleSupported({
+          runWrangler: () => ({
+            status: 1,
+            stdout: '',
+            stderr: '',
+            errorCode: 10007,
+            failure: 'not-found',
+            ...provenance,
+          }),
+          configPath,
+          workerName: 'app',
+          accountId: 'account',
+          apiBaseUrl: 'https://api.cloudflare.test/client/v4',
+        }),
+      ).rejects.toBeInstanceOf(CloudflareWorkerInspectionError);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('accepts an already-published declarative Durable Object state without a legacy tag', async () => {
     const root = mkdtempSync(join(tmpdir(), 'void-do-exports-'));
     const configPath = join(root, 'wrangler.jsonc');
@@ -494,7 +548,7 @@ describe('existing Worker preservation', () => {
         ],
       }),
     );
-    const runWrangler = vi.fn((args: Array<string>) => ({
+    const runWrangler = operationFixture((args: Array<string>) => ({
       status: 0,
       stderr: '',
       stdout: JSON.stringify(
@@ -532,7 +586,7 @@ describe('existing Worker preservation', () => {
     const root = mkdtempSync(join(tmpdir(), 'void-do-lifecycle-'));
     const configPath = join(root, 'wrangler.jsonc');
     writeFileSync(configPath, JSON.stringify({ migrations: [{ tag: 'v1' }] }));
-    const runWrangler = vi.fn(() => {
+    const runWrangler = operationFixture(() => {
       throw new Error('must not run');
     });
     try {
@@ -585,7 +639,7 @@ describe('existing Worker preservation', () => {
         configPath,
         JSON.stringify({ migrations: [{ tag: 'live-v1', new_sqlite_classes: ['Room'] }] }),
       );
-      const runWrangler = vi.fn((args: Array<string>) => ({
+      const runWrangler = operationFixture((args: Array<string>) => ({
         status: 0,
         stderr: '',
         stdout: JSON.stringify(
@@ -638,7 +692,7 @@ describe('existing Worker preservation', () => {
   });
 
   it('reads the authoritative migration tag from Worker script metadata', async () => {
-    const runWrangler = vi.fn(() => ({
+    const runWrangler = operationFixture(() => ({
       status: 0,
       stdout: JSON.stringify({ type: 'oauth', token: 'private-token' }),
       stderr: '',
@@ -682,7 +736,7 @@ describe('existing Worker preservation', () => {
       configPath,
       JSON.stringify({ migrations: [{ tag: 'v1', new_sqlite_classes: ['Room'] }] }),
     );
-    const runWrangler = vi.fn((args: Array<string>) => ({
+    const runWrangler = operationFixture((args: Array<string>) => ({
       status: 0,
       stderr: '',
       stdout: JSON.stringify(

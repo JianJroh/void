@@ -10,6 +10,7 @@ import type { Context } from 'hono';
 import type { ApiEnv } from '../../env.ts';
 import { OperatorError } from '../../operator/common.ts';
 import {
+  loadPlansPage,
   loadBuildDetailPage,
   loadAuthEditPage,
   loadAuthNewPage,
@@ -25,7 +26,18 @@ import {
   loadSignupPage,
   loadUserDetailPage,
   loadUsersPage,
+  loadZeroTrustPage,
 } from './page-data.ts';
+
+type PlansRecord = Awaited<ReturnType<typeof loadPlansPage>>;
+export const plansDataView = dataView<PlansRecord>('AdminPlans')({
+  id: true,
+  catalog: true,
+  accounts: true,
+  selectedPlanId: true,
+});
+export type AdminPlans = Entity<typeof plansDataView, 'AdminPlans'>;
+const plansSource: SourceDefinition<PlansRecord> = { id: 'id', view: plansDataView };
 
 type AdminContext = Context<ApiEnv>;
 type UsersPageRecord = Awaited<ReturnType<typeof loadUsersPage>>;
@@ -43,6 +55,7 @@ type AuthNewRecord = Awaited<ReturnType<typeof loadAuthNewPage>>;
 type AuthEditRecord = Awaited<ReturnType<typeof loadAuthEditPage>>;
 type EmailSettingsRecord = Awaited<ReturnType<typeof loadEmailSettingsPage>>;
 type EmailProjectRecord = Awaited<ReturnType<typeof loadEmailProjectPage>>;
+type ZeroTrustRecord = Awaited<ReturnType<typeof loadZeroTrustPage>>;
 
 export const usersPageDataView = dataView<UsersPageRecord>('AdminUsersPage')({
   id: true,
@@ -70,6 +83,8 @@ export const deploymentsPageDataView = dataView<DeploymentsPageRecord>('AdminDep
   tz: true,
 });
 export const userDetailDataView = dataView<UserDetailRecord>('AdminUserDetail')({
+  limits: true,
+  plans: true,
   id: true,
   user: true,
   projects: true,
@@ -87,6 +102,7 @@ export const projectDetailDataView = dataView<ProjectDetailRecord>('AdminProject
   pendingTeamInvitations: true,
   domains: true,
   builds: true,
+  zeroTrust: true,
   cfAccountId: true,
   deployUrl: true,
   tz: true,
@@ -176,6 +192,22 @@ export const emailProjectDataView = dataView<EmailProjectRecord>('AdminEmailProj
   senderDomain: true,
   tz: true,
 });
+export const zeroTrustDataView = dataView<ZeroTrustRecord>('AdminZeroTrust')({
+  id: true,
+  configured: true,
+  enabled: true,
+  status: true,
+  accountId: true,
+  teamDomain: true,
+  identityProviderIds: true,
+  policyIds: true,
+  protectNewProjects: true,
+  operation: true,
+  lastError: true,
+  checked: true,
+  live: true,
+  projects: true,
+});
 
 export type AdminUsersPage = Entity<typeof usersPageDataView, 'AdminUsersPage'>;
 export type AdminProjectsPage = Entity<typeof projectsPageDataView, 'AdminProjectsPage'>;
@@ -195,6 +227,7 @@ export type AdminAuthNew = Entity<typeof authNewDataView, 'AdminAuthNew'>;
 export type AdminAuthEdit = Entity<typeof authEditDataView, 'AdminAuthEdit'>;
 export type AdminEmailSettings = Entity<typeof emailSettingsDataView, 'AdminEmailSettings'>;
 export type AdminEmailProject = Entity<typeof emailProjectDataView, 'AdminEmailProject'>;
+export type AdminZeroTrust = Entity<typeof zeroTrustDataView, 'AdminZeroTrust'>;
 
 const usersSource: SourceDefinition<UsersPageRecord> = { id: 'id', view: usersPageDataView };
 const projectsSource: SourceDefinition<ProjectsPageRecord> = {
@@ -241,8 +274,10 @@ const emailProjectSource: SourceDefinition<EmailProjectRecord> = {
   id: 'id',
   view: emailProjectDataView,
 };
+const zeroTrustSource: SourceDefinition<ZeroTrustRecord> = { id: 'id', view: zeroTrustDataView };
 
 export const pageSourceByType = new Map<string, SourceDefinition>([
+  ['AdminPlans', plansSource],
   ['AdminUsersPage', usersSource],
   ['AdminProjectsPage', projectsSource],
   ['AdminDeploymentsPage', deploymentsSource],
@@ -258,6 +293,7 @@ export const pageSourceByType = new Map<string, SourceDefinition>([
   ['AdminAuthEdit', authEditSource],
   ['AdminEmailSettings', emailSettingsSource],
   ['AdminEmailProject', emailProjectSource],
+  ['AdminZeroTrust', zeroTrustSource],
 ]);
 
 export const pageRegistry: SourceRegistry<AdminContext> = new Map();
@@ -281,6 +317,9 @@ async function loadPages<Item>(
     throw error;
   }
 }
+pageRegistry.set(plansSource, {
+  byIds: async ({ ctx, ids }) => loadPages(ctx, ids, loadPlansPage),
+});
 pageRegistry.set(usersSource, {
   byIds: async ({ ctx, ids }) => loadPages(ctx, ids, loadUsersPage),
 });
@@ -326,6 +365,9 @@ pageRegistry.set(emailSettingsSource, {
 pageRegistry.set(emailProjectSource, {
   byIds: async ({ ctx, ids }) => loadPages(ctx, ids, loadEmailProjectPage),
 });
+pageRegistry.set(zeroTrustSource, {
+  byIds: async ({ ctx, ids }) => loadPages(ctx, ids, loadZeroTrustPage),
+});
 
 function pagePath(input: { args?: Record<string, unknown> }) {
   const path = input.args?.path;
@@ -336,6 +378,7 @@ function pagePath(input: { args?: Record<string, unknown> }) {
 }
 
 export const PageRoot = {
+  plans: plansDataView,
   usersPage: usersPageDataView,
   projectsPage: projectsPageDataView,
   deploymentsPage: deploymentsPageDataView,
@@ -351,9 +394,28 @@ export const PageRoot = {
   authEdit: authEditDataView,
   emailSettings: emailSettingsDataView,
   emailProject: emailProjectDataView,
+  zeroTrust: zeroTrustDataView,
 };
 
 export const pageQueries = {
+  plans: {
+    resolve: ({
+      ctx,
+      input,
+      select,
+    }: {
+      ctx: AdminContext;
+      input: { args?: Record<string, unknown> };
+      select: Array<string>;
+    }) =>
+      resolveSourceById({
+        ctx,
+        id: pagePath(input),
+        input: { select },
+        registry: pageRegistry,
+        source: plansSource,
+      }),
+  },
   usersPage: {
     resolve: ({
       ctx,
@@ -622,6 +684,24 @@ export const pageQueries = {
         input: { select },
         registry: pageRegistry,
         source: emailProjectSource,
+      }),
+  },
+  zeroTrust: {
+    resolve: ({
+      ctx,
+      input,
+      select,
+    }: {
+      ctx: AdminContext;
+      input: { args?: Record<string, unknown> };
+      select: Array<string>;
+    }) =>
+      resolveSourceById({
+        ctx,
+        id: pagePath(input),
+        input: { select },
+        registry: pageRegistry,
+        source: zeroTrustSource,
       }),
   },
 };

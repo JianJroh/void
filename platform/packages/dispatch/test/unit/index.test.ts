@@ -53,6 +53,10 @@ type RoutingEntry = {
   redirectRules?: Array<{ source: string; destination: string; status: number; host?: string }>;
   fallbackRules?: Array<{ source: string; destination: string; status: number; host?: string }>;
   queryAllowlist?: Record<string, Array<string>>;
+  zeroTrust?: {
+    teamDomain: string;
+    audiences: Array<{ hostname: string; audience: string }>;
+  };
 };
 
 function createCtx(): ExecutionContext {
@@ -199,6 +203,29 @@ function createEnv(options: {
 }
 
 describe('dispatch fetch handler', () => {
+  it('fails closed before dispatch when a protected route has no Access assertion', async () => {
+    const { env, workerFetch } = createEnv({
+      routing: {
+        workerName: 'user-app',
+        projectId: 'proj_1',
+        zeroTrust: {
+          teamDomain: 'https://company.cloudflareaccess.com',
+          audiences: [{ hostname: '*.void.app', audience: 'project-audience' }],
+        },
+      },
+    });
+
+    const response = await app.fetch(
+      new Request('https://my-app.void.app/private'),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(403);
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    expect(workerFetch).not.toHaveBeenCalled();
+  });
+
   it('forwards /api requests to user worker', async () => {
     const { env, workerFetch } = createEnv({
       routing: { workerName: 'user-app', projectId: 'proj_1' },
@@ -3182,7 +3209,17 @@ describe('ISR JSON edge cache (pages protocol)', () => {
       'https://my-app.void.app/dashboard?__void=json&__void_isr=legacy',
     );
     expect(jsonCached).toBeDefined();
-    expect(await jsonCached!.text()).toBe(pageData);
+    expect(jsonCached!.headers.get('X-VoidPages')).toBe('true');
+    expect(jsonCached!.headers.get('Vary')).toBe('X-VoidPages');
+    const navigation = await app.fetch(
+      new Request('https://my-app.void.app/dashboard', { headers: { 'X-VoidPages': 'true' } }),
+      env,
+      createCtx(),
+    );
+    expect(workerFetch).toHaveBeenCalledOnce();
+    expect(navigation.headers.get('X-VoidPages')).toBe('true');
+    expect(navigation.headers.get('Vary')).toBe('X-VoidPages');
+    expect(await navigation.json()).toEqual(JSON.parse(pageData));
   });
 
   it('background revalidation populates JSON edge cache', async () => {
@@ -3216,6 +3253,8 @@ describe('ISR JSON edge cache (pages protocol)', () => {
       'https://my-app.void.app/dashboard?__void=json&__void_isr=legacy',
     );
     expect(jsonCached).toBeDefined();
+    expect(jsonCached!.headers.get('X-VoidPages')).toBe('true');
+    expect(jsonCached!.headers.get('Vary')).toBe('X-VoidPages');
     expect(await jsonCached!.text()).toBe(pageData);
     expect(jsonCached!.headers.get('x-isr-cache')).toBe('HIT');
   });
@@ -5451,6 +5490,42 @@ describe('static asset caching', () => {
     await app.fetch(new Request('https://test.void.app/missing.png'), env, createCtx());
     expect(edgeCacheStore.size).toBe(0);
   });
+
+  it.each(['Accept-Language', '*', 'X-VoidPages, Origin'])(
+    'does not share ISR responses with unsupported Vary: %s',
+    async (vary) => {
+      let renderedLanguage = 'en';
+      const { env, workerFetch, kvStore } = createEnv({
+        routing: {
+          workerName: 'test-worker',
+          projectId: 'proj-1',
+          ssr: true,
+          revalidate: 60,
+          version: 'deploy-1',
+        },
+        workerFetchImpl: async () =>
+          new Response(renderedLanguage, {
+            headers: { 'Content-Type': 'text/html', Vary: vary },
+          }),
+      });
+      for (const language of ['en', 'ja']) {
+        renderedLanguage = language;
+        const ctx = createCtx();
+        const response = await app.fetch(
+          new Request('https://test.void.app/', { headers: { 'Accept-Language': language } }),
+          env,
+          ctx,
+        );
+        expect(await response.text()).toBe(language);
+        await Promise.all(
+          (ctx.waitUntil as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[0]),
+        );
+        expect([...kvStore.keys()].filter((key) => key.includes('/isr/'))).toEqual([]);
+        expect(edgeCacheStore.size).toBe(0);
+      }
+      expect(workerFetch).toHaveBeenCalledTimes(2);
+    },
+  );
 
   it('does not cache when worker sets Cache-Control: private', async () => {
     const routing: RoutingEntry = {

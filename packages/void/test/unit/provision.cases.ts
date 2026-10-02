@@ -21,6 +21,13 @@ import { types as nodeUtilTypes } from 'node:util';
 import { parse as parseJsoncRaw } from 'jsonc-parser';
 import { toSlash } from 'pathslash';
 import { afterEach, beforeEach, describe as vitestDescribe, expect, it } from 'vite-plus/test';
+import type { CloudflareOperation } from '../../../deploy-cloudflare/src/operations.ts';
+import {
+  operationFixtureArgs,
+  operationFixtureRequest,
+  operationFixtureResult,
+} from '../../../deploy-cloudflare/test/operation-fixture.ts';
+import { encodeCloudflareOperation } from '../../src/cli/cloudflare-process.ts';
 import {
   acquireProvisionLock,
   assertNoTransportRedirectInProjectDotenv,
@@ -122,6 +129,31 @@ function readConfig(): Record<string, unknown> {
   return parseJsoncRaw(readFileSync(wranglerPath, 'utf-8')) as Record<string, unknown>;
 }
 
+/** Keep the established lock/race scenarios while provider calls use typed requests. */
+function provisionOperationFixture(
+  callback: (
+    args: Array<string>,
+    options: Parameters<RunWrangler>[1],
+  ) => RunWranglerResult | Promise<RunWranglerResult>,
+): RunWrangler {
+  return async (operation, options) => {
+    const args = operationFixtureArgs(operation);
+    if (operation.type === 'hyperdrive.create') {
+      args.splice(3, 0, '--connection-string=' + (options.input ?? ''));
+    }
+    const result = await callback(args, options);
+    const decoded = operationFixtureResult(result);
+    if (
+      operation.type === 'queues.info' &&
+      result.status !== 0 &&
+      result.stderr.includes('Queue "' + operation.name + '" does not exist.')
+    ) {
+      return { ...decoded, failure: 'not-found' };
+    }
+    return decoded;
+  };
+}
+
 /** A logger that swallows output (the default one prints to console). */
 const silentLog = { info: () => {}, warn: () => {} };
 
@@ -134,7 +166,7 @@ type Handler = { match: RegExp; reply: (sub: string) => RunWranglerResult };
  */
 function makeRunner(handlers: Array<Handler>): { run: RunWrangler; calls: Array<Array<string>> } {
   const calls: Array<Array<string>> = [];
-  const run: RunWrangler = (args) => {
+  const run: RunWrangler = provisionOperationFixture((args) => {
     calls.push(args);
     const sub = args.join(' ');
     for (const handler of handlers) {
@@ -143,7 +175,7 @@ function makeRunner(handlers: Array<Handler>): { run: RunWrangler; calls: Array<
       }
     }
     return { stdout: '', stderr: '', status: 0 };
-  };
+  });
   return { run, calls };
 }
 
@@ -242,6 +274,113 @@ describe('D1 read-replication API', () => {
     );
 
     await expect(update).rejects.toThrow(/D1 Edit permission/);
+  });
+});
+
+describe('provisionCloudflareResources — typed operations', () => {
+  it('sends a Hyperdrive connection only through stdin while literal public targets stay structured', async () => {
+    setup('{}');
+    const connection = 'postgres://user:synthetic-password@host/database';
+    const operations: Array<CloudflareOperation> = [];
+    const inputs: Array<string | undefined> = [];
+    const run: RunWrangler = (operation, options) => {
+      operations.push(operation);
+      inputs.push(options.input);
+      simulateUpdateConfig('hyperdrive', { binding: 'HYPERDRIVE', id: hex32('typed') });
+      return ok();
+    };
+    await provisionCloudflareResources(
+      tmpDir,
+      wranglerPath,
+      {
+        ...emptyDesired,
+        hyperdrive: { name: 'typed-hd', binding: 'HYPERDRIVE', connectionString: connection },
+      },
+      { runWrangler: run, listHyperdriveConfigs: async () => [], log: silentLog },
+    );
+    expect(operations).toEqual([
+      {
+        type: 'hyperdrive.create',
+        name: 'typed-hd',
+        binding: 'HYPERDRIVE',
+        configPath: wranglerPath,
+      },
+    ]);
+    expect(inputs).toEqual([connection]);
+    expect(JSON.stringify(operations)).not.toContain('synthetic-password');
+    const encoded = encodeCloudflareOperation(operations[0]!);
+    expect(encoded).toHaveLength(1);
+    expect(encoded.join(' ')).not.toContain('synthetic-password');
+    expect(JSON.parse(encoded[0]!)).toEqual(operations[0]);
+  });
+
+  it('adopts structured Queue identity despite misleading human prose', async () => {
+    setup('{}');
+    const operations: Array<CloudflareOperation> = [];
+    const run: RunWrangler = (operation) => {
+      operations.push(operation);
+      return {
+        status: 0,
+        stdout: 'Queue "typed-jobs" does not exist.',
+        stderr: '',
+        data: { name: 'typed-jobs' },
+      };
+    };
+    await provisionCloudflareResources(
+      tmpDir,
+      wranglerPath,
+      { ...emptyDesired, queues: ['typed-jobs'] },
+      { runWrangler: run, log: silentLog },
+    );
+    expect(operations).toEqual([
+      { type: 'queues.info', name: 'typed-jobs', configPath: wranglerPath },
+    ]);
+  });
+
+  it('creates a Queue from a structured not-found result and verifies the new identity', async () => {
+    setup('{}');
+    const operations: Array<CloudflareOperation> = [];
+    let created = false;
+    const run: RunWrangler = (operation) => {
+      operations.push(operation);
+      if (operation.type === 'queues.create') {
+        created = true;
+        return ok();
+      }
+      return created
+        ? { ...ok(), data: { name: 'typed-jobs' } }
+        : { status: 1, stdout: '', stderr: 'Provider presentation changed.', failure: 'not-found' };
+    };
+    await provisionCloudflareResources(
+      tmpDir,
+      wranglerPath,
+      { ...emptyDesired, queues: ['typed-jobs'] },
+      { runWrangler: run, log: silentLog },
+    );
+    expect(operations.map((operation) => operation.type)).toEqual([
+      'queues.info',
+      'queues.create',
+      'queues.info',
+    ]);
+  });
+
+  it('rejects signal provenance even when structured D1 data looks valid', async () => {
+    setup('{}');
+    const run: RunWrangler = () => ({
+      status: 0,
+      stdout: '',
+      stderr: '',
+      data: [],
+      signal: 'SIGTERM',
+    });
+    await expect(
+      provisionCloudflareResources(
+        tmpDir,
+        wranglerPath,
+        { ...emptyDesired, d1: { name: 'typed-db', binding: 'DB' } },
+        { runWrangler: run, log: silentLog },
+      ),
+    ).rejects.toThrow(/SIGTERM|failed|invalid/);
   });
 });
 
@@ -2662,21 +2801,25 @@ describe('createDefaultRunWrangler — hard timeout kills the REAL process', () 
 
   it('a DIRECT hung CLI is SIGKILLed and the runner REJECTS-as-hard-failure within the timeout', async () => {
     // Simulate the post-fix launcher: a direct CLI entry (no wrapper) that ignores SIGTERM
-    // and hangs forever, writing its pid so the test can confirm it was actually killed.
-    const pidFile = join(TIMEOUT_TMP, 'cli.pid');
+    // and hangs forever.
     const hungCli = join(TIMEOUT_TMP, 'hung-cli.cjs');
     writeFileSync(
       hungCli,
-      `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
-        `process.on('SIGTERM', () => {});\n` + // survives a plain SIGTERM (like the wrapper sends)
+      `process.on('SIGTERM', () => {});\n` + // survives a plain SIGTERM (like the wrapper sends)
         `setInterval(() => {}, 1 << 30);\n`,
     );
+    let pid: number | undefined;
     const run = createDefaultRunWrangler(TIMEOUT_TMP, {
       launcher: [process.execPath, hungCli],
+      onSpawnedChild: (child) => {
+        pid = child.pid;
+      },
       timeoutMs: 400,
     });
     const start = Date.now();
-    const result = await run(['d1', 'list', '--json'], { accountId: 'acct' });
+    const result = await run(operationFixtureRequest(['d1', 'list', '--json']), {
+      accountId: 'acct',
+    });
     const elapsed = Date.now() - start;
     // Settled in bounded time — the runner did NOT hang. The tight ceiling here is a
     // load-tolerant sanity bound (the 400ms internal timer can be delayed on a busy
@@ -2688,8 +2831,8 @@ describe('createDefaultRunWrangler — hard timeout kills the REAL process', () 
     expect(result.stderr).toMatch(/exceeded the 400ms command timeout/);
     // No lingering process — the SIGKILL reached the real CLI. Poll for the OUTCOME
     // (dead pid) with a generous bound rather than racing a tight deadline.
-    const pid = Number(readFileSync(pidFile, 'utf-8'));
-    expect(await waitForDead(pid, 10_000)).toBe(true);
+    expect(pid).toBeTypeOf('number');
+    expect(await waitForDead(pid!, 10_000)).toBe(true);
   }, 20_000);
 
   it('a WRAPPER that re-spawns a hung grandchild: runner still settles in time AND the grandchild is reaped', async () => {
@@ -2737,7 +2880,9 @@ describe('createDefaultRunWrangler — hard timeout kills the REAL process', () 
       timeoutMs: 1_500,
     });
     const start = Date.now();
-    const result = await run(['d1', 'list', '--json'], { accountId: 'acct' });
+    const result = await run(operationFixtureRequest(['d1', 'list', '--json']), {
+      accountId: 'acct',
+    });
     const elapsed = Date.now() - start;
     // Bounded settle (the vitest timeout is the real "did not hang" guard).
     expect(elapsed).toBeLessThan(20_000);
@@ -3415,7 +3560,7 @@ describe('provisionCloudflareResources — transport account context', () => {
     setup(JSON.stringify({ account_id: 'reconciled-acct' }));
     const seenRunAccounts: Array<string> = [];
     const seenListAccounts: Array<string> = [];
-    const run: RunWrangler = (args, opts) => {
+    const run: RunWrangler = provisionOperationFixture((args, opts) => {
       seenRunAccounts.push(opts.accountId);
       const sub = args.join(' ');
       if (/^d1 list --json/.test(sub)) {
@@ -3437,7 +3582,7 @@ describe('provisionCloudflareResources — transport account context', () => {
         return ok();
       }
       return ok();
-    };
+    });
     await provisionCloudflareResources(
       tmpDir,
       wranglerPath,
@@ -4014,14 +4159,14 @@ describe('provisionCloudflareResources — whole-provision cross-process lock (p
       JSON.stringify({ account_id: 'acct', hyperdrive: [{ binding: 'HYPERDRIVE', id: 'local' }] }),
     );
     let createCalls = 0;
-    const run: RunWrangler = (args) => {
+    const run: RunWrangler = provisionOperationFixture((args) => {
       if (isCall(args, 'hyperdrive', 'create')) {
         createCalls++;
         simulateUpdateConfig('hyperdrive', { binding: 'HYPERDRIVE', id: hex32('hd-1') });
         return ok();
       }
       return ok();
-    };
+    });
     const desired = {
       ...emptyDesired,
       hyperdrive: { binding: 'HYPERDRIVE', name: 'myapp-hd', connectionString: 'postgres://x' },
@@ -4097,7 +4242,7 @@ describe('provisionCloudflareResources — whole-provision cross-process lock (p
         `import { provisionCloudflareResources } from ${JSON.stringify(provisionUrl)};\n` +
         `const cfgPath = ${JSON.stringify(wranglerPath)};\n` +
         `const run = (args) => {\n` +
-        `  if (args[0] === 'hyperdrive' && args[1] === 'create') {\n` +
+        `  if (args.type === 'hyperdrive.create') {\n` +
         `    const cfg = JSON.parse(readFileSync(cfgPath, 'utf-8'));\n` +
         `    cfg.hyperdrive = [{ binding: 'HYPERDRIVE', id: process.argv[2] }];\n` +
         `    writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));\n` +
@@ -4230,7 +4375,7 @@ describe('provisionCloudflareResources — whole-provision cross-process lock (p
     // Sanity: the alias and the real config canonicalize to the same real file.
     expect(realpathSync(join(tmpDir, aliasName))).toBe(realpathSync(wranglerPath));
     let createCalls = 0;
-    const run: RunWrangler = (args) => {
+    const run: RunWrangler = provisionOperationFixture((args) => {
       if (isCall(args, 'hyperdrive', 'create')) {
         createCalls++;
         simulateUpdateConfig('hyperdrive', {
@@ -4240,7 +4385,7 @@ describe('provisionCloudflareResources — whole-provision cross-process lock (p
         return ok();
       }
       return ok();
-    };
+    });
     const makeProv = (
       configArg: string,
       retries?: number,
@@ -4286,7 +4431,7 @@ describe('provisionCloudflareResources — whole-provision cross-process lock (p
     delete process.env.CLOUDFLARE_ACCOUNT_ID; // force reconciliation via opts.accountId only
     try {
       const makeProv = (account: string): Promise<unknown> => {
-        const run: RunWrangler = (args) => {
+        const run: RunWrangler = provisionOperationFixture((args) => {
           if (isCall(args, 'd1', 'list')) {
             return ok('[]');
           }
@@ -4299,7 +4444,7 @@ describe('provisionCloudflareResources — whole-provision cross-process lock (p
             return ok();
           }
           return ok();
-        };
+        });
         return provisionCloudflareResources(
           tmpDir,
           wranglerPath,
@@ -4333,14 +4478,14 @@ describe('provisionCloudflareResources — whole-provision cross-process lock (p
 
   it('a wrangler call blocking past a SHORT stale window does NOT let a second process steal the mutex (async heartbeat keeps it fresh)', async () => {
     setup(JSON.stringify({ account_id: 'acct', kv_namespaces: [{ binding: 'KV', id: 'local' }] }));
-    const run: RunWrangler = async (args) => {
+    const run: RunWrangler = provisionOperationFixture(async (args) => {
       if (isCall(args, 'kv', 'namespace', 'list')) {
         // blocks (async) longer than the probe below, which is past the 2s stale window
         await delay(2400);
         return ok(JSON.stringify([{ id: hex32('kv'), title: 'myapp-kv' }]));
       }
       return ok();
-    };
+    });
     const prov = provisionCloudflareResources(
       tmpDir,
       wranglerPath,
@@ -4457,12 +4602,12 @@ describe('provisionCloudflareResources — config compliance_region pins the tra
     );
     let seen: { apiBaseUrl: string } | undefined;
     const calls: Array<Array<string>> = [];
-    const run: RunWrangler = (args, opts) => {
+    const run: RunWrangler = provisionOperationFixture((args, opts) => {
       calls.push(args);
       // The wrangler child is pinned to the SAME base via its env transport context.
       expect(opts.apiBaseUrl).toBe('https://api.fed.cloudflare.com/client/v4');
       return { stdout: '', stderr: '', status: 0 };
-    };
+    });
     try {
       await provisionCloudflareResources(
         tmpDir,
@@ -4702,7 +4847,9 @@ describe('provisionCloudflareResources — Hyperdrive password never reaches wra
     const conn = 'postgres://dbuser:sup3r-secret@db.example.com:5432/app';
     // A rejecting runner is supported control flow; pre-fix only `instanceof Error`
     // rejections were redacted, so this string propagated VERBATIM to the caller.
-    const run: RunWrangler = () => Promise.reject(`hyperdrive create failed for ${conn}`);
+    const run: RunWrangler = provisionOperationFixture(() =>
+      Promise.reject(`hyperdrive create failed for ${conn}`),
+    );
     let thrown: unknown;
     try {
       await provisionCloudflareResources(
@@ -4731,7 +4878,7 @@ describe('provisionCloudflareResources — Hyperdrive password never reaches wra
       detail: `could not connect using ${conn}`,
       attempts: [`first try: ${conn}`, { url: conn }],
     };
-    const run: RunWrangler = () => Promise.reject(rejection);
+    const run: RunWrangler = provisionOperationFixture(() => Promise.reject(rejection));
     let thrown: unknown;
     try {
       await provisionCloudflareResources(
@@ -4761,7 +4908,7 @@ describe('provisionCloudflareResources — Hyperdrive password never reaches wra
       54321,
       `kill failed while running hyperdrive create --connection-string=${conn}`,
     );
-    const run: RunWrangler = () => Promise.reject(quarantineError);
+    const run: RunWrangler = provisionOperationFixture(() => Promise.reject(quarantineError));
     let thrown: unknown;
     try {
       await provisionCloudflareResources(
@@ -4859,7 +5006,7 @@ describe('provisionCloudflareResources — redaction carrier: frozen/nested payl
 
   async function provisionRejectingWith(rejection: unknown): Promise<unknown> {
     setup(JSON.stringify({ account_id: 'acct', name: 'app' }));
-    const run: RunWrangler = () => Promise.reject(rejection);
+    const run: RunWrangler = provisionOperationFixture(() => Promise.reject(rejection));
     let thrown: unknown;
     try {
       await provisionCloudflareResources(tmpDir, wranglerPath, hyperdriveDesired, {
@@ -4981,7 +5128,7 @@ describe('provisionCloudflareResources — hostile values: one no-throw boundary
 
   async function provisionRejectingWith(rejection: unknown): Promise<unknown> {
     setup(JSON.stringify({ account_id: 'acct', name: 'app' }));
-    const run: RunWrangler = () => Promise.reject(rejection);
+    const run: RunWrangler = provisionOperationFixture(() => Promise.reject(rejection));
     let thrown: unknown;
     try {
       await provisionCloudflareResources(tmpDir, wranglerPath, hyperdriveDesired, {
@@ -5710,7 +5857,7 @@ describe('provisionCloudflareResources — quarantine retains the whole-provisio
     // with a quarantine error in that state; injecting the same rejection exercises the
     // provision-level contract: NO release, mutex retained, error surfaced verbatim.
     const quarantineError = new WranglerQuarantineError(43210, 'test: child unconfirmed');
-    const run: RunWrangler = () => Promise.reject(quarantineError);
+    const run: RunWrangler = provisionOperationFixture(() => Promise.reject(quarantineError));
     let thrown: unknown;
     try {
       await provisionCloudflareResources(
@@ -5801,7 +5948,7 @@ describe('createDefaultRunWrangler — parent-signal forwarding awaits confirmed
         `const run = createDefaultRunWrangler(process.cwd(), {\n` +
         `  launcher: [process.execPath, ${JSON.stringify(childScript)}, ${JSON.stringify(pidFile)}],\n` +
         `});\n` +
-        `run(['noop'], { accountId: 'acct' }).then(\n` +
+        `run({ type: 'd1.list' }, { accountId: 'acct' }).then(\n` +
         `  (r) => console.log('runner-settled', r.status, r.signal),\n` +
         `  (e) => console.log('runner-rejected', e.message),\n` +
         `);\n`,
@@ -5894,14 +6041,16 @@ describe('createDefaultRunWrangler — normal close confirms the whole GROUP', (
         `const c = spawn(process.execPath, [${JSON.stringify(gc)}], { stdio: 'ignore' });\n` +
         `c.unref();\n` +
         `setInterval(() => {\n` +
-        `  if (fs.existsSync(${JSON.stringify(gcPidFile)})) { process.exit(0); }\n` +
+        `  if (fs.existsSync(${JSON.stringify(gcPidFile)})) { console.log(JSON.stringify({ operationResult: 1 })); process.exit(0); }\n` +
         `}, 10);\n`,
     );
     const run = createDefaultRunWrangler(GROUP_CLOSE_TMP, {
       launcher: [process.execPath, leader],
       timeoutMs: 30_000,
     });
-    const result = await run(['d1', 'list', '--json'], { accountId: 'acct' });
+    const result = await run(operationFixtureRequest(['d1', 'list', '--json']), {
+      accountId: 'acct',
+    });
     // The leader's own clean exit is reported faithfully...
     expect(result.status).toBe(0);
     expect(result.signal).toBeNull();
@@ -6184,7 +6333,7 @@ describe('acquireProvisionLock — durable sidecar is a PRECONDITION for quarant
         let guardHeld = false;
         try {
           await provisionCloudflareResources(probeDir, probeCfg, emptyDesired, {
-            runWrangler: () => ok('[]'),
+            runWrangler: provisionOperationFixture(() => ok('[]')),
             log: silentLog,
           });
         } catch (error) {
@@ -6266,7 +6415,7 @@ describe('acquireProvisionLock — durable sidecar is a PRECONDITION for quarant
       expect(dead).toBe(true);
     }
     const quarantineError = new WranglerQuarantineError(childPid, 'child unconfirmed');
-    const run: RunWrangler = () => Promise.reject(quarantineError);
+    const run: RunWrangler = provisionOperationFixture(() => Promise.reject(quarantineError));
     let thrown: unknown;
     try {
       await provisionCloudflareResources(
@@ -6333,7 +6482,7 @@ describe('acquireProvisionLock — durable sidecar is a PRECONDITION for quarant
     });
     let failPersistence = true;
     const quarantineError = new WranglerQuarantineError(live.pid, 'live child');
-    const run: RunWrangler = () => Promise.reject(quarantineError);
+    const run: RunWrangler = provisionOperationFixture(() => Promise.reject(quarantineError));
     try {
       let thrown: unknown;
       try {
@@ -6876,18 +7025,21 @@ describe('createDefaultRunWrangler — ONE signal coordinator: repeated signals 
     // provision runs per process — so a second concurrently-active child is always a
     // caller bug and is rejected fast, before any child is spawned.
     const slowChild = join(COORDINATOR_TMP, 'slow-child.cjs');
-    writeFileSync(slowChild, `setTimeout(() => process.exit(0), 400);\n`);
+    writeFileSync(
+      slowChild,
+      `setTimeout(() => { console.log(JSON.stringify({ operationResult: 1 })); process.exit(0); }, 400);\n`,
+    );
     const runA = createDefaultRunWrangler(COORDINATOR_TMP, {
       launcher: [process.execPath, slowChild],
       timeoutMs: 30_000,
     });
-    const first = runA(['noop'], { accountId: 'acct' });
+    const first = runA({ type: 'd1.list' }, { accountId: 'acct' });
     await new Promise((r) => setTimeout(r, 80)); // A's child is alive and registered
     const runB = createDefaultRunWrangler(COORDINATOR_TMP, {
       launcher: [process.execPath, slowChild],
       timeoutMs: 30_000,
     });
-    await expect(runB(['noop'], { accountId: 'acct' })).rejects.toThrow(
+    await expect(runB({ type: 'd1.list' }, { accountId: 'acct' })).rejects.toThrow(
       /another wrangler child is already active in this process/,
     );
     // The first runner is unaffected and settles cleanly.
@@ -6898,7 +7050,10 @@ describe('createDefaultRunWrangler — ONE signal coordinator: repeated signals 
 
   it('permits two immutable Worker uploads while rejecting a third upload or traffic mutation', async () => {
     const slowChild = join(COORDINATOR_TMP, 'parallel-upload.cjs');
-    writeFileSync(slowChild, `setTimeout(() => process.exit(0), 400);\n`);
+    writeFileSync(
+      slowChild,
+      `setTimeout(() => { console.log(JSON.stringify({ operationResult: 1 })); process.exit(0); }, 400);\n`,
+    );
     const spawned: Array<number | undefined> = [];
     const run = createDefaultRunWrangler(COORDINATOR_TMP, {
       launcher: [process.execPath, slowChild],
@@ -6906,18 +7061,20 @@ describe('createDefaultRunWrangler — ONE signal coordinator: repeated signals 
       parallelWorkerUpload: true,
       timeoutMs: 30_000,
     });
-    const first = run(['versions', 'upload'], { accountId: 'acct' });
-    const second = run(['versions', 'upload'], { accountId: 'acct' });
+    const first = run(operationFixtureRequest(['versions', 'upload']), { accountId: 'acct' });
+    const second = run(operationFixtureRequest(['versions', 'upload']), { accountId: 'acct' });
     expect(spawned).toHaveLength(2);
-    await expect(run(['versions', 'upload'], { accountId: 'acct' })).rejects.toThrow(
-      /another wrangler child is already active in this process/,
-    );
-    await expect(run(['versions', 'deploy'], { accountId: 'acct' })).rejects.toThrow(
-      /another wrangler child is already active in this process/,
-    );
+    await expect(
+      run(operationFixtureRequest(['versions', 'upload']), { accountId: 'acct' }),
+    ).rejects.toThrow(/another wrangler child is already active in this process/);
+    await expect(
+      run(operationFixtureRequest(['versions', 'deploy']), { accountId: 'acct' }),
+    ).rejects.toThrow(/another wrangler child is already active in this process/);
     expect(spawned).toHaveLength(2);
     expect((await Promise.all([first, second])).map((result) => result.status)).toEqual([0, 0]);
-    expect((await run(['versions', 'deploy'], { accountId: 'acct' })).status).toBe(0);
+    expect(
+      (await run(operationFixtureRequest(['versions', 'deploy']), { accountId: 'acct' })).status,
+    ).toBe(0);
   }, 15_000);
 
   it('confirms both parallel upload process groups have exited before forwarding SIGTERM', async (ctx) => {
@@ -6938,7 +7095,7 @@ describe('createDefaultRunWrangler — ONE signal coordinator: repeated signals 
         pidFiles
           .map(
             (pidFile) =>
-              `createDefaultRunWrangler(process.cwd(), { launcher: [process.execPath, ${JSON.stringify(childScript)}, ${JSON.stringify(pidFile)}], parallelWorkerUpload: true })(['versions', 'upload'], { accountId: 'acct' }).catch(() => {});\n`,
+              `createDefaultRunWrangler(process.cwd(), { launcher: [process.execPath, ${JSON.stringify(childScript)}, ${JSON.stringify(pidFile)}], parallelWorkerUpload: true })({ type: 'versions.upload' }, { accountId: 'acct' }).catch(() => {});\n`,
           )
           .join(''),
     );
@@ -6997,7 +7154,7 @@ describe('createDefaultRunWrangler — ONE signal coordinator: repeated signals 
         `const runA = createDefaultRunWrangler(process.cwd(), {\n` +
         `  launcher: [process.execPath, ${JSON.stringify(childScript)}, ${JSON.stringify(pidFile)}],\n` +
         `});\n` +
-        `runA(['noop'], { accountId: 'acct' }).then(\n` +
+        `runA({ type: 'd1.list' }, { accountId: 'acct' }).then(\n` +
         `  (r) => console.log('A-settled', r.status, r.signal),\n` +
         `  (e) => console.log('A-rejected', e.message),\n` +
         `);\n`,
@@ -7072,13 +7229,13 @@ describe('createDefaultRunWrangler — ONE signal coordinator: repeated signals 
         `const run = createDefaultRunWrangler(process.cwd(), {\n` +
         `  launcher: [process.execPath, ${JSON.stringify(childScript)}, ${JSON.stringify(pidFile)}],\n` +
         `});\n` +
-        `run(['noop'], { accountId: 'acct' }).catch(() => {});\n` +
+        `run({ type: 'd1.list' }, { accountId: 'acct' }).catch(() => {});\n` +
         // A ONCE listener (consumed by the first SIGTERM, so it can never swallow the
         // coordinator's later re-raise) schedules a mid-teardown spawn attempt. The
         // outcome is written SYNCHRONOUSLY to a file so the re-raise death cannot lose it.
         `process.once('SIGTERM', () => {\n` +
         `  setTimeout(() => {\n` +
-        `    run(['noop-late'], { accountId: 'acct' }).then(\n` +
+        `    run({ type: 'd1.list' }, { accountId: 'acct' }).then(\n` +
         `      () => writeFileSync(${JSON.stringify(outcomeFile)}, 'LATE-SPAWN-ALLOWED'),\n` +
         `      (e) => writeFileSync(${JSON.stringify(outcomeFile)}, 'LATE-SPAWN-REJECTED:' + e.message),\n` +
         `    );\n` +
@@ -7146,7 +7303,7 @@ describe('createDefaultRunWrangler — ONE signal coordinator: repeated signals 
         `  signalTeardownDeadlineMs: 800,\n` +
         `  killProcessGroup: () => {},\n` + // claims success, kills nothing
         `});\n` +
-        `run(['noop'], { accountId: 'acct' }).catch(() => {});\n`,
+        `run({ type: 'd1.list' }, { accountId: 'acct' }).catch(() => {});\n`,
     );
     const { spawn } = await import('node:child_process');
     const parent = spawn(process.execPath, [parentScript], {
@@ -7197,13 +7354,32 @@ describe('createDefaultRunWrangler — ONE signal coordinator: repeated signals 
 
 describe('createDefaultRunWrangler — post-spawn child `error` events confirm/quarantine', () => {
   const POST_SPAWN_TMP = join(import.meta.dirname, '.tmp-post-spawn-error');
+  const spawnedChildren = new Set<import('node:child_process').ChildProcess>();
   beforeEach(() => {
     rmSync(POST_SPAWN_TMP, { recursive: true, force: true });
     mkdirSync(POST_SPAWN_TMP, { recursive: true });
   });
-  afterEach(() => {
+  afterEach(async () => {
+    // A test deadline can interrupt the assertion before the runner's deadline.
+    // Wait for actual close before removing a directory a Windows child uses as cwd.
+    for (const child of spawnedChildren) {
+      const closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+      child.kill('SIGKILL');
+      await closed;
+    }
     rmSync(POST_SPAWN_TMP, { recursive: true, force: true });
   });
+
+  function createRunner(options: NonNullable<Parameters<typeof createDefaultRunWrangler>[1]>) {
+    return createDefaultRunWrangler(POST_SPAWN_TMP, {
+      ...options,
+      onSpawnedChild: (child) => {
+        spawnedChildren.add(child);
+        child.once('close', () => spawnedChildren.delete(child));
+        options.onSpawnedChild?.(child);
+      },
+    });
+  }
 
   function writeHangScript(path: string): void {
     // Ignores SIGTERM; only the machine's SIGKILL can end it.
@@ -7249,14 +7425,168 @@ describe('createDefaultRunWrangler — post-spawn child `error` events confirm/q
   }
 
   it('pre-spawn ENOENT still settles directly as a hard failure (the one carve-out: no pid, nothing to confirm)', async () => {
-    const run = createDefaultRunWrangler(POST_SPAWN_TMP, {
+    const run = createRunner({
       launcher: [join(POST_SPAWN_TMP, 'no-such-wrangler-binary')],
     });
-    const result = await run(['d1', 'list'], { accountId: 'acct' });
+    const result = await run(
+      {
+        type: 'hyperdrive.create',
+        name: 'missing-launcher-db',
+        binding: 'HYPERDRIVE',
+        configPath: 'literal config.jsonc',
+      },
+      { accountId: 'acct', input: 'postgres://user:secret@localhost/db' },
+    );
     expect(result.status).toBe(1);
     expect(result.error).toContain('ENOENT');
     expect(result.signal).toBeNull();
   });
+
+  it('an early closed stdin rejects a buffered success envelope and confirms child termination', async (ctx) => {
+    // Even after closing fd 0 and destroying its stream, a live Node process on
+    // Windows retains inherited pipe handles. Real peer-exit and Writable-error
+    // regressions below cover Windows without relying on POSIX descriptor closure.
+    ctx.skip(
+      process.platform === 'win32',
+      'closing a live child stdin descriptor does not close inherited Windows pipe handles',
+    );
+    const script = join(POST_SPAWN_TMP, 'closed-stdin.cjs');
+    const pidFile = join(POST_SPAWN_TMP, 'closed-stdin.pid');
+    writeFileSync(
+      script,
+      `const fs = require('fs');\n` +
+        `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
+        `fs.writeSync(1, JSON.stringify({ operationResult: 1, data: { id: 'provider-id' } }));\n` +
+        `fs.closeSync(0);\n` +
+        `setInterval(() => {}, 1 << 30);\n`,
+    );
+    const run = createRunner({
+      launcher: [process.execPath, script],
+      timeoutMs: 30_000,
+    });
+    try {
+      const result = await run(
+        {
+          type: 'hyperdrive.create',
+          name: 'closed-stdin-db',
+          binding: 'HYPERDRIVE',
+          configPath: 'literal config.jsonc',
+        },
+        { accountId: 'acct', input: 'x'.repeat(2 * 1024 * 1024) },
+      );
+      expect(result.status).toBe(1);
+      expect(result.signal).toBe('SIGKILL');
+      expect(result.stderr).toMatch(/EPIPE|broken pipe/i);
+      expect(result.stdout).toContain('"operationResult":1');
+      expect(result.data).toBeUndefined();
+      const pid = Number(readFileSync(pidFile, 'utf-8'));
+      expect(() => process.kill(pid, 0)).toThrow();
+    } finally {
+      reapPidFile(pidFile);
+    }
+  }, 15_000);
+
+  it('a provider exiting after reporting success rejects unread stdin through its real pipe error', async () => {
+    const script = join(POST_SPAWN_TMP, 'exited-stdin.cjs');
+    const pidFile = join(POST_SPAWN_TMP, 'exited-stdin.pid');
+    writeFileSync(
+      script,
+      `const fs = require('fs');\n` +
+        `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
+        `fs.writeSync(1, JSON.stringify({ operationResult: 1, data: { id: 'provider-id' } }));\n` +
+        // Exit closes every inherited handle on Windows as well as POSIX. The
+        // oversized unread input is still pending, so the parent gets a real
+        // closed-pipe error (write EOF on Windows, EPIPE on POSIX).
+        `process.exit(0);\n`,
+    );
+    let observedOutput = '';
+    let childClosed = Promise.resolve();
+    const run = createRunner({
+      launcher: [process.execPath, script],
+      timeoutMs: 30_000,
+      onSpawnedChild: (child) => {
+        child.stdout!.on('data', (chunk: string) => {
+          observedOutput += chunk;
+        });
+        childClosed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+      },
+    });
+    let result: Awaited<ReturnType<typeof run>> | undefined;
+    let failure: unknown;
+    try {
+      result = await run(
+        {
+          type: 'hyperdrive.create',
+          name: 'exited-stdin-db',
+          binding: 'HYPERDRIVE',
+          configPath: 'literal config.jsonc',
+        },
+        { accountId: 'acct', input: 'x'.repeat(2 * 1024 * 1024) },
+      );
+    } catch (error) {
+      failure = error;
+    }
+    if (failure !== undefined) {
+      // macOS can return EPERM when signalling an already-exiting process group.
+      // The runner must quarantine that unconfirmed group, never trust its output.
+      expect(failure).toBeInstanceOf(WranglerQuarantineError);
+      expect((failure as Error).message).toMatch(
+        /post-spawn child error \(.*EPIPE.*\).*failed process-group kill/s,
+      );
+    } else {
+      expect(result!.status).toBe(1);
+      // The stdin error owns termination even if exit 0 is concurrently observed.
+      expect(result!.signal).toBe('SIGKILL');
+      expect(result!.stderr).toMatch(
+        process.platform === 'win32' ? /write EOF|EPIPE|broken pipe/i : /EPIPE|broken pipe/i,
+      );
+      expect(result!.stdout).toContain('"operationResult":1');
+      expect(result!.data).toBeUndefined();
+    }
+    expect(observedOutput).toContain('"operationResult":1');
+    await childClosed;
+    const pid = Number(readFileSync(pidFile, 'utf-8'));
+    expect(() => process.kill(pid, 0)).toThrow();
+  }, 15_000);
+
+  it('a stdin Writable error rejects buffered success only after the child is confirmed dead', async () => {
+    const script = join(POST_SPAWN_TMP, 'stdin-error.cjs');
+    const pidFile = join(POST_SPAWN_TMP, 'stdin-error.pid');
+    writeFileSync(
+      script,
+      `const fs = require('fs');\n` +
+        `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
+        `fs.writeSync(1, JSON.stringify({ operationResult: 1, data: { id: 'provider-id' } }));\n` +
+        `setInterval(() => {}, 1 << 30);\n`,
+    );
+    const run = createRunner({
+      launcher: [process.execPath, script],
+      timeoutMs: 30_000,
+      onSpawnedChild: (child) => {
+        child.stdout!.once('data', () => {
+          // Drive Node's real Writable error event after the runner buffered success.
+          // This separately covers the error path regardless of platform pipe behavior.
+          child.stdin!.destroy(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+        });
+      },
+    });
+    const result = await run(
+      {
+        type: 'hyperdrive.create',
+        name: 'stdin-error-db',
+        binding: 'HYPERDRIVE',
+        configPath: 'literal config.jsonc',
+      },
+      { accountId: 'acct', input: 'x'.repeat(2 * 1024 * 1024) },
+    );
+    expect(result.status).toBe(1);
+    expect(result.signal).toBe('SIGKILL');
+    expect(result.stderr).toContain('write EPIPE');
+    expect(result.stdout).toContain('"operationResult":1');
+    expect(result.data).toBeUndefined();
+    const pid = Number(readFileSync(pidFile, 'utf-8'));
+    expect(() => process.kill(pid, 0)).toThrow();
+  }, 15_000);
 
   it('an injected POST-spawn `error` routes through the termination machine: the group is DEAD before the promise settles', async () => {
     // Pre-fix the `error` handler ALWAYS called finish() — a post-spawn error (e.g. a
@@ -7265,14 +7595,14 @@ describe('createDefaultRunWrangler — post-spawn child `error` events confirm/q
     const pidFile = join(POST_SPAWN_TMP, 'child.pid');
     const hang = join(POST_SPAWN_TMP, 'hang.cjs');
     writeHangScript(hang);
-    const run = createDefaultRunWrangler(POST_SPAWN_TMP, {
+    const run = createRunner({
       launcher: [process.execPath, hang, pidFile],
       timeoutMs: 30_000,
       onSpawnedChild: (child) => {
         injectErrorAfterChildStarts(child, pidFile, 'injected kill-delivery failure');
       },
     });
-    const result = await run(['d1', 'list'], { accountId: 'acct' });
+    const result = await run(operationFixtureRequest(['d1', 'list']), { accountId: 'acct' });
     // Settled as a HARD failure carrying the injected error + kill provenance…
     expect(result.status).toBe(1);
     expect(result.signal).toBe('SIGKILL');
@@ -7294,7 +7624,7 @@ describe('createDefaultRunWrangler — post-spawn child `error` events confirm/q
     const pidFile = join(POST_SPAWN_TMP, 'child2.pid');
     const hang = join(POST_SPAWN_TMP, 'hang2.cjs');
     writeHangScript(hang);
-    const run = createDefaultRunWrangler(POST_SPAWN_TMP, {
+    const run = createRunner({
       launcher: [process.execPath, hang, pidFile],
       timeoutMs: 30_000,
       killProcessGroup: () => {
@@ -7306,7 +7636,7 @@ describe('createDefaultRunWrangler — post-spawn child `error` events confirm/q
     });
     let thrown: unknown;
     try {
-      await run(['d1', 'list'], { accountId: 'acct' });
+      await run(operationFixtureRequest(['d1', 'list']), { accountId: 'acct' });
     } catch (error) {
       thrown = error;
     }
@@ -7616,8 +7946,12 @@ describe('createDefaultRunWrangler — confirmed child termination + kill classi
       `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
         `setInterval(() => {}, 1 << 30);\n`,
     );
+    let spawnedPid: number | undefined;
     const run = createDefaultRunWrangler(killClassifyTmp, {
       launcher: [process.execPath, hungCli],
+      onSpawnedChild: (child) => {
+        spawnedPid = child.pid;
+      },
       timeoutMs: 300,
       // Simulate a kill that FAILS for a non-ESRCH reason (the child is still alive).
       killProcessGroup: () => {
@@ -7629,7 +7963,7 @@ describe('createDefaultRunWrangler — confirmed child termination + kill classi
     // It REJECTS with a quarantine error naming the pid + manual-recovery guidance.
     let rejected: unknown;
     try {
-      await run(['d1', 'list', '--json'], { accountId: 'acct' });
+      await run(operationFixtureRequest(['d1', 'list', '--json']), { accountId: 'acct' });
     } catch (error) {
       rejected = error;
     }
@@ -7640,7 +7974,8 @@ describe('createDefaultRunWrangler — confirmed child termination + kill classi
     expect(err.message).toMatch(/intentionally RETAINED/);
     expect(err.message).toMatch(/pid \d+/);
     // The child is genuinely STILL ALIVE (the bug scenario) — prove it, then clean up.
-    const pid = Number(readFileSync(pidFile, 'utf-8'));
+    const pid = spawnedPid!;
+    expect(pid).toBeTypeOf('number');
     expect(() => process.kill(pid, 0)).not.toThrow();
     try {
       process.kill(pid, 'SIGKILL');
@@ -7658,8 +7993,12 @@ describe('createDefaultRunWrangler — confirmed child termination + kill classi
       `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
         `setInterval(() => {}, 1 << 30);\n`,
     );
+    let spawnedPid: number | undefined;
     const run = createDefaultRunWrangler(killClassifyTmp, {
       launcher: [process.execPath, hungCli],
+      onSpawnedChild: (child) => {
+        spawnedPid = child.pid;
+      },
       timeoutMs: 250,
       confirmKillGraceMs: 500,
       // A killer that CLAIMS success but kills nothing: the group stays alive, so
@@ -7668,7 +8007,7 @@ describe('createDefaultRunWrangler — confirmed child termination + kill classi
     });
     let rejected: unknown;
     try {
-      await run(['d1', 'list', '--json'], { accountId: 'acct' });
+      await run(operationFixtureRequest(['d1', 'list', '--json']), { accountId: 'acct' });
     } catch (error) {
       rejected = error;
     }
@@ -7676,7 +8015,8 @@ describe('createDefaultRunWrangler — confirmed child termination + kill classi
     expect((rejected as Error).message).toMatch(/could not be confirmed terminated within 500ms/);
     expect((rejected as Error).message).toMatch(/intentionally RETAINED/);
     // Clean up the real child the fake killer left alive.
-    const pid = Number(readFileSync(pidFile, 'utf-8'));
+    const pid = spawnedPid!;
+    expect(pid).toBeTypeOf('number');
     try {
       process.kill(pid, 'SIGKILL');
     } catch {
@@ -7693,8 +8033,12 @@ describe('createDefaultRunWrangler — confirmed child termination + kill classi
       `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
         `setInterval(() => {}, 1 << 30);\n`,
     );
+    let spawnedPid: number | undefined;
     const run = createDefaultRunWrangler(killClassifyTmp, {
       launcher: [process.execPath, hungCli],
+      onSpawnedChild: (child) => {
+        spawnedPid = child.pid;
+      },
       timeoutMs: 300,
       // Kill FOR REAL, then report ESRCH (the child exited in the race window) → treated as gone.
       killProcessGroup: (target, signal) => {
@@ -7702,13 +8046,16 @@ describe('createDefaultRunWrangler — confirmed child termination + kill classi
         throw Object.assign(new Error('ESRCH: no such process'), { code: 'ESRCH' });
       },
     });
-    const result = await run(['d1', 'list', '--json'], { accountId: 'acct' });
+    const result = await run(operationFixtureRequest(['d1', 'list', '--json']), {
+      accountId: 'acct',
+    });
     expect(result.signal).toBe('SIGKILL');
     expect(result.status).not.toBe(0);
     // ESRCH is NOT a kill failure — no "could not be killed" surfaced.
     expect(result.stderr).not.toMatch(/could not be killed/);
     expect(result.error).toBeNull();
-    const pid = Number(readFileSync(pidFile, 'utf-8'));
+    const pid = spawnedPid!;
+    expect(pid).toBeTypeOf('number');
     expect(await waitForDead(pid, 10_000)).toBe(true);
   }, 15_000);
 
@@ -7728,8 +8075,12 @@ describe('createDefaultRunWrangler — confirmed child termination + kill classi
         `process.on('SIGTERM', () => {});\n` +
         `setInterval(() => {}, 1 << 30);\n`,
     );
+    let spawnedPid: number | undefined;
     const runner = createDefaultRunWrangler(cfgDir, {
       launcher: [process.execPath, hungCli],
+      onSpawnedChild: (child) => {
+        spawnedPid = child.pid;
+      },
       timeoutMs: 400,
     });
     const lockMutex = `${realpathSync(cfgPath)}.void-provision.lock.lock`;
@@ -7741,7 +8092,8 @@ describe('createDefaultRunWrangler — confirmed child termination + kill classi
         { runWrangler: runner, log: silentLog },
       ),
     ).rejects.toThrow(/d1 list.*(failed|timeout)/s);
-    const pid = Number(readFileSync(pidFile, 'utf-8'));
+    const pid = spawnedPid!;
+    expect(pid).toBeTypeOf('number');
     // The child (and its group) was confirmed terminated...
     expect(await waitForDead(pid, 5_000)).toBe(true);
     // ...and the lock was released (never leaked past the child).
@@ -7767,7 +8119,7 @@ describe('provisionCloudflareResources — dangling-symlink lock identity', () =
     expect(existsSync(target)).toBe(false); // both aliases are dangling at start
 
     let createCalls = 0;
-    const run: RunWrangler = (args) => {
+    const run: RunWrangler = provisionOperationFixture((args) => {
       if (isCall(args, 'hyperdrive', 'create')) {
         createCalls++;
         // --update-config writes to the CANONICAL target (both aliases resolve to it).
@@ -7779,7 +8131,7 @@ describe('provisionCloudflareResources — dangling-symlink lock identity', () =
         return ok();
       }
       return ok();
-    };
+    });
     const makeProv = (
       aliasPath: string,
       retries?: number,

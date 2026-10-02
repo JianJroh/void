@@ -11,7 +11,9 @@ import {
   LogOut,
   Mail,
   Rocket,
+  SlidersHorizontal,
   ShieldCheck,
+  ShieldLock,
   Terminal,
   Users,
 } from 'lucide-react';
@@ -129,6 +131,12 @@ export function Layout({
           </SideNavSection>
           <SideNavSection title="Platform">
             <SideNavItem
+              label="Plans"
+              icon={SlidersHorizontal}
+              href="/admin/config/plans"
+              isSelected={path.startsWith('/admin/config/plans')}
+            />
+            <SideNavItem
               label="Authentication"
               icon={ShieldCheck}
               href="/admin/config/auth"
@@ -139,6 +147,12 @@ export function Layout({
               icon={Mail}
               href="/admin/email"
               isSelected={path.startsWith('/admin/email')}
+            />
+            <SideNavItem
+              label="Zero Trust"
+              icon={ShieldLock}
+              href="/admin/zero-trust"
+              isSelected={path === '/admin/zero-trust'}
             />
             <SideNavItem
               label="CLI Versions"

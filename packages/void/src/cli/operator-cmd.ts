@@ -14,7 +14,6 @@ import { OperatorClient, OperatorClientError } from './operator-client.ts';
 
 const MAX_RUNTIME_FOLLOW_ROWS = 10_000;
 export const BUILD_LOG_DRAIN_TIMEOUT_MS: number = 2 * 60_000;
-export const LEGACY_BUILD_LOG_QUIET_MS: number = 30_000;
 
 function printable(value: unknown): string {
   if (value === null || value === undefined) {
@@ -366,8 +365,6 @@ export async function followOperatorLogs(
   const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   const query = { ...args.query };
   let terminalBuildSince: number | null = null;
-  let legacyQuietSince: number | null = null;
-  let legacyQuietSeq: number | null = null;
   let previousRuntimeRows = new Map<string, number>();
   let currentRuntimeRows = new Map<string, number>();
   let currentRuntimeRowCount = 0;
@@ -434,6 +431,12 @@ export async function followOperatorLogs(
           if (result.logsComplete === true) {
             return;
           }
+          if (result.logsComplete === null || result.logsComplete === undefined) {
+            throw new OperatorClientError(
+              'This platform cannot confirm that the final build logs were captured. Upgrade the platform runtime, or read the retained logs without --follow.',
+              'log_completion_unavailable',
+            );
+          }
           const now = Date.now();
           terminalBuildSince ??= now;
           if (now - terminalBuildSince >= BUILD_LOG_DRAIN_TIMEOUT_MS) {
@@ -442,21 +445,8 @@ export async function followOperatorLogs(
               'invalid_response',
             );
           }
-          if (result.logsComplete === null || result.logsComplete === undefined) {
-            if (legacyQuietSeq !== result.lastSeq) {
-              legacyQuietSeq = result.lastSeq;
-              legacyQuietSince = now;
-            } else {
-              legacyQuietSince ??= now;
-              if (now - legacyQuietSince >= LEGACY_BUILD_LOG_QUIET_MS) {
-                return;
-              }
-            }
-          }
         } else {
           terminalBuildSince = null;
-          legacyQuietSince = null;
-          legacyQuietSeq = null;
         }
       } else {
         if (typeof result.nextCursor === 'string' && result.nextCursor) {
@@ -493,6 +483,86 @@ export async function followOperatorLogs(
   }
 }
 
+async function migrateDeploymentAssets(
+  client: OperatorClient,
+  origin: string,
+  args: OperatorArgs,
+): Promise<void> {
+  const target = decodeURIComponent(
+    args.path.slice('/deployments/'.length, -'/migrate-assets'.length),
+  );
+  const seenCursors = new Set<string>();
+  let body = { ...args.body };
+  if (typeof body.cursor === 'string') {
+    seenCursors.add(body.cursor);
+  }
+  let authorized = false;
+  while (true) {
+    const preview = await client.request(args.path, {
+      method: 'POST',
+      body: { ...body, dryRun: true },
+      timeoutMs: args.timeoutMs,
+    });
+    if (
+      preview.dryRun !== true ||
+      preview.action !== 'deployment.migrate-assets' ||
+      preview.target !== target ||
+      typeof preview.expected !== 'string' ||
+      !preview.expected.trim()
+    ) {
+      throw new OperatorClientError(
+        'The server did not return a valid asset migration preview. No asset batch was requested.',
+        'invalid_preview',
+      );
+    }
+    if (
+      !(await confirmOperatorMutation(
+        origin,
+        {
+          ...preview,
+          scope:
+            'Copy and verify all remaining asset batches for this deployment; keep original assets.',
+        },
+        authorized ? { ...args, yes: true } : args,
+      ))
+    ) {
+      return;
+    }
+    authorized = true;
+    // Each batch is pinned to its own preview. Failed or ambiguous writes are never retried.
+    const result = await client.request(args.path, {
+      method: 'POST',
+      body: { ...body, expected: preview.expected },
+      timeoutMs: args.timeoutMs,
+    });
+    const nextCursor = result.nextCursor;
+    if (
+      result.dryRun !== false ||
+      result.action !== 'deployment.migrate-assets' ||
+      result.target !== target ||
+      typeof result.complete !== 'boolean' ||
+      (result.complete
+        ? nextCursor !== null
+        : typeof nextCursor !== 'string' || !nextCursor.trim() || seenCursors.has(nextCursor))
+    ) {
+      throw new OperatorClientError(
+        'The server returned an invalid asset migration continuation. Inspect the deployment before resuming; no batch was retried.',
+        'invalid_response',
+        undefined,
+        { target, lastSuccessfulCursor: body.cursor ?? null, result },
+      );
+    }
+    // Preserve each successful continuation in stdout if a later batch fails or is interrupted.
+    output(result, args.json);
+    if (result.complete) {
+      return;
+    }
+    const cursor = nextCursor as string;
+    seenCursors.add(cursor);
+    body = { ...args.body, cursor };
+  }
+}
+
 export async function runOperatorCommand(args: OperatorArgs): Promise<void> {
   if (!args.action) {
     const { printHelpPage } = await import('./help.ts');
@@ -512,11 +582,15 @@ export async function runOperatorCommand(args: OperatorArgs): Promise<void> {
         'confirmation_required',
       );
     }
+    if (args.group === 'deployment' && args.action === 'migrate-assets') {
+      return migrateDeploymentAssets(client, origin, args);
+    }
     // Read once for preview and apply; the server excludes the token from audit output.
     if (
       args.tokenStdin &&
-      args.group === 'email' &&
-      (args.action === 'domain-add' || args.action === 'domain-remove')
+      ((args.group === 'email' &&
+        (args.action === 'domain-add' || args.action === 'domain-remove')) ||
+        (args.group === 'zero-trust' && args.action === 'configure'))
     ) {
       args = { ...args, body: { ...args.body, apiToken: await readOperatorApiTokenStdin() } };
     }
@@ -535,10 +609,24 @@ export async function runOperatorCommand(args: OperatorArgs): Promise<void> {
         'invalid_preview',
       );
     }
-    const recoveryFence =
+    let recoveryFence: Record<string, unknown> =
       args.group === 'email' && args.action === 'operation-resolve'
         ? operationRecoveryFence(preview.target)
         : {};
+    if (args.group === 'email' && args.action === 'shared-recipient-resolve') {
+      const target = preview.target as Record<string, unknown> | null;
+      if (
+        !target ||
+        typeof target.recoveryFence !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(target.recoveryFence)
+      ) {
+        throw new OperatorClientError(
+          'The server did not return a valid shared recipient recovery fence. No change was requested.',
+          'invalid_preview',
+        );
+      }
+      recoveryFence = { recoveryFence: target.recoveryFence };
+    }
     if (!(await confirmOperatorMutation(origin, preview, args))) {
       return;
     }
@@ -546,6 +634,9 @@ export async function runOperatorCommand(args: OperatorArgs): Promise<void> {
       ...args.body,
       ...(args.group === 'worker' && args.action === 'rollback-all'
         ? { versions: preview.versions }
+        : {}),
+      ...(args.group === 'project' && args.action === 'normalize'
+        ? { expected: preview.changes }
         : {}),
       ...recoveryFence,
     };
@@ -559,6 +650,20 @@ export async function runOperatorCommand(args: OperatorArgs): Promise<void> {
     const result = await client.request(args.path, { query: args.query });
     if (args.action === 'logs' && args.group !== 'email') {
       outputLogs(result, args.json);
+    } else if (
+      args.group === 'system' &&
+      args.action === 'asset-migrations' &&
+      !args.json &&
+      Array.isArray(result.deployments)
+    ) {
+      // Keep every migration count and protection flag visible without table truncation.
+      console.log(
+        [
+          ...humanLines({ pagination: result.pagination }),
+          'deployments:',
+          ...eventLines(result.deployments, '  '),
+        ].join('\n'),
+      );
     } else {
       output(result, args.json);
     }

@@ -1,5 +1,6 @@
 import { defer, view } from 'react-fate';
 import type {
+  AdminPlans,
   AdminDashboard,
   AdminTopProject,
   AdminHealth,
@@ -18,8 +19,8 @@ import type {
   AdminAuthEdit,
   AdminEmailSettings,
   AdminEmailProject,
+  AdminZeroTrust,
   AdminBuildLogs,
-  AdminBuildStatus,
   AdminDeploymentLogs,
 } from './server.ts';
 
@@ -56,13 +57,16 @@ export const HealthView = view<AdminHealth>()({
 });
 export const healthRequest = { health: { view: HealthView } } as const;
 
-export const BuildLogsView = view<AdminBuildLogs>()({ id: true, lines: true, lastSeq: true });
-export const BuildStatusView = view<AdminBuildStatus>()({ id: true, status: true, terminal: true });
+export const BuildLogsView = view<AdminBuildLogs>()({
+  id: true,
+  lines: true,
+  lastSeq: true,
+  terminal: true,
+  logsComplete: true,
+});
 export const DeploymentLogsView = view<AdminDeploymentLogs>()({ id: true, data: true });
 export const buildLogsRequest = (id: string, since: number) =>
   ({ buildLogs: { view: BuildLogsView, args: { id, since } } }) as const;
-export const buildStatusRequest = (id: string) =>
-  ({ buildStatus: { view: BuildStatusView, args: { id } } }) as const;
 export const deploymentLogsRequest = (id: string, since: string, limit: number) =>
   ({ deploymentLogs: { view: DeploymentLogsView, args: { id, since, limit } } }) as const;
 
@@ -106,6 +110,8 @@ export const deploymentsPageRequest = (path: string) =>
   }) as const;
 
 export const UserDetailView = view<AdminUserDetail>()({
+  limits: true as never,
+  plans: true,
   id: true,
   user: true as never,
   projects: true,
@@ -123,6 +129,7 @@ export const ProjectDetailView = view<AdminProjectDetail>()({
   pendingTeamInvitations: true,
   domains: true,
   builds: true,
+  zeroTrust: true as never,
   cfAccountId: true,
   deployUrl: true,
   tz: true,
@@ -267,3 +274,34 @@ export const emailProjectRequest = (path: string) =>
   ({
     emailProject: { view: EmailProjectView, args: { path } },
   }) as const;
+
+export const ZeroTrustView = view<AdminZeroTrust>()({
+  id: true,
+  configured: true,
+  enabled: true,
+  status: true,
+  accountId: true,
+  teamDomain: true,
+  identityProviderIds: true,
+  policyIds: true,
+  protectNewProjects: true,
+  operation: true as never,
+  lastError: true,
+  checked: true,
+  live: true as never,
+  projects: true,
+});
+
+export const zeroTrustRequest = (path: string) =>
+  ({
+    zeroTrust: { view: ZeroTrustView, args: { path } },
+  }) as const;
+
+export const PlansView = view<AdminPlans>()({
+  id: true,
+  catalog: true as never,
+  accounts: true,
+  selectedPlanId: true,
+});
+export const plansRequest = (path: string) =>
+  ({ plans: { view: PlansView, args: { path } } }) as const;

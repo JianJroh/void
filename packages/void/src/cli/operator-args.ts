@@ -113,10 +113,83 @@ export const operatorCommands: Array<OperatorCommand> = [
   },
   {
     group: 'project',
+    action: 'normalize',
+    description: 'Verify and normalize legacy project deployment and queue identities',
+    path: '/projects/:id/normalize',
+    positional: ['id'],
+    method: 'POST',
+  },
+  {
+    group: 'project',
     action: 'owner',
     description: 'Transfer project ownership to another registered user',
     path: '/projects/:id/owner',
     positional: ['id', 'userId'],
+    method: 'POST',
+  },
+  {
+    group: 'zero-trust',
+    action: 'status',
+    description: 'Inspect saved platform Zero Trust configuration and project state counts',
+    path: '/zero-trust',
+    booleans: ['check'],
+  },
+  {
+    group: 'zero-trust',
+    action: 'configure',
+    description: 'Configure and reconcile project Zero Trust protection',
+    path: '/zero-trust/configure',
+    values: {
+      'identity-providers': 'Comma-separated Access identity provider IDs',
+      policies: 'Comma-separated reusable Access policy IDs',
+      'existing-projects': 'Required when enabling: protected or public for existing projects',
+    },
+    booleans: ['token-stdin', 'protect-new-projects'],
+    method: 'POST',
+  },
+  {
+    group: 'zero-trust',
+    action: 'reconcile',
+    description: 'Repair platform and project Access configuration drift',
+    path: '/zero-trust/reconcile',
+    method: 'POST',
+  },
+  {
+    group: 'zero-trust',
+    action: 'disable',
+    description: 'Remove Void-managed Access applications and make projects public',
+    path: '/zero-trust/disable',
+    method: 'POST',
+  },
+  {
+    group: 'zero-trust',
+    action: 'project-status',
+    description: 'Inspect one project Zero Trust override and effective state',
+    path: '/zero-trust/projects/:id',
+    positional: ['id'],
+  },
+  {
+    group: 'zero-trust',
+    action: 'project-protect',
+    description: 'Protect one project, overriding the platform default',
+    path: '/zero-trust/projects/:id',
+    positional: ['id'],
+    method: 'POST',
+  },
+  {
+    group: 'zero-trust',
+    action: 'project-public',
+    description: 'Make one project public, overriding the platform default',
+    path: '/zero-trust/projects/:id',
+    positional: ['id'],
+    method: 'POST',
+  },
+  {
+    group: 'zero-trust',
+    action: 'project-reconcile',
+    description: 'Repair Access configuration drift for one project',
+    path: '/zero-trust/projects/:id/reconcile',
+    positional: ['id'],
     method: 'POST',
   },
   {
@@ -139,6 +212,15 @@ export const operatorCommands: Array<OperatorCommand> = [
     description: 'Cancel a deployment',
     path: '/deployments/:id/cancel',
     positional: ['id'],
+    method: 'POST',
+  },
+  {
+    group: 'deployment',
+    action: 'migrate-assets',
+    description: 'Copy and verify legacy deployment assets in scoped R2 storage',
+    path: '/deployments/:id/migrate-assets',
+    positional: ['id'],
+    values: { cursor: 'Resume from the last successful asset migration cursor' },
     method: 'POST',
   },
   {
@@ -256,6 +338,13 @@ export const operatorCommands: Array<OperatorCommand> = [
   },
   {
     group: 'system',
+    action: 'asset-migrations',
+    description: 'Inventory legacy assets in active and retained deployments',
+    path: '/system/asset-migrations',
+    values: { page: 'One-based page number', limit: 'Maximum 100 records per page' },
+  },
+  {
+    group: 'system',
     action: 'events',
     description: 'List operator audit events',
     path: '/system/events',
@@ -345,6 +434,26 @@ export const operatorCommands: Array<OperatorCommand> = [
     action: 'operation-resolve',
     description: 'Resolve an ended ambiguous email setup write with operator attestation',
     path: '/email/operations/:id/resolve',
+    positional: ['id'],
+    values: {
+      outcome: 'Provider outcome: applied or not-applied',
+      reason: 'Audit reason for the verified provider outcome',
+    },
+    booleans: ['ended'],
+    method: 'POST',
+  },
+  {
+    group: 'email',
+    action: 'shared-recipients',
+    description: 'Inspect shared inbound recipient rules and interrupted creation intents',
+    path: '/email/shared-recipients',
+    values: { project: 'Project id or slug, including a project awaiting deletion' },
+  },
+  {
+    group: 'email',
+    action: 'shared-recipient-resolve',
+    description: 'Resolve an ended ambiguous shared recipient creation after provider inspection',
+    path: '/email/shared-recipients/:id/resolve',
     positional: ['id'],
     values: {
       outcome: 'Provider outcome: applied or not-applied',
@@ -471,7 +580,16 @@ export function parseOperatorArgs(args: Array<string>): OperatorArgs {
   const positional: Array<string> = [];
   const values: Record<string, string> = {};
   const flags = new Set<string>();
-  const booleanFlags = new Set(['json', 'plan', 'yes', 'follow', 'token-stdin', 'force', 'ended']);
+  const booleanFlags = new Set([
+    'json',
+    'plan',
+    'yes',
+    'follow',
+    'token-stdin',
+    'force',
+    'ended',
+    ...operatorCommands.flatMap((command) => command.booleans ?? []),
+  ]);
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
     if (!arg.startsWith('-')) {
@@ -548,7 +666,11 @@ export function parseOperatorArgs(args: Array<string>): OperatorArgs {
     );
   }
   const paged =
-    action === 'list' || action === 'events' || action === 'logs' || action === 'attempts';
+    action === 'list' ||
+    action === 'events' ||
+    action === 'logs' ||
+    action === 'attempts' ||
+    action === 'shared-recipients';
   const allowed = new Set([
     'connection',
     ...(command.method ? ['timeout'] : []),
@@ -647,6 +769,49 @@ export function parseOperatorArgs(args: Array<string>): OperatorArgs {
     if (name !== 'token-stdin' && flags.has(name)) {
       parsed.body[name] = true;
     }
+  }
+  if (group === 'zero-trust' && action === 'configure') {
+    if (!parsed.tokenStdin) {
+      throw new Error('platform: zero-trust configure requires --token-stdin.');
+    }
+    const identityProviderIds = values['identity-providers']
+      ?.split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const policyIds = values.policies
+      ?.split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const existingProjects = values['existing-projects'];
+    if (!identityProviderIds?.length || !policyIds?.length) {
+      throw new Error(
+        'platform: zero-trust configure requires --identity-providers and --policies.',
+      );
+    }
+    // Required only when enabling; the platform rejects it once enabled.
+    if (
+      existingProjects !== undefined &&
+      existingProjects !== 'protected' &&
+      existingProjects !== 'public'
+    ) {
+      throw new Error('platform: --existing-projects must be protected or public.');
+    }
+    parsed.body = {
+      identityProviderIds,
+      policyIds,
+      ...(existingProjects ? { existingProjects } : {}),
+      protectNewProjects: flags.has('protect-new-projects'),
+    };
+  } else if (group === 'zero-trust' && action === 'status') {
+    // A GET carries its options in the query string.
+    delete parsed.body.check;
+    if (flags.has('check')) {
+      parsed.query.check = 'true';
+    }
+  } else if (group === 'zero-trust' && action === 'project-protect') {
+    parsed.body.protected = true;
+  } else if (group === 'zero-trust' && action === 'project-public') {
+    parsed.body.protected = false;
   }
   return parsed;
 }

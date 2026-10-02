@@ -48,8 +48,6 @@ export const POST = defineHandler(async (c) => {
 });
 ```
 
-`ai.stream()` calls `ai.run()` with `stream: true` and wraps the result in a `Response` with `content-type: text/event-stream` and `cache-control: no-cache` headers.
-
 ## Listing Models
 
 Use `ai.models()` to list available models:
@@ -80,12 +78,11 @@ npm run dev
 
 When the app imports `void/ai`, Void enables a remote Workers AI binding during
 development and preview. Requests use your Cloudflare account and its allowance;
-Workers AI has no local simulator. The session uses the same keychain-backed
-Cloudflare login as the CLI, or `CLOUDFLARE_API_TOKEN` in an automated environment.
+Workers AI has no local simulator. Use your Cloudflare login or
+`CLOUDFLARE_API_TOKEN` in an automated environment.
 
 For a team platform, use `void connect <platform-url>` and link your project.
-Development requests use that platform's HTTPS proxy and usage controls.
-Credentials are injected into server bindings automatically.
+Development requests use that platform's account and usage limits.
 
 ## Usage Limits
 
@@ -93,12 +90,7 @@ Workers AI usage is measured in [neurons](https://developers.cloudflare.com/work
 On a direct deployment, usage belongs to your Cloudflare account. Provider-native
 requests also use your provider credentials and their billing terms.
 
-A team platform tracks usage in its own account and can apply per-user limits.
-Fresh self-hosted installations assign the `custom` profile, which has no
-platform-imposed AI allowance. Administrators can select a quota profile through
-[Platform Administration](./platform-administration.md). These profiles do not
-subscribe users to a commercial plan or charge them automatically; the operator
-remains responsible for its infrastructure and provider accounts.
+A team platform uses its own Cloudflare account and may apply per-user limits. Ask your administrator about the available allowance.
 
 ## Cloudflare Gateway Models
 
@@ -139,9 +131,7 @@ const result = await ai.run(
 );
 ```
 
-Managed requests use the installation's gateway and project metadata. Direct
-requests use your Workers AI binding; provider-native requests require your own
-`ai.gateway` configuration.
+For provider-native requests on a direct deployment, configure [`ai.gateway`](../integrations/cloudflare.md#ai-self-host).
 
 ## Provider-Native Requests
 
@@ -218,7 +208,7 @@ export const POST = defineHandler(async (c) => {
 });
 ```
 
-Use `ai.provider().fetch()` for provider-native image APIs:
+Use `ai.provider().fetch()` for provider-native image APIs. Match the [provider's request schema](https://developers.openai.com/api/reference/resources/images/methods/generate):
 
 ```ts
 export const POST = defineHandler(async (c) => {
@@ -226,22 +216,21 @@ export const POST = defineHandler(async (c) => {
 
   return ai.provider('openai').fetch('/images/generations', {
     body: {
-      model: 'gpt-image-1.5',
+      model: 'gpt-image-2.5-sunburst',
       prompt,
       size: '1024x1024',
-      response_format: 'b64_json',
     },
   });
 });
 ```
 
-For multipart provider APIs, pass a `FormData` body. Void serializes the body through the proxy and reconstructs it before forwarding to AI Gateway:
+For multipart provider APIs, pass `FormData`:
 
 ```ts
 export const POST = defineHandler(async (c) => {
   const body = await c.req.parseBody();
   const form = new FormData();
-  form.set('model', 'gpt-image-1.5');
+  form.set('model', 'gpt-image-2.5-sunburst');
   form.set('prompt', String(body.prompt));
   form.set('image', body.image as Blob, 'source.png');
 
@@ -290,22 +279,6 @@ For local development, add it to `.env` in your project root:
 OPENAI_API_KEY=sk-...
 ```
 
-If the key is missing at runtime, `ai.provider().fetch()` throws a descriptive error telling you which env var to set.
-
 ### Streaming with Provider-Native APIs
 
-Provider-native streaming APIs return the provider response directly:
-
-```ts
-export const POST = defineHandler(async (c) => {
-  const { prompt } = await c.req.json();
-
-  return ai.provider('openai').fetch('/chat/completions', {
-    body: {
-      model: 'gpt-4o',
-      messages: [{ role: 'user', content: prompt }],
-      stream: true,
-    },
-  });
-});
-```
+Return the provider response directly. For example, add `stream: true` to the OpenAI request body shown above.

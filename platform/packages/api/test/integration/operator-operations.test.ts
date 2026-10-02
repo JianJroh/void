@@ -1,4 +1,4 @@
-import { PLATFORM_APPLICATION_KEY } from '@void/platform';
+import { PLATFORM_APPLICATION_KEY, PLATFORM_SANDBOX_DRAIN_KEY } from '@void/platform';
 import { eq, sql } from 'drizzle-orm';
 import {
   afterAll,
@@ -10,11 +10,11 @@ import {
   test,
   vi,
 } from 'vite-plus/test';
-import { createBuild, getDeployment } from '../../src/db.ts';
+import { getDeployment } from '../../src/db.ts';
 import { app } from '../../src/index.ts';
 import { loadSandboxDeploymentPageProjection } from '../../src/operator/sandbox-operations.ts';
 import { databaseTimestampMs } from '../../src/routes/deploy.ts';
-import { SANDBOX_DRAIN_STATE_KEY } from '../../src/sandbox-drain.ts';
+import { readSandboxDrainCheckpoint } from '../../src/sandbox-drain.ts';
 import {
   deployments,
   operatorEvents,
@@ -24,6 +24,7 @@ import {
 } from '../../src/schema.ts';
 import { BUILD_INSTANCE_LARGE } from '../../src/tiers.ts';
 import {
+  createTestBuild,
   clearTables,
   createOperatorToken,
   createTestDeployment,
@@ -48,7 +49,7 @@ beforeEach(async () => {
   await env.db.delete(platformEvents);
   await clearTables(env.db);
   await env.db.delete(sandboxDrainCheckpoints);
-  await env.ROUTING.delete(SANDBOX_DRAIN_STATE_KEY);
+  await env.ROUTING.delete(PLATFORM_SANDBOX_DRAIN_KEY);
   delete env.PLATFORM_INSTALLATION_ID;
   delete env.PLATFORM_CAPABILITIES;
   const user = await createTestUser(env.db, 'operator', 'github', undefined, 'free', 'admin');
@@ -412,7 +413,7 @@ describe('operator deployment operations', () => {
 describe('operator build operations', () => {
   test('preserves log cursor, DO terminal status, and the recorded build size', async () => {
     const project = await createTestProject(env.db, ownerId);
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: ownerId,
       executor: 'container',
@@ -443,7 +444,7 @@ describe('operator build operations', () => {
   });
   test('bounded build pages advance only past returned lines and retain buffered terminal logs', async () => {
     const project = await createTestProject(env.db, ownerId);
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: ownerId,
       executor: 'container',
@@ -475,7 +476,7 @@ describe('operator build operations', () => {
   });
   test('disabled managed builds fail before resolving or calling a DO', async () => {
     const project = await createTestProject(env.db, ownerId);
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: ownerId,
       executor: 'container',
@@ -502,7 +503,7 @@ describe('operator build operations', () => {
   });
   test('returns external build URLs without accessing container services', async () => {
     const project = await createTestProject(env.db, ownerId);
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: ownerId,
       executor: 'github_actions',
@@ -522,7 +523,7 @@ describe('operator build operations', () => {
   });
   test('does not mask a failed log service as success', async () => {
     const project = await createTestProject(env.db, ownerId);
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: ownerId,
       executor: 'container',
@@ -547,7 +548,7 @@ describe('operator installation-aware system and worker operations', () => {
     expect(await response.json()).toMatchObject({ allOk: true });
     expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
       'https://my-proxy.example/health',
-      'https://test.apps.example/health',
+      'https://void-platform-health.apps.example/health',
     ]);
     expect(fetch.mock.calls[1][1]?.headers).toEqual({ 'X-Void-Platform-Probe': 'probe' });
     expect(fetch.mock.calls[0][1]?.headers).toEqual({ 'X-Void-Platform-Probe': 'probe' });
@@ -599,7 +600,7 @@ describe('operator installation-aware system and worker operations', () => {
       });
       expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
         'https://custom-proxy.example/health',
-        'https://test.apps.example.com/health',
+        'https://void-platform-health.apps.example.com/health',
       ]);
     } finally {
       await env.ROUTING.delete(PLATFORM_APPLICATION_KEY);
@@ -927,7 +928,7 @@ describe('operator installation-aware system and worker operations', () => {
       applications: [],
       blockers: [expect.objectContaining({ kind: 'active_deployment' })],
     });
-    expect(await env.ROUTING.get(SANDBOX_DRAIN_STATE_KEY)).toBeNull();
+    expect(await env.ROUTING.get(PLATFORM_SANDBOX_DRAIN_KEY)).toBeNull();
     expect(cf.state.containerApps.has(application.id)).toBe(true);
 
     const firstApply = await req(
@@ -975,9 +976,10 @@ describe('operator installation-aware system and worker operations', () => {
     );
     expect(cf.state.containerApps.has(application.id)).toBe(false);
     expect((await getDeployment(env.db, deployment.id))?.status).toBe('canceled');
-    expect(JSON.parse((await env.ROUTING.get(SANDBOX_DRAIN_STATE_KEY))!)).toMatchObject({
+    expect(await readSandboxDrainCheckpoint(env.db)).toMatchObject({
       state: 'complete',
     });
+    expect(await env.ROUTING.get(PLATFORM_SANDBOX_DRAIN_KEY)).toBeNull();
     const events = await env.db.select().from(operatorEvents);
     expect(events).toHaveLength(1 + resumedPages.length);
     expect(events.at(-1)).toEqual(

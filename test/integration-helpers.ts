@@ -6,6 +6,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -29,6 +31,7 @@ const heldServers = new Map<number, Server>();
 
 const GENERATED_PLAYGROUND_ENTRIES = new Set([
   '.astro',
+  '.next',
   '.nuxt',
   '.output',
   '.react-router',
@@ -57,9 +60,9 @@ export function shouldCopyPlaygroundPath(sourceRoot: string, path: string): bool
 }
 
 /**
- * Copies a playground into the gitignored playground-local workspace so tests that rewrite configs,
- * source, or build output can run beside tests using the checked-in playground. Dependencies stay
- * linked to the installed source tree; generated state is deliberately not copied.
+ * Copies a playground outside the workspace package globs so concurrent task-graph scans never
+ * discover a manifest while the fixture is created or removed. Run Vite+ directly from the copy.
+ * Dependencies stay linked to the installed source tree; generated state is deliberately not copied.
  */
 export function createIsolatedPlayground(
   workspaceRoot: string,
@@ -70,7 +73,7 @@ export function createIsolatedPlayground(
     ? join(process.env.VOID_TEST_SOURCE_SNAPSHOTS, sourceWorkspacePath)
     : undefined;
   const copySource = snapshot && existsSync(snapshot) ? snapshot : sourceRoot;
-  const playgroundLocal = join(workspaceRoot, 'playground-local');
+  const playgroundLocal = join(workspaceRoot, 'playground-local', '.test-fixtures');
   mkdirSync(playgroundLocal, { recursive: true });
   const root = mkdtempSync(join(playgroundLocal, `test-${basename(sourceWorkspacePath)}-`));
 
@@ -79,18 +82,41 @@ export function createIsolatedPlayground(
     filter(path) {
       // `cpSync` reports native backslash paths on Windows, while these workspace paths are
       // normalized to forward slashes. Normalize before using the POSIX path helpers or the
-      // top-level `node_modules` junction is copied and the replacement junction already exists.
+      // top-level `node_modules` directory is copied into the isolated dependency tree.
       return shouldCopyPlaygroundPath(copySource, path);
     },
   });
 
   const sourceNodeModules = join(sourceRoot, 'node_modules');
   if (existsSync(sourceNodeModules)) {
-    symlinkSync(
-      sourceNodeModules,
-      join(root, 'node_modules'),
-      process.platform === 'win32' ? 'junction' : 'dir',
-    );
+    const fixtureNodeModules = join(root, 'node_modules');
+    mkdirSync(fixtureNodeModules);
+    const linkDependency = (source: string, destination: string) =>
+      symlinkSync(
+        realpathSync(source),
+        destination,
+        process.platform === 'win32' ? 'junction' : 'dir',
+      );
+    // Linking the whole directory leaves pnpm's relative package links behind
+    // a Windows junction at a different depth. Pin each package's real target.
+    for (const entry of readdirSync(sourceNodeModules, { withFileTypes: true })) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) {
+        continue;
+      }
+      if (entry.name.startsWith('.') && entry.name !== '.bin') {
+        continue;
+      }
+      const source = join(sourceNodeModules, entry.name);
+      const destination = join(fixtureNodeModules, entry.name);
+      if (entry.name.startsWith('@')) {
+        mkdirSync(destination);
+        for (const name of readdirSync(source)) {
+          linkDependency(join(source, name), join(destination, name));
+        }
+      } else {
+        linkDependency(source, destination);
+      }
+    }
   }
 
   // Avoid duplicate workspace package names when multiple copies exist concurrently.

@@ -1,6 +1,6 @@
 {
   "name": "@void/platform",
-  "version": "0.21.9",
+  "version": "0.22.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/voidzero-dev/void.git",
@@ -22,6 +22,10 @@
     "./email-protocol": {
       "types": "./dist/email-protocol.d.mts",
       "import": "./dist/email-protocol.mjs"
+    },
+    "./plans": {
+      "types": "./dist/plans.d.mts",
+      "import": "./dist/plans.mjs"
     }
   },
   "publishConfig": {

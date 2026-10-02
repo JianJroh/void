@@ -1,5 +1,5 @@
 import { PGlite } from '@electric-sql/pglite';
-import { eq, sql } from 'drizzle-orm';
+import { desc, eq, sql } from 'drizzle-orm';
 import { drizzle as drizzlePg } from 'drizzle-orm/node-postgres';
 import { drizzle } from 'drizzle-orm/pglite';
 import pg from 'pg';
@@ -33,6 +33,7 @@ import {
   githubWebhookRedeliveries,
 } from '../../src/schema.ts';
 import type { PlanId } from '../../src/tiers.ts';
+import type { Build, GitHubInstallationMember } from '../../src/types.ts';
 import { loadPGliteTemplateBundle } from './db-template.ts';
 import { setTestDb, clearTestDb } from './setup.ts';
 
@@ -529,11 +530,12 @@ export async function teardownEnv(): Promise<void> {
 }
 
 export async function clearTables(db: Db): Promise<void> {
-  await db.delete(schema.projectCleanupJobs);
-  for (const table of [
+  const tables = [
+    schema.projectCleanupJobs,
     schema.emailDestinationCleanups,
     schema.emailOperationSteps,
     schema.emailOperations,
+    schema.emailSharedRecipients,
     schema.emailDomainRoutes,
     schema.emailZoneConnections,
     schema.emailCredentials,
@@ -544,43 +546,39 @@ export async function clearTables(db: Db): Promise<void> {
     schema.emailReceipts,
     schema.emailProjectControls,
     schema.emailMonthlyUsage,
-  ]) {
-    await db.delete(table);
-  }
-  await db.delete(sandboxDrainCheckpoints);
-  await db.delete(domains);
-  await db.delete(resources);
-  await db.delete(projectSecrets);
-  // `builds` references deployments/projects/users WITHOUT `onDelete: 'cascade'`
-  // (a project delete in prod is expected to remove its builds explicitly), so a
-  // leftover build row would block the deletes below. Delete it first. Under the
-  // shared real-Postgres run (schema-compat, `fileParallelism: false`) rows survive
-  // across files, so this must mirror `clearBuildTables` in the build-creating tests.
-  await db.delete(builds);
-  await db.delete(githubConnections);
-  // FK to users (cascade) — clear before the users delete below.
-  await db.delete(githubInstallationMembers);
-  await db.delete(githubInstallationRevocations);
-  await db.delete(githubInstallations);
-  // Isolated ledger (no FK to any other table) — clear it so replay tests start
-  // from an empty redelivery ledger.
-  await db.delete(githubWebhookRedeliveries);
-  await db.delete(deployments);
-  await db.delete(projects);
-  await db.delete(invitations);
-  await db.delete(oauthAccounts);
-  await db.delete(users);
-  await db.delete(oauthNonces);
-  await db.delete(authCodes);
-  await db.delete(operatorSessions);
-  await db.delete(operatorEvents);
-  await db.delete(schema.platformAuthAttempts);
-  await db.delete(schema.platformAuthBootstrap);
-  await db.delete(schema.platformLoginTests);
-  await db.delete(schema.platformLoginRevisions);
-  await db.delete(schema.platformLoginConnections);
-  await db.delete(schema.platformAuthSettings);
-  await db.delete(platformSettings);
+    sandboxDrainCheckpoints,
+    domains,
+    resources,
+    projectSecrets,
+    builds,
+    githubConnections,
+    githubInstallationMembers,
+    githubInstallationRevocations,
+    githubInstallations,
+    githubWebhookRedeliveries,
+    deployments,
+    projects,
+    invitations,
+    oauthAccounts,
+    users,
+    oauthNonces,
+    authCodes,
+    operatorSessions,
+    operatorEvents,
+    schema.platformAuthAttempts,
+    schema.platformAuthBootstrap,
+    schema.platformLoginTests,
+    schema.platformLoginRevisions,
+    schema.platformLoginConnections,
+    schema.platformAuthSettings,
+    platformSettings,
+  ];
+  await db.execute(sql`do $$ begin
+    ${sql.join(
+      tables.map((table) => sql`delete from ${table};`),
+      sql`\n`,
+    )}
+  end $$;`);
 }
 
 /** Keep both orphan sweeps while skipping the provider-settling wait in in-memory tests. */
@@ -610,6 +608,18 @@ export async function createOperatorToken(
 
 export async function seedOAuthNonce(db: Db, nonce: string): Promise<void> {
   await db.insert(oauthNonces).values({ nonce, expires_at: sql`now() + interval '600 seconds'` });
+}
+
+/** All cached members of an installation, newest verification first. */
+export async function getTestGitHubInstallationMembers(
+  db: Db,
+  installationId: string,
+): Promise<ReadonlyArray<GitHubInstallationMember>> {
+  return db
+    .select()
+    .from(githubInstallationMembers)
+    .where(eq(githubInstallationMembers.installation_id, installationId))
+    .orderBy(desc(githubInstallationMembers.verified_at));
 }
 
 let userCounter = 0;
@@ -656,6 +666,41 @@ export async function createTestProject(
   const id = `proj_test${n}`;
   await db.insert(projects).values({ id, user_id: userId, slug: s });
   return { id, slug: s };
+}
+
+export async function createTestBuild(
+  db: Db,
+  args: {
+    projectId: string;
+    userId: string;
+    executor?: Build['executor'];
+    commitSha?: string | null;
+    branch?: string | null;
+    githubRunId?: string | null;
+    githubRunAttempt?: string | null;
+    logsUrl?: string | null;
+    instanceType?: string | null;
+    status?: Build['status'];
+  },
+): Promise<Build> {
+  const id = generateId('bld');
+  const [row] = await db
+    .insert(builds)
+    .values({
+      id,
+      project_id: args.projectId,
+      user_id: args.userId,
+      executor: args.executor ?? 'container',
+      status: args.status ?? 'queued',
+      commit_sha: args.commitSha ?? null,
+      branch: args.branch ?? null,
+      github_run_id: args.githubRunId ?? null,
+      github_run_attempt: args.githubRunAttempt ?? null,
+      logs_url: args.logsUrl ?? null,
+      instance_type: args.instanceType ?? null,
+    })
+    .returning();
+  return row;
 }
 
 let deploymentCounter = 0;

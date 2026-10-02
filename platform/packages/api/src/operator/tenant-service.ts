@@ -25,18 +25,19 @@ import {
   getProjectDeployments,
   getProjectResources,
   getOwnedProjectsByUserId,
+  getOpenProjectOwnershipPeriodsByProjectIds,
   getUser,
   TERMINAL_DEPLOYMENT_STATUSES,
   LastAdminError,
   prepareUserRemoval,
   suspendUser,
   unsuspendUser,
-  unsuspendUserIfReason,
   updateUserPlan,
 } from '../db.ts';
 import type { ApiEnv } from '../env.ts';
 import { cancelContainerBuildDos } from '../github/cancel-builds.ts';
 import { generateId } from '../id.ts';
+import { requireAssignablePlan, resolvePlanLimits } from '../plans.ts';
 import { teardownProject } from '../provisioning/cleanup.ts';
 import {
   getAccountUsageProjectWindows,
@@ -45,9 +46,7 @@ import {
   ZERO_USAGE,
 } from '../routes/usage.ts';
 import {
-  buildProjectAccountJson,
   computeDispatchLimits,
-  projectAccountKey,
   sandboxBlockKey,
   setProjectsRoutingSuspension,
 } from '../routing.ts';
@@ -62,14 +61,13 @@ import {
   projects,
   users,
 } from '../schema.ts';
-import {
-  isAdminSuspended,
-  REASON_REQUESTS_EXCEEDED,
-  REASON_SANDBOX_RUNTIME_EXCEEDED,
-  routingSuspensionReason,
-} from '../suspension.ts';
-import { getCurrentBillingPeriodStart, PLAN_LIMITS, type PlanId } from '../tiers.ts';
+import { isAdminSuspended, routingSuspensionReason } from '../suspension.ts';
+import { getCurrentBillingPeriodStart } from '../tiers.ts';
 import type { DeployManifest, Project, User } from '../types.ts';
+import {
+  resolveProjectZeroTrustRoutingForPublication,
+  rewriteProjectRouteMetadata,
+} from '../zero-trust/routing.ts';
 import { OperatorError, preview } from './common.ts';
 
 type Page = { page: number; limit: number; offset: number };
@@ -670,33 +668,27 @@ async function republishProjectOwnerState(
     if (activeDeployment?.manifest) {
       manifest = JSON.parse(activeDeployment.manifest) as DeployManifest;
     }
-    const dispatchLimits = computeDispatchLimits(PLAN_LIMITS[owner.plan], manifest?.limits);
+    const dispatchLimits = computeDispatchLimits(
+      await resolvePlanLimits(txDb, owner.plan),
+      manifest?.limits,
+    );
+    const protection = await resolveProjectZeroTrustRoutingForPublication(tx, project.id);
     for (const key of [project.slug, ...domains.map((domain) => `domain:${domain.hostname}`)]) {
       const raw = await context.env.ROUTING.get(key);
       if (!raw) {
         continue;
       }
-      const entry = JSON.parse(raw) as Record<string, unknown>;
-      entry.userId = owner.id;
-      if ('workerName' in entry) {
-        if (dispatchLimits) {
-          entry.limits = dispatchLimits;
-        } else {
-          delete entry.limits;
-        }
-      }
-      const suspensionReason = routingSuspensionReason(owner.suspended_reason);
-      if (suspensionReason) {
-        entry.suspended = suspensionReason;
-      } else {
-        delete entry.suspended;
-      }
-      await context.env.ROUTING.put(key, JSON.stringify(entry));
+      await context.env.ROUTING.put(
+        key,
+        rewriteProjectRouteMetadata(JSON.parse(raw) as Record<string, unknown>, {
+          projectId: project.id,
+          userId: owner.id,
+          limits: dispatchLimits,
+          suspended: routingSuspensionReason(owner.suspended_reason),
+          zeroTrust: protection,
+        }),
+      );
     }
-    await context.env.ROUTING.put(
-      projectAccountKey(project.id),
-      buildProjectAccountJson({ userId: owner.id, plan: owner.plan }),
-    );
     return owner;
   });
 }
@@ -747,7 +739,6 @@ export async function previewOperatorProjectOwner(
       routingUpdates: [
         inspection.project.slug,
         ...inspection.domains.map((domain) => `domain:${domain.hostname}`),
-        projectAccountKey(inspection.project.id),
       ],
       counterUpdates: {
         detachUserId:
@@ -841,10 +832,7 @@ export async function changeOperatorUserPlan(
 ) {
   const db = context.get('db');
   const user = await requireUser(db, id);
-  if (!Object.hasOwn(PLAN_LIMITS, plan)) {
-    throw new OperatorError(400, 'Invalid plan');
-  }
-  const newPlan = plan as PlanId;
+  await requireAssignablePlan(db, plan);
   const target = { id, login: user.login };
   if (dryRun) {
     const projects = await getOwnedProjectsByUserId(db, id);
@@ -854,35 +842,9 @@ export async function changeOperatorUserPlan(
       projects: projects.map((p) => ({ id: p.id, slug: p.slug })),
     });
   }
-  await updateUserPlan(db, id, newPlan);
-  // Only clear usage reasons. Changing a plan must never lift an admin suspension.
-  // Persisting the plan first lets an operator retry this idempotent cleanup.
+  await updateUserPlan(db, id, plan);
   try {
-    const stub = context.env.USAGE_COUNTER.get(context.env.USAGE_COUNTER.idFromName(id));
-    const results = await Promise.allSettled([
-      context.env.ROUTING.delete(sandboxBlockKey(id)),
-      unsuspendUserIfReason(db, id, REASON_REQUESTS_EXCEEDED),
-      unsuspendUserIfReason(db, id, REASON_SANDBOX_RUNTIME_EXCEEDED),
-      stub.fetch(
-        new Request('https://do/reevaluate-sandbox', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ plan: newPlan }),
-        }),
-      ),
-    ]);
-    const failed = results.find((result) => result.status === 'rejected');
-    if (failed?.status === 'rejected') {
-      throw failed.reason;
-    }
-    const reeval = results[3];
-    if (reeval.status === 'fulfilled' && !reeval.value.ok) {
-      throw new Error(`reevaluate-sandbox DO returned HTTP ${reeval.value.status}`);
-    }
-    // A transfer can republish between the mixed-order cleanup writes above.
-    // Re-enumerate current ownership after the account row has settled and
-    // publish the authoritative plan and suspension state once more.
-    await reconcileOperatorUserProjects(context, id);
+    await reconcileOperatorUserPlan(context, id);
   } catch (error) {
     console.error('[admin] plan-change cleanup failed', { userId: id, error });
     throw new OperatorError(
@@ -893,6 +855,55 @@ export async function changeOperatorUserPlan(
     );
   }
   return { action: 'user.plan', target, plan, cleanupComplete: true };
+}
+
+/** Refresh policy without resetting usage or lifting an administrator suspension. */
+export async function reconcileOperatorUserPlan(context: Context<ApiEnv>, id: string) {
+  const db = context.get('db');
+  const user = await requireUser(db, id);
+  const owned = await getOwnedProjectsByUserId(db, id);
+  const periods = await getOpenProjectOwnershipPeriodsByProjectIds(
+    db,
+    owned.map((project) => project.id),
+  );
+  const ownershipStarts = new Map(periods.map((period) => [period.project_id, period.starts_at]));
+  const stub = context.env.USAGE_COUNTER.get(context.env.USAGE_COUNTER.idFromName(id));
+  const initialized = await stub.fetch(
+    new Request('https://do/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: id,
+        plan: user.plan,
+        billingPeriodStart: getCurrentBillingPeriodStart(
+          user.billing_cycle_start ?? user.created_at,
+        ).toISOString(),
+        projectSlugs: Object.fromEntries(owned.map((project) => [project.id, project.slug])),
+        projectOwnershipStarts: Object.fromEntries(
+          owned.map((project) => [
+            project.id,
+            ownershipStarts.get(project.id) ?? project.created_at,
+          ]),
+        ),
+      }),
+    }),
+  );
+  if (!initialized.ok) {
+    throw new Error(`Usage counter initialization returned HTTP ${initialized.status}`);
+  }
+  const reevaluated = await stub.fetch(
+    new Request('https://do/reevaluate-limits', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: id }),
+    }),
+  );
+  if (!reevaluated.ok) {
+    throw new Error(`Usage counter limit reevaluation returned HTTP ${reevaluated.status}`);
+  }
+  // Ownership and quota writes can settle while a transfer is publishing. Each
+  // project is reread under its row fence before its final route publication.
+  await reconcileOperatorUserProjects(context, id);
 }
 
 export async function suspendOperatorUser(

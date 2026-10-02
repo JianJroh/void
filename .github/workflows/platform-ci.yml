@@ -78,9 +78,15 @@ jobs:
         with:
           cache: true
           node-version-file: .node-version
+      - name: Install Chromium for native API forms
+        if: ${{ startsWith(matrix.project, 'platform-api-integration') && github.repository == 'voidzero-dev/void' }}
+        run: vp exec playwright install chromium
+      - name: Install Chromium and system dependencies for native API forms
+        if: ${{ startsWith(matrix.project, 'platform-api-integration') && github.repository != 'voidzero-dev/void' }}
+        run: vp exec playwright install --with-deps chromium
       - run: vp run build
       - run: vp run --filter './platform/packages/**' build
-      - run: vp test run --project ${{ matrix.project }}
+      - run: vp test run --project '${{ matrix.project }}*'
 
   # Upgrade a populated previous schema, then run that immutable runtime's tests.
   # The prod branch can already be the candidate, so never use it as the baseline.
@@ -168,10 +174,16 @@ jobs:
         with:
           cache: true
           node-version-file: .node-version
+      - name: Install Chromium for deployed runtime API forms
+        if: ${{ github.repository == 'voidzero-dev/void' }}
+        run: vp exec playwright install chromium
+      - name: Install Chromium and system dependencies for deployed runtime API forms
+        if: ${{ github.repository != 'voidzero-dev/void' }}
+        run: vp exec playwright install --with-deps chromium
       - name: Run the deployed runtime against the upgraded schema
         run: |
           vp run build
           vp run --filter './platform/packages/**' build
-          vp test run --project platform-api-integration
+          vp test run --project 'platform-api-integration*'
         env:
           VOID_TEST_DATABASE_URL: ${{ env.COMPAT_DATABASE_URL }}

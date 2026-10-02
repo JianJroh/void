@@ -7,6 +7,7 @@ import { renderAdminPage } from '../react/server.ts';
 import { createFateClient } from './client.generated.ts';
 import { fateServer } from './server.ts';
 import {
+  plansRequest,
   BuildDetailView,
   DeploymentDetailView,
   ProjectDetailView,
@@ -28,6 +29,7 @@ import {
   signupRequest,
   userDetailRequest,
   usersPageRequest,
+  zeroTrustRequest,
 } from './views.ts';
 
 function createServerClient(context: Context<ApiEnv>) {
@@ -59,6 +61,8 @@ export async function renderDashboardFatePage(context: Context<ApiEnv>): Promise
 export async function renderFateListPage(
   context: Context<ApiEnv>,
   page:
+    | 'plans'
+    | 'planEdit'
     | 'users'
     | 'projects'
     | 'deployments'
@@ -68,9 +72,12 @@ export async function renderFateListPage(
     | 'authSettings'
     | 'authNew'
     | 'authEdit'
-    | 'email',
+    | 'email'
+    | 'zeroTrust',
 ): Promise<Response> {
   const title = {
+    plans: 'Plans',
+    planEdit: 'Plan',
     users: 'Users',
     projects: 'Projects',
     deployments: 'Deployments',
@@ -81,6 +88,7 @@ export async function renderFateListPage(
     authNew: 'Add login method',
     authEdit: 'Edit login method',
     email: 'Email',
+    zeroTrust: 'Zero Trust',
   }[page];
   const path = new URL(context.req.url).pathname + new URL(context.req.url).search;
   const props = {
@@ -89,7 +97,7 @@ export async function renderFateListPage(
     username: context.get('user').login,
   };
   if (page === 'authSettings' || page === 'authNew' || page === 'authEdit') {
-    context.header('Referrer-Policy', 'no-referrer');
+    context.header('Referrer-Policy', 'strict-origin');
   }
   if (context.req.header('X-VoidPages') === 'true') {
     return renderAdminPage(context, page, title, props);
@@ -97,7 +105,9 @@ export async function renderFateListPage(
 
   const client = createServerClient(context);
   try {
-    if (page === 'users') {
+    if (page === 'plans' || page === 'planEdit') {
+      await client.request(plansRequest(path));
+    } else if (page === 'users') {
       await client.request(usersPageRequest(path));
     } else if (page === 'projects') {
       await client.request(projectsPageRequest(path));
@@ -115,6 +125,8 @@ export async function renderFateListPage(
       await client.request(authNewRequest(path));
     } else if (page === 'authEdit') {
       await client.request(authEditRequest(path));
+    } else if (page === 'zeroTrust') {
+      await client.request(zeroTrustRequest(path));
     } else {
       await client.request(emailSettingsRequest(path));
     }

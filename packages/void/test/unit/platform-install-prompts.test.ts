@@ -162,6 +162,27 @@ describe('interactive platform installation prompts', () => {
       null,
       expect.anything(),
     );
+    vi.clearAllMocks();
+    await runPlatformLifecycleCommand(
+      parsePlatformArgs([
+        ...args,
+        '--workers-dev',
+        '--no-control-plane-domain',
+        '--hyperdrive',
+        'terraform-id',
+        '--login-methods',
+        'github',
+        '--no-access-protection',
+      ]),
+    );
+    expect(mocks.select).not.toHaveBeenCalled();
+    expect(mocks.multiselect).not.toHaveBeenCalled();
+    expect(mocks.confirm).not.toHaveBeenCalled();
+    expect(PlatformCloudflareClient.prototype.getHyperdriveConfig).toHaveBeenCalledWith(
+      'account',
+      'terraform-id',
+    );
+    expect(mocks.plan.mock.calls[0]![1].externalHyperdrive.id).toBe('terraform-id');
   });
 
   it('keeps the environment override for unattended installation', async () => {
@@ -239,7 +260,7 @@ describe('interactive platform installation prompts', () => {
       ],
     });
     expect(mocks.note).toHaveBeenCalledWith(
-      expect.stringContaining('with any unused name (for example void-test-database)'),
+      expect.stringContaining('with any unused name such as void-test-database'),
       'Set up Hyperdrive first',
     );
     expect(mocks.plan).not.toHaveBeenCalled();

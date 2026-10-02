@@ -2,66 +2,11 @@ import { and, eq, sql } from 'drizzle-orm';
 import type { Db } from './db.ts';
 import { sandboxDrainCheckpoints } from './schema.ts';
 
-export const SANDBOX_DRAIN_STATE_KEY = '__void/platform/sandbox-drain/v1';
 const LEASE_MS = 120_000;
 
 export type SandboxDrainPhase = 'deployments' | 'resources';
 export type SandboxDrainCursor = Readonly<Record<string, string>>;
 export type SandboxDrainCheckpoint = typeof sandboxDrainCheckpoints.$inferSelect;
-
-export type SandboxDrainState = Readonly<{
-  version: 1;
-  generation: string;
-  state: 'draining' | 'complete';
-  startedAt: string;
-  updatedAt: string;
-  completedAt?: string;
-}>;
-
-export async function readSandboxDrainState(
-  routing: Pick<KVNamespace, 'get'>,
-): Promise<SandboxDrainState | null> {
-  const raw = await routing.get(SANDBOX_DRAIN_STATE_KEY);
-  if (!raw) {
-    return null;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error(`${SANDBOX_DRAIN_STATE_KEY} contains invalid JSON.`);
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(`${SANDBOX_DRAIN_STATE_KEY} contains an invalid state document.`);
-  }
-  const state = parsed as Record<string, unknown>;
-  if (
-    state.version !== 1 ||
-    typeof state.generation !== 'string' ||
-    (state.state !== 'draining' && state.state !== 'complete') ||
-    typeof state.startedAt !== 'string' ||
-    typeof state.updatedAt !== 'string' ||
-    (state.completedAt !== undefined && typeof state.completedAt !== 'string')
-  ) {
-    throw new Error(`${SANDBOX_DRAIN_STATE_KEY} contains an invalid state document.`);
-  }
-  return state as SandboxDrainState;
-}
-
-export async function writeSandboxDrainMirror(
-  routing: Pick<KVNamespace, 'put'>,
-  checkpoint: SandboxDrainCheckpoint,
-): Promise<void> {
-  const state: SandboxDrainState = {
-    version: 1,
-    generation: checkpoint.generation,
-    state: checkpoint.state,
-    startedAt: checkpoint.started_at,
-    updatedAt: checkpoint.updated_at,
-    ...(checkpoint.completed_at ? { completedAt: checkpoint.completed_at } : {}),
-  };
-  await routing.put(SANDBOX_DRAIN_STATE_KEY, JSON.stringify(state));
-}
 
 export async function readSandboxDrainCheckpoint(db: Db): Promise<SandboxDrainCheckpoint | null> {
   const [row] = await db
@@ -200,15 +145,4 @@ export async function completeSandboxDrain(
     throw new Error('Sandbox drain lease was superseded; stale work cannot complete it.');
   }
   return row;
-}
-
-/** The legacy tenant-owned provisioner remains closed after its drain. */
-export async function assertSandboxContainerCreationAllowed(
-  routing: Pick<KVNamespace, 'get'>,
-): Promise<void> {
-  if (await readSandboxDrainState(routing)) {
-    throw new Error(
-      'Legacy tenant-owned Sandbox container creation is disabled by the platform drain gate.',
-    );
-  }
 }

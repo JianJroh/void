@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { canonicalJson } from '@void/deploy-core';
 import { eq } from 'drizzle-orm';
 import {
   describe,
@@ -12,7 +13,6 @@ import {
 } from 'vite-plus/test';
 import { deleteRollbackLease, type Db } from '../../src/db.ts';
 import app from '../../src/index.ts';
-import { canonicalJson } from '../../src/migrations/canonical-json.ts';
 import * as projectAccess from '../../src/project-access.ts';
 import {
   deployments,
@@ -5193,21 +5193,21 @@ describe('POST /projects/:id/migrations/rename', () => {
         id: `res_${project.id}_q1`,
         project_id: project.id,
         type: 'queue',
-        cf_id: 'cf-q1',
+        cf_id: '11111111111111111111111111111111',
         binding_name: 'q1',
       },
       {
         id: `res_${project.id}_q2`,
         project_id: project.id,
         type: 'queue',
-        cf_id: 'cf-q2',
+        cf_id: '22222222222222222222222222222222',
         binding_name: 'q2',
       },
       {
         id: `res_${project.id}_q3`,
         project_id: project.id,
         type: 'queue',
-        cf_id: 'cf-q3',
+        cf_id: '33333333333333333333333333333333',
         binding_name: 'q3',
       },
     ]);
@@ -5409,7 +5409,7 @@ describe('POST /projects/:id/migrations/rename', () => {
       id: `res_${project.id}_q3`,
       project_id: project.id,
       type: 'queue',
-      cf_id: 'cf-q3',
+      cf_id: '33333333333333333333333333333333',
       binding_name: 'q3',
     });
 
@@ -5636,7 +5636,7 @@ describe('POST /projects/:id/migrations/rename', () => {
       id: `res_${project.id}_q2`,
       project_id: project.id,
       type: 'queue',
-      cf_id: 'cf-q2',
+      cf_id: '22222222222222222222222222222222',
       binding_name: 'q2',
     });
 

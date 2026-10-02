@@ -6,10 +6,11 @@ You can also administer a team platform with the same CLI. Sign in with
 `void platform auth login`, then manage users, signup access, projects, and logs.
 Commands show a preview before applying changes and support `--json` for scripts.
 See [Platform Administration](../../docs/guide/platform-administration.md) for a
-walkthrough and the [CLI reference](../../docs/reference/cli.md#operator-commands)
+walkthrough and the [CLI reference](../../docs/reference/cli/platform.md#operator-commands)
 for every command.
 
 Use `void platform config auth` to manage login methods and company signup.
+Use `void platform config plans` to manage account plans, enforced limits, and the default for new accounts. See [Plans and Limits](../../docs/guide/platform/administration/plans.md).
 Cloudflare Access protection has separate create/connect controls. Users can
 link another enabled login to their account with `void account link`.
 
@@ -57,6 +58,7 @@ export default defineConfig({
 
 - `voidPlugin()` — Vite integration, routing, pages mode, codegen, migrations, packaging
 - `void prepare` — generate `.void` artifacts for CI, editors, and fresh clones
+- `void info [--json]` — discover persistent resource names before moving definitions
 - `void auth login` — sign in to the project's saved Cloudflare or Void destination
 - `void account login` — platform auth
 - `void connect [url]` — choose Cloudflare or a Void platform, sign in, and save the deployment destination
@@ -97,6 +99,8 @@ Runtime helpers include:
 - non-Cloudflare server targets (`node`, `bun`, `deno`)
 
 Direct Cloudflare deployments also support D1, KV, R2, Queues, Hyperdrive, auth, cron jobs, AI, ISR, typed SQLite Durable Objects, and WebSocket rooms. They upload an immutable Worker Version, probe it before activation (using a 0%-traffic version override when Durable Objects disable preview URLs), and retain version metadata for migration-aware rollback.
+
+Durable State and WebSocket definitions accept optional `name` to preserve their resource identity when files move. Run `void info` and pin the displayed name before moving deployed code. See [Durable State](../../docs/guide/durable-state.md#rename-a-file-while-keeping-its-state) and [WebSockets](../../docs/guide/websockets.md#move-a-route-while-keeping-its-state), including how to preserve room instances when renaming route parameters.
 
 Self-hosted platform upgrades verify every packaged PostgreSQL migration and require the live Drizzle history to be an exact prefix. Pending SQL is allowed only for an explicitly attested old-version/schema compatibility edge, runs in one transaction, and leaves the old Worker version authoritative until the target runtime passes discovery and health checks.
 

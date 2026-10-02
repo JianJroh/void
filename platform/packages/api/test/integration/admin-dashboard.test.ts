@@ -10,12 +10,14 @@ import {
   vi,
 } from 'vite-plus/test';
 import { respondToProjectInvitation } from '../../src/db.ts';
+import type { ApiEnv } from '../../src/env.ts';
 import { app } from '../../src/index.ts';
 import {
   deployments,
   domains,
   githubInstallations,
   invitations,
+  platformSettings,
   platformLoginConnections,
   platformLoginRevisions,
   operatorEvents,
@@ -23,6 +25,7 @@ import {
   projectInvitations,
   projectMembers,
   projectOwnershipPeriods,
+  projectZeroTrust,
   projects,
   users,
 } from '../../src/schema.ts';
@@ -37,6 +40,8 @@ import {
   skipOrphanSweepDelay,
   type TestEnv,
 } from './helpers.ts';
+import { nativeFormSubmission } from './native-form-browser.ts';
+import { createUsageCounterFixture } from './usage-counter-fixture.ts';
 
 let env: TestEnv;
 let manifestCounter = 0;
@@ -62,7 +67,12 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function req(path: string, cookie?: string, init?: RequestInit): Response | Promise<Response> {
+function req(
+  path: string,
+  cookie?: string,
+  init?: RequestInit,
+  overrides?: Partial<ApiEnv['Bindings']>,
+): Response | Promise<Response> {
   const headers: Record<string, string> = {
     ...(init?.headers as Record<string, string>),
   };
@@ -75,7 +85,7 @@ function req(path: string, cookie?: string, init?: RequestInit): Response | Prom
   }
   return app.fetch(
     new Request(`http://localhost${path}`, { ...init, headers, redirect: 'manual' }),
-    env,
+    { ...env, ...overrides },
   );
 }
 
@@ -448,6 +458,395 @@ describe('auth middleware', () => {
   );
 });
 
+const zeroTrustCredential = 'stored-access-management-credential';
+
+function zeroTrustSetting(overrides: Record<string, unknown> = {}) {
+  return {
+    key: 'zeroTrust.configuration',
+    value: {
+      version: 1,
+      revision: 918273645,
+      enabled: true,
+      protectNewProjects: true,
+      accountId: 'zero-trust-account',
+      teamDomain: 'https://company.cloudflareaccess.com',
+      identityProviderIds: ['idp-1'],
+      policyIds: ['policy-1'],
+      credential: { ciphertext: zeroTrustCredential, iv: 'credential-iv', keyVersion: 'v1' },
+      wildcardApplicationName: 'managed-wildcard-name',
+      wildcardApplication: {
+        id: 'managed-wildcard-id',
+        name: 'managed-wildcard-name',
+        audience: 'managed-wildcard-audience',
+        destinations: ['*.example.com'],
+      },
+      operation: null,
+      lastError: null,
+      updatedAt: '2026-09-22T00:00:00.000Z',
+      ...overrides,
+    },
+  };
+}
+
+const configuringZeroTrust = {
+  enabled: false,
+  wildcardApplication: null,
+  operation: {
+    id: 'configure-operation',
+    kind: 'configure',
+    phase: 'public-bypasses',
+    owner: null,
+    leaseExpiresAt: null,
+    startedAt: '2026-09-22T00:00:00.000Z',
+    existingProjects: 'public',
+  },
+};
+
+function pageSnapshot(html: string): string {
+  const match =
+    /<script id="__VOID_PAGE_DATA__" type="application\/json">([\s\S]*?)<\/script>/.exec(html);
+  expect(match).not.toBeNull();
+  const page = JSON.parse(match![1]!) as { shared: { adminFateSnapshot?: unknown } };
+  expect(page.shared.adminFateSnapshot).toBeDefined();
+  return JSON.stringify(page.shared.adminFateSnapshot);
+}
+
+function checkedValues(html: string, name: string): Array<string> {
+  return Array.from(html.matchAll(/<input\b[^>]*>/g), ([tag]) => tag)
+    .filter((tag) => tag.includes(`name="${name}"`) && tag.includes(' checked=""'))
+    .map((tag) => /value="([^"]*)"/.exec(tag)?.[1] ?? '');
+}
+
+function expectNoZeroTrustSecrets(text: string) {
+  for (const secret of [
+    zeroTrustCredential,
+    'credential-iv',
+    '918273645',
+    'managed-wildcard-id',
+    'managed-wildcard-name',
+    'managed-wildcard-audience',
+    env.CF_API_TOKEN,
+  ]) {
+    expect(text).not.toContain(secret);
+  }
+}
+
+describe('admin Zero Trust', () => {
+  test('admits native setup form validation while retaining its exact-origin CSRF guard', async () => {
+    const admin = await createTestUser(env.db, 'zt-native', 'github', undefined, 'free', 'admin');
+    const origin = 'https://api.example.com';
+    const input = {
+      env,
+      origin,
+      cookie: `admin_token=${admin.adminJwt}`,
+      path: '/admin/zero-trust?test=private-query',
+      fields: {
+        apiToken: 'synthetic-form-token',
+        identityProviderIds: '   ',
+        policyIds: 'policy-1',
+      },
+      button: 'Save and reconcile',
+    };
+    expect(await nativeFormSubmission({ ...input, noReferrer: true })).toEqual({
+      pagePolicy: 'strict-origin',
+      submission: { origin: 'null', referrer: undefined, status: 403 },
+    });
+    expect(await env.db.select().from(operatorEvents)).toHaveLength(0);
+    expect(await nativeFormSubmission(input)).toEqual({
+      pagePolicy: 'strict-origin',
+      submission: { origin, referrer: `${origin}/`, status: 400 },
+    });
+    // Empty provider IDs fail validation before any Cloudflare request or mutation.
+    expect(await env.db.select().from(platformSettings)).toHaveLength(0);
+  });
+
+  test('renders the installation page without exposing a credential', async () => {
+    const admin = await createTestUser(
+      env.db,
+      'zero-trust-admin',
+      'github',
+      undefined,
+      'free',
+      'admin',
+    );
+    await env.db.insert(platformSettings).values(zeroTrustSetting(configuringZeroTrust));
+    const project = await createTestProject(env.db, admin.id, 'zero-trust-admin-status');
+    await env.db.insert(projectZeroTrust).values({
+      project_id: project.id,
+      desired_protected: false,
+      effective_protected: false,
+      status: 'ready',
+    });
+
+    const res = await req('/admin/zero-trust', admin.adminJwt);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Cache-Control')).toBe('no-store');
+    expect(res.headers.get('Referrer-Policy')).toBe('strict-origin');
+    const html = await res.text();
+    const visible = visibleMarkup(html);
+    expect(visible).toContain('Project Zero Trust');
+    expect(visible).toContain('Protect new projects by default');
+    expect(visible).toContain('zero-trust-account');
+    expect(visible).toContain('configure · public-bypasses');
+    expect(visible).toContain('pending operation will resume');
+    expect(visible).toContain('Cancel setup and clean up');
+    expect(visible).toContain('Project states');
+    expect(html).toContain('action="/admin/zero-trust/configure"');
+    expect(html).toContain('action="/admin/zero-trust/reconcile"');
+    expect(html).toContain('action="/admin/zero-trust/disable"');
+    expect(html).toContain('data-confirm="Disable Zero Trust and make every project public?"');
+    expect(html).toContain('name="apiToken"');
+    expect(html.toLowerCase()).toContain('autocomplete="new-password"');
+    expect(checkedValues(html, 'existingProjects')).toEqual(['public']);
+    expect(html).toContain('name="protectNewProjects" value="yes"');
+    // Zero Trust always uses the installation account; there is no account field.
+    expect(html).not.toContain('name="accountId"');
+    expectNoZeroTrustSecrets(html);
+    expectNoZeroTrustSecrets(pageSnapshot(html));
+  });
+
+  test('keeps managed application identifiers out of an enabled installation page', async () => {
+    const admin = await createTestUser(env.db, 'zt-enabled', 'github', undefined, 'free', 'admin');
+    await env.db.insert(platformSettings).values(zeroTrustSetting());
+    // The seeded credential cannot be decrypted, so the live check reports drift.
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = await req('/admin/zero-trust', admin.adminJwt);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const visible = visibleMarkup(html);
+    expect(visible).toContain('Enabled');
+    expect(visible).toContain('Not checked');
+    expect(html).toContain('href="/admin/zero-trust?check=1"');
+    expect(visible).toContain('Disable Zero Trust');
+    // Existing projects keep their protection once Zero Trust is enabled.
+    expect(html).not.toContain('name="existingProjects"');
+    expectNoZeroTrustSecrets(html);
+    expectNoZeroTrustSecrets(pageSnapshot(html));
+    // A plain page view reads saved state only.
+    expect(logged).not.toHaveBeenCalledWith(
+      '[zero-trust] live status check failed',
+      expect.anything(),
+    );
+
+    const checked = await req('/admin/zero-trust?check=1', admin.adminJwt);
+    expect(checked.status).toBe(200);
+    const checkedHtml = await checked.text();
+    expect(visibleMarkup(checkedHtml)).toContain('Missing or drifted');
+    expectNoZeroTrustSecrets(checkedHtml);
+    expectNoZeroTrustSecrets(pageSnapshot(checkedHtml));
+    expect(logged).toHaveBeenCalledWith('[zero-trust] live status check failed', expect.anything());
+  });
+
+  test('serves a fixed redacted shape through Fate for the Zero Trust path only', async () => {
+    const admin = await createTestUser(env.db, 'zt-fate', 'github', undefined, 'free', 'admin');
+    await env.db.insert(platformSettings).values(zeroTrustSetting(configuringZeroTrust));
+    const fields = [
+      'id',
+      'configured',
+      'enabled',
+      'status',
+      'accountId',
+      'teamDomain',
+      'identityProviderIds',
+      'policyIds',
+      'protectNewProjects',
+      'operation',
+      'lastError',
+      'checked',
+      'live',
+      'projects',
+    ];
+
+    const page = await req(
+      '/admin/fate',
+      admin.adminJwt,
+      fateQuery('zeroTrust', '/admin/zero-trust', fields),
+    );
+    expect(page.status).toBe(200);
+    const text = await page.text();
+    expectNoZeroTrustSecrets(text);
+    const body = JSON.parse(text) as {
+      results: Array<{ ok: boolean; data?: Record<string, unknown> }>;
+    };
+    expect(body.results[0]?.ok).toBe(true);
+    expect(body.results[0]?.data).toEqual({
+      id: '/admin/zero-trust',
+      configured: true,
+      enabled: false,
+      status: 'configuring',
+      accountId: 'zero-trust-account',
+      teamDomain: 'https://company.cloudflareaccess.com',
+      identityProviderIds: ['idp-1'],
+      policyIds: ['policy-1'],
+      protectNewProjects: true,
+      operation: { kind: 'configure', phase: 'public-bypasses', existingProjects: 'public' },
+      lastError: null,
+      checked: false,
+      live: null,
+      projects: [],
+    });
+
+    const invalid = await req(
+      '/admin/fate',
+      admin.adminJwt,
+      fateQuery('zeroTrust', '/admin/users', ['id', 'configured']),
+    );
+    const invalidBody = (await invalid.json()) as {
+      results: Array<{ ok: boolean; error?: { code: string } }>;
+    };
+    expect(invalidBody.results[0]).toMatchObject({ ok: false, error: { code: 'BAD_REQUEST' } });
+  });
+
+  test('serves page-object navigation and a navigation link', async () => {
+    const admin = await createTestUser(env.db, 'zt-nav', 'github', undefined, 'free', 'admin');
+    const navigation = await req('/admin/zero-trust', admin.adminJwt, {
+      headers: { 'X-VoidPages': 'true' },
+    });
+    expect(navigation.status).toBe(200);
+    expect(navigation.headers.get('X-VoidPages')).toBe('true');
+    expect(navigation.headers.get('Cache-Control')).toBe('no-store');
+    expect(navigation.headers.get('Referrer-Policy')).toBe('strict-origin');
+    const pageObject = (await navigation.json()) as { component: string; shared: object };
+    expect(pageObject.component).toBe('zeroTrust');
+    expect(pageObject.shared).not.toHaveProperty('adminFateSnapshot');
+
+    const dashboard = await (await req('/admin/', admin.adminJwt)).text();
+    expect(dashboard).toContain('href="/admin/zero-trust"');
+  });
+
+  test('shows why project protection cannot change when Zero Trust is not enabled', async () => {
+    const admin = await createTestUser(env.db, 'zt-project', 'github', undefined, 'free', 'admin');
+    const project = await createTestProject(env.db, admin.id, 'zt-project-off');
+
+    const html = await (await req(`/admin/projects/${project.id}`, admin.adminJwt)).text();
+    const visible = visibleMarkup(html);
+    expect(html).toContain('id="zero-trust"');
+    expect(visible).toContain('Platform: not configured');
+    expect(visible).toContain('Project Zero Trust is not enabled.');
+    expect(html).toContain('href="/admin/zero-trust"');
+    expect(html).not.toContain(`action="/admin/projects/${project.id}/zero-trust"`);
+    expect(html).not.toContain(`action="/admin/projects/${project.id}/zero-trust/reconcile"`);
+  });
+
+  test('shows project protection actions from saved state without calling Cloudflare', async () => {
+    const admin = await createTestUser(env.db, 'zt-ready', 'github', undefined, 'free', 'admin');
+    const project = await createTestProject(env.db, admin.id, 'zt-project-ready');
+    await env.db.insert(platformSettings).values(zeroTrustSetting());
+    await env.db.insert(projectZeroTrust).values({
+      project_id: project.id,
+      desired_protected: true,
+      effective_protected: true,
+      status: 'ready',
+    });
+    const fetched = vi.spyOn(globalThis, 'fetch');
+    // The seeded credential cannot be decrypted, so a live status check would fail before
+    // fetch and only show up as this log line.
+    const logged = vi.spyOn(console, 'error');
+
+    const html = await (await req(`/admin/projects/${project.id}`, admin.adminJwt)).text();
+    const visible = visibleMarkup(html);
+    expect(visible).toContain('Platform: enabled');
+    expect(visible).toContain('Desired: protected');
+    expect(visible).toContain('Effective: protected');
+    expect(html).toContain(`action="/admin/projects/${project.id}/zero-trust"`);
+    expect(html).toContain('name="protected" value="false"');
+    expect(visible).toContain('Make project public');
+    expect(html).toContain(`action="/admin/projects/${project.id}/zero-trust/reconcile"`);
+    // The server-side Fate client calls the local /admin/fate handler.
+    const external = fetched.mock.calls
+      .map(([input]) => (input instanceof Request ? input.url : String(input)))
+      .filter((url) => !url.startsWith('http://localhost/'));
+    expect(external).toEqual([]);
+    expect(logged).not.toHaveBeenCalledWith(
+      '[zero-trust] live status check failed',
+      expect.anything(),
+    );
+    expectNoZeroTrustSecrets(html);
+  });
+
+  test('hides project protection actions while an installation operation runs', async () => {
+    const admin = await createTestUser(env.db, 'zt-busy', 'github', undefined, 'free', 'admin');
+    const project = await createTestProject(env.db, admin.id, 'zt-project-busy');
+    await env.db.insert(platformSettings).values(
+      zeroTrustSetting({
+        operation: {
+          id: 'reconcile-operation',
+          kind: 'reconcile',
+          phase: 'projects',
+          owner: null,
+          leaseExpiresAt: null,
+          startedAt: '2026-09-22T00:00:00.000Z',
+          existingProjects: null,
+        },
+      }),
+    );
+
+    const html = await (await req(`/admin/projects/${project.id}`, admin.adminJwt)).text();
+    expect(visibleMarkup(html)).toContain('Platform: enabled, configuring');
+    expect(visibleMarkup(html)).toContain('A Zero Trust reconcile operation is running.');
+    expect(html).not.toContain(`action="/admin/projects/${project.id}/zero-trust"`);
+    expect(html).not.toContain(`action="/admin/projects/${project.id}/zero-trust/reconcile"`);
+  });
+
+  test('hides project protection actions while the installation needs attention', async () => {
+    const admin = await createTestUser(env.db, 'zt-error', 'github', undefined, 'free', 'admin');
+    const project = await createTestProject(env.db, admin.id, 'zt-project-error');
+    await env.db
+      .insert(platformSettings)
+      .values(zeroTrustSetting({ lastError: 'Access token was revoked' }));
+
+    const html = await (await req(`/admin/projects/${project.id}`, admin.adminJwt)).text();
+    const visible = visibleMarkup(html);
+    expect(visible).toContain('Platform: enabled, needs attention');
+    expect(visible).toContain('Platform Zero Trust status: needs attention.');
+    expect(html).not.toContain(`action="/admin/projects/${project.id}/zero-trust"`);
+  });
+
+  test('rejects an invalid project protection form value', async () => {
+    const admin = await createTestUser(
+      env.db,
+      'zero-trust-project-admin',
+      'github',
+      undefined,
+      'free',
+      'admin',
+    );
+    const project = await createTestProject(env.db, admin.id, 'zero-trust-project-form');
+
+    const res = await req(`/admin/projects/${project.id}/zero-trust`, admin.adminJwt, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ protected: 'invalid' }).toString(),
+    });
+
+    expect(res.status).toBe(400);
+    expect(visibleMarkup(await res.text())).toContain('Project protection must be true or false.');
+  });
+
+  test('renders an invalid installation form as an admin error page', async () => {
+    const admin = await createTestUser(env.db, 'zt-form', 'github', undefined, 'free', 'admin');
+
+    const res = await req('/admin/zero-trust/configure', admin.adminJwt, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        apiToken: 'form-token-value',
+        identityProviderIds: '',
+        policyIds: 'policy-1',
+        existingProjects: 'protected',
+      }).toString(),
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.headers.get('Cache-Control')).toBe('no-store');
+    expect(res.headers.get('Referrer-Policy')).toBe('strict-origin');
+    const html = await res.text();
+    expect(visibleMarkup(html)).toContain('identity providers must contain between 1 and 16 ids');
+    expect(html).not.toContain('form-token-value');
+  });
+});
+
 describe('GET /admin/ (dashboard)', () => {
   test('renders dashboard with stats and projects', async () => {
     const admin = await createTestUser(env.db, 'admin1', 'github', undefined, 'free', 'admin');
@@ -713,7 +1112,7 @@ describe('POST /admin/users/:id/plan', () => {
     expect(res.headers.get('Location')).toBe(`/admin/users/${user.id}`);
   });
 
-  test('refreshes project:{projectId} KV entries so the proxy sandbox gate sees the new plan without a redeploy', async () => {
+  test('updates the serving policy without publishing retired Sandbox proxy account mirrors', async () => {
     const admin = await createTestUser(
       env.db,
       'admin-plan-kv',
@@ -726,9 +1125,12 @@ describe('POST /admin/users/:id/plan', () => {
     const p1 = await createTestProject(env.db, user.id, 'plan-kv-a');
     const p2 = await createTestProject(env.db, user.id, 'plan-kv-b');
 
-    // Seed stale entries that reflect the pre-change plan.
-    await env.ROUTING.put(`project:${p1.id}`, JSON.stringify({ userId: user.id, plan: 'free' }));
-    await env.ROUTING.put(`project:${p2.id}`, JSON.stringify({ userId: user.id, plan: 'free' }));
+    for (const project of [p1, p2]) {
+      await env.ROUTING.put(
+        project.slug,
+        JSON.stringify({ projectId: project.id, userId: user.id, workerName: 'test-worker' }),
+      );
+    }
 
     const body = new URLSearchParams({ plan: 'pro' });
     const res = await req(`/admin/users/${user.id}/plan`, admin.adminJwt, {
@@ -738,10 +1140,13 @@ describe('POST /admin/users/:id/plan', () => {
     });
     expect(res.status).toBe(302);
 
-    const v1 = JSON.parse((await env.ROUTING.get(`project:${p1.id}`))!);
-    expect(v1).toEqual({ userId: user.id, plan: 'pro' });
-    const v2 = JSON.parse((await env.ROUTING.get(`project:${p2.id}`))!);
-    expect(v2).toEqual({ userId: user.id, plan: 'pro' });
+    for (const project of [p1, p2]) {
+      expect(await env.ROUTING.get(project.slug, 'json')).toMatchObject({
+        userId: user.id,
+        limits: { cpuMs: 50, subRequests: 1000 },
+      });
+      expect(await env.ROUTING.get(`project:${project.id}`)).toBeNull();
+    }
   });
 
   test('clears sandbox-block KV and sandbox_runtime_exceeded DB suspension on plan change', async () => {
@@ -763,11 +1168,20 @@ describe('POST /admin/users/:id/plan', () => {
       .where(eq(users.id, user.id));
 
     const body = new URLSearchParams({ plan: 'pro' });
-    const res = await req(`/admin/users/${user.id}/plan`, admin.adminJwt, {
-      method: 'POST',
-      body: body.toString(),
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' } as Record<string, string>,
-    });
+    const res = await req(
+      `/admin/users/${user.id}/plan`,
+      admin.adminJwt,
+      {
+        method: 'POST',
+        body: body.toString(),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' } as Record<string, string>,
+      },
+      {
+        USAGE_COUNTER: createUsageCounterFixture(env as unknown as ApiEnv['Bindings'], {
+          [user.id]: { totalSandboxSeconds: 40 * 3600, sandboxRuntimeSuspended: true },
+        }),
+      },
+    );
     expect(res.status).toBe(302);
 
     // KV block key should be deleted.
@@ -781,7 +1195,7 @@ describe('POST /admin/users/:id/plan', () => {
     expect(row.suspended_reason).toBeNull();
   });
 
-  test('optimistically clears request suspension (DB + route marker) on plan change', async () => {
+  test('reevaluates recorded request usage and clears its suspension when the new plan is unlimited', async () => {
     const admin = await createTestUser(
       env.db,
       'admin-plan-req',
@@ -793,10 +1207,7 @@ describe('POST /admin/users/:id/plan', () => {
     const user = await createTestUser(env.db, 'planuser-req', 'github', undefined, 'solo');
     const project = await createTestProject(env.db, user.id, 'planuser-req-slug');
 
-    // Request-suspended on the old plan. A plan change must drop the request
-    // suspension too (symmetric with sandbox), or a capped→unlimited upgrade
-    // would strand the user at 429 — the scheduled reconcile skips unlimited
-    // plans, so nothing else clears it.
+    // Execute the production counter so this verifies actual quota reevaluation.
     await env.db
       .update(users)
       .set({ suspended_reason: 'requests_exceeded' })
@@ -807,11 +1218,20 @@ describe('POST /admin/users/:id/plan', () => {
     );
 
     const body = new URLSearchParams({ plan: 'sponsored' });
-    const res = await req(`/admin/users/${user.id}/plan`, admin.adminJwt, {
-      method: 'POST',
-      body: body.toString(),
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' } as Record<string, string>,
-    });
+    const res = await req(
+      `/admin/users/${user.id}/plan`,
+      admin.adminJwt,
+      {
+        method: 'POST',
+        body: body.toString(),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' } as Record<string, string>,
+      },
+      {
+        USAGE_COUNTER: createUsageCounterFixture(env as unknown as ApiEnv['Bindings'], {
+          [user.id]: { totalRequests: 10_000_000, requestsSuspended: true },
+        }),
+      },
+    );
     expect(res.status).toBe(302);
 
     const [row] = await env.db
@@ -1210,9 +1630,9 @@ describe('POST /admin/users/:id/delete', () => {
       id: 'ghi_udel_test',
       installation_id: 'inst-udel-1',
       user_id: user.id,
-      account_login: 'octo-org',
+      account_login: 'octo',
       account_id: '4242',
-      account_type: 'Organization',
+      account_type: 'User',
     });
 
     const res = await req(`/admin/users/${user.id}/delete`, admin.adminJwt, {

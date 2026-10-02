@@ -26,6 +26,7 @@ import { lockAuthSettings } from './auth/configuration.ts';
 import { lockEmailPolicy } from './email/admission.ts';
 import { generateId } from './id.ts';
 import { getProjectQueueName } from './naming.ts';
+import { getDefaultPlan, lockPlanCatalog, requireAssignablePlan, resolvePlan } from './plans.ts';
 import { requireProjectCapability } from './project-access.ts';
 import * as schema from './schema.ts';
 import {
@@ -65,7 +66,7 @@ import {
   REASON_REQUESTS_EXCEEDED,
   REASON_SANDBOX_RUNTIME_EXCEEDED,
 } from './suspension.ts';
-import { getBuildInstanceType, getPlanLimits, type PlanId } from './tiers.ts';
+import type { PlanId } from './tiers.ts';
 import type {
   Build,
   Deployment,
@@ -119,14 +120,19 @@ export async function createUser(
   login: string,
   email: string | null,
   role: 'user' | 'admin' = 'user',
-  plan: PlanId = 'free',
+  plan?: PlanId,
 ): Promise<User> {
-  const id = generateId('user');
-  const [row] = await db
-    .insert(users)
-    .values({ id, provider, provider_id: providerId, login, email, role, plan })
-    .returning();
-  return row;
+  return db.transaction(async (tx) => {
+    await lockPlanCatalog(tx);
+    const assignedPlan =
+      plan === undefined ? await getDefaultPlan(tx) : await requireAssignablePlan(tx, plan);
+    const id = generateId('user');
+    const [row] = await tx
+      .insert(users)
+      .values({ id, provider, provider_id: providerId, login, email, role, plan: assignedPlan.id })
+      .returning();
+    return row;
+  });
 }
 
 /**
@@ -148,6 +154,7 @@ export async function createUserForPlatform(
     bootstrapGitHubId: string;
   },
 ): Promise<User> {
+  await lockPlanCatalog(db);
   if (await lockAuthSettings(db)) {
     throw new SelfHostedSignupRestrictedError();
   }
@@ -167,7 +174,16 @@ export async function createUserForPlatform(
   } else if (!options?.additionalSignupAllowed) {
     throw new SelfHostedSignupRestrictedError();
   }
-  return createUser(db, provider, providerId, login, email, existing ? 'user' : 'admin', 'custom');
+  const defaultPlan = await getDefaultPlan(db, 'custom');
+  return createUser(
+    db,
+    provider,
+    providerId,
+    login,
+    email,
+    existing ? 'user' : 'admin',
+    defaultPlan.id,
+  );
 }
 
 /** Bootstrap the configured owner through admin OAuth without opening general signup. */
@@ -398,7 +414,11 @@ export async function linkGitHubIdentity(
 }
 
 export async function updateUserPlan(db: Db, id: string, plan: PlanId): Promise<void> {
-  await db.update(users).set({ plan }).where(eq(users.id, id));
+  await db.transaction(async (tx) => {
+    await lockPlanCatalog(tx);
+    await requireAssignablePlan(tx, plan);
+    await tx.update(users).set({ plan }).where(eq(users.id, id));
+  });
 }
 
 export async function countUserDeploymentsToday(db: Db, userId: string): Promise<number> {
@@ -1633,6 +1653,7 @@ export async function failStaleDeployments(db: Db): Promise<number> {
         ne(deployments.status, 'compensating'),
         or(isNull(deployments.source), ne(deployments.source, 'rollback-lease')),
         sql`${deployments.updated_at} < now() - interval '30 minutes'`,
+        sql`NOT EXISTS (SELECT 1 FROM deployment_operations op WHERE op.id = ${deployments.id} AND op.status <> 'terminal')`,
       ),
     );
   return result.rowCount ?? 0;
@@ -1653,7 +1674,24 @@ export async function getActiveDeployment(db: Db, projectId: string): Promise<De
   return row ?? null;
 }
 
-/** Newest historical live row, used only to backfill legacy project pointers. */
+export async function getPendingDeploymentOperation(
+  db: Db,
+  projectId: string,
+): Promise<{ id: string } | null> {
+  const [operation] = await db
+    .select({ id: schema.deploymentOperations.id })
+    .from(schema.deploymentOperations)
+    .where(
+      and(
+        eq(schema.deploymentOperations.project_id, projectId),
+        ne(schema.deploymentOperations.status, 'terminal'),
+      ),
+    )
+    .limit(1);
+  return operation ?? null;
+}
+
+/** Newest historical live row for verifying legacy Zero Trust routing freshness. */
 export async function getLatestLiveDeployment(
   db: Db,
   projectId: string,
@@ -1690,43 +1728,6 @@ export async function cancelDeployment(
     )
     .returning();
   return row ?? null;
-}
-
-export async function getLastLiveAssetManifest(
-  db: Db,
-  projectId: string,
-): Promise<Record<string, { hash: string; size: number }> | null> {
-  // Rollback can make an older deployment authoritative while newer rows keep
-  // status='live' for history. Asset carry-forward must follow the deployment
-  // actually serving the project, otherwise an identical redeploy of that
-  // newer row treats its hashes as cached even when the active serving
-  // manifest does not contain them and publishes missing paths.
-  const [activeRow] = await db
-    .select({ asset_hashes: deployments.asset_hashes })
-    .from(projects)
-    .innerJoin(deployments, eq(projects.active_deployment_id, deployments.id))
-    .where(and(eq(projects.id, projectId), eq(deployments.status, 'live')))
-    .limit(1);
-
-  if (activeRow) {
-    return activeRow.asset_hashes ? JSON.parse(activeRow.asset_hashes) : null;
-  }
-
-  // Legacy projects created before active_deployment_id was authoritative may
-  // still have a live row and routing entry but no project pointer. Preserve
-  // their old dedup behavior; returning every asset as needed would be safe but
-  // would cause an unnecessary one-time full upload.
-  const [legacyRow] = await db
-    .select({ asset_hashes: deployments.asset_hashes })
-    .from(deployments)
-    .where(and(eq(deployments.project_id, projectId), eq(deployments.status, 'live')))
-    .orderBy(desc(deployments.created_at))
-    .limit(1);
-
-  if (!legacyRow?.asset_hashes) {
-    return null;
-  }
-  return JSON.parse(legacyRow.asset_hashes);
 }
 
 export async function setActiveDeployment(
@@ -2041,17 +2042,6 @@ export async function invalidateMigrationRenamesForOldName(
   await db
     .delete(migrationRenames)
     .where(and(eq(migrationRenames.project_id, projectId), eq(migrationRenames.to_name, oldName)));
-}
-
-export async function getRetainedDeployments(
-  db: Db,
-  projectId: string,
-): Promise<ReadonlyArray<Deployment>> {
-  return db
-    .select()
-    .from(deployments)
-    .where(and(eq(deployments.project_id, projectId), eq(deployments.retained, true)))
-    .orderBy(desc(deployments.created_at));
 }
 
 export async function getRetainedDeploymentsExcluding(
@@ -2414,19 +2404,6 @@ export async function updateDomainVerificationData(
 
 export async function deleteDomain(db: Db, id: string): Promise<void> {
   await db.delete(domains).where(eq(domains.id, id));
-}
-
-// Atomically delete a domain row ONLY if it is still `pending`. Used by the
-// cleanup janitor to "claim" a stale row: if a concurrent status poll has
-// since activated the domain (status → 'active'), the delete is a no-op and
-// returns false, so the janitor leaves the now-live domain (and its CF
-// hostname) untouched. Returns true iff a pending row was deleted.
-export async function deleteDomainIfPending(db: Db, id: string): Promise<boolean> {
-  const deleted = await db
-    .delete(domains)
-    .where(and(eq(domains.id, id), eq(domains.status, 'pending')))
-    .returning({ id: domains.id });
-  return deleted.length > 0;
 }
 
 // --- Email destinations ---
@@ -2953,10 +2930,6 @@ export async function promoteEmailDestinationWithOwnerAudit(
 
 // --- Deletion ---
 
-export async function deleteProject(db: Db, id: string): Promise<void> {
-  await db.delete(projects).where(eq(projects.id, id));
-}
-
 export type ProjectCleanupJobInput = typeof projectCleanupJobs.$inferInsert;
 
 export function cleanupJobsForResource(
@@ -3262,17 +3235,6 @@ export async function unsuspendUser(db: Db, id: string): Promise<void> {
   await db.update(users).set({ suspended_reason: null }).where(eq(users.id, id));
 }
 
-export async function updateUserRole(db: Db, id: string, role: 'user' | 'admin'): Promise<void> {
-  const update = async (target: Db) => {
-    await target.update(users).set({ role }).where(eq(users.id, id));
-  };
-  if (role === 'user') {
-    await withAdminRemovalGuard(db, id, update);
-  } else {
-    await update(db);
-  }
-}
-
 export async function deleteUser(db: Db, id: string): Promise<ReadonlyArray<TerminatedBuild>> {
   return withAdminRemovalGuard(db, id, async (tx) => {
     const cancelledBuilds: Array<TerminatedBuild> = [];
@@ -3314,7 +3276,7 @@ export async function deleteUser(db: Db, id: string): Promise<ReadonlyArray<Term
       // Pending invitations are in the lock set so acceptance cannot add a
       // membership after discovery. Re-read the connections under every lock:
       // a creator that acquired a project lock first may have inserted after
-      // discovery and must not be reduced to legacy NULL provenance by the FK.
+      // discovery and must not be left with NULL provenance by the FK.
       const authorizedConnections = await tx
         .select({ projectId: githubConnections.project_id })
         .from(githubConnections)
@@ -3917,41 +3879,6 @@ export async function purgeExpiredAuthCodes(db: Db): Promise<void> {
 // builds
 // ---------------------------------------------------------------------------
 
-export async function createBuild(
-  db: Db,
-  args: {
-    projectId: string;
-    userId: string;
-    executor?: Build['executor'];
-    commitSha?: string | null;
-    branch?: string | null;
-    githubRunId?: string | null;
-    githubRunAttempt?: string | null;
-    logsUrl?: string | null;
-    instanceType?: string | null;
-    status?: Build['status'];
-  },
-): Promise<Build> {
-  const id = generateId('bld');
-  const [row] = await db
-    .insert(builds)
-    .values({
-      id,
-      project_id: args.projectId,
-      user_id: args.userId,
-      executor: args.executor ?? 'container',
-      status: args.status ?? 'queued',
-      commit_sha: args.commitSha ?? null,
-      branch: args.branch ?? null,
-      github_run_id: args.githubRunId ?? null,
-      github_run_attempt: args.githubRunAttempt ?? null,
-      logs_url: args.logsUrl ?? null,
-      instance_type: args.instanceType ?? null,
-    })
-    .returning();
-  return row;
-}
-
 export async function getBuild(db: Db, id: string): Promise<Build | null> {
   const [row] = await db.select().from(builds).where(eq(builds.id, id)).limit(1);
   return row ?? null;
@@ -4207,7 +4134,7 @@ export async function getQueuedBuilds(
  * plan, suspension reason, and count of builds in `ACTIVE_BUILD_STATUSES`
  * (`starting`/`building`/`deploying`). The scheduler uses this to decide which
  * owners are AT their plan's concurrency cap (cap is plan-derived in
- * `getPlanLimits`, NOT a DB column) and pass those ids to `getQueuedBuilds` as
+ * the effective plan catalog, NOT a user DB column) and pass those ids to `getQueuedBuilds` as
  * `excludeUserIds`, so a capped tenant's rows never starve the scan window.
  *
  * Only `container` builds gate scheduling, so the queued-work filter is scoped
@@ -4324,11 +4251,10 @@ export async function hasQueuedContainerBuilds(db: Db): Promise<boolean> {
  * and the plain read avoids any lock-order concern on `github_installations`.
  *
  * FAILS CLOSED unless the exact connection still belongs to the project, has
- * durable authority, and its active installation still covers the repo. New
- * connections record the project owner/admin who completed the repository proof;
- * that authorizer must still be the owner or an admin. Legacy personal-install
- * rows without provenance retain their former owner-match behavior; legacy
- * organization rows are null and stop here.
+ * durable authority, and its active installation still covers the repo. Every
+ * connection records the project owner/admin who completed the repository proof;
+ * that authorizer must still be the owner or an admin. A connection without an
+ * authorizer (its user was deleted) has no authority.
  * An `all` install covers every repo; a `selected` install requires the immutable
  * repo id in its cache. This is the shared predicate used by webhook and OIDC
  * resolvers as well as enqueue and final startup checks.
@@ -4343,11 +4269,6 @@ function githubConnectionAuthorityClause() {
         and ${projectMembers.user_id} = ${githubConnections.authorized_by_user_id}
         and ${projectMembers.role} = 'admin'
     )`,
-    and(
-      isNull(githubConnections.authorized_by_user_id),
-      eq(githubInstallations.account_type, 'User'),
-      eq(githubInstallations.user_id, projects.user_id),
-    ),
   );
 }
 
@@ -4355,8 +4276,7 @@ function githubConnectionAuthorityClause() {
  * Invalidate provenance that no longer names a project owner/admin. Membership
  * mutations call this while holding the project row lock, so they serialize with
  * connection CRUD/build creation (which use the same project-first order).
- * Reauthorization by another admin changes `authorized_by_user_id`, making this
- * a no-op. Active build rows are terminalized before the connection is removed,
+ * Active build rows are terminalized before the connection is removed,
  * which immediately revokes their build-bound deploy tokens.
  */
 async function invalidateGitHubConnectionAuthorizedBy(
@@ -4391,11 +4311,11 @@ async function installationCoversRepoInTx(
   installationId: string,
   repositoryId: string | null,
 ): Promise<boolean> {
-  // An `all`-repos install grants every repo regardless of id; only a `selected`
-  // install needs the immutable numeric id in the cached set, so a null repo id
-  // can't match there and fails closed via the `false` arm below. Checking null
-  // BEFORE the `all` branch (the old unconditional `return false`) wrongly treated
-  // a legacy null-id connection on an `all` install as install-revoked.
+  // Every connection records its immutable repository id; a row without one
+  // cannot prove coverage.
+  if (repositoryId === null) {
+    return false;
+  }
   const [row] = await tx
     .select({ id: githubConnections.id })
     .from(githubConnections)
@@ -4413,9 +4333,7 @@ async function installationCoversRepoInTx(
         githubConnectionAuthorityClause(),
         or(
           eq(githubInstallations.repository_selection, 'all'),
-          repositoryId === null
-            ? sql`false`
-            : sql`${githubInstallations.repositories} @> ${JSON.stringify([{ id: Number(repositoryId) }])}::jsonb`,
+          sql`${githubInstallations.repositories} @> ${JSON.stringify([{ id: Number(repositoryId) }])}::jsonb`,
         ),
       ),
     )
@@ -4429,9 +4347,8 @@ async function installationCoversRepoInTx(
  * repo. Identical fail-closed predicate — returns false unless the
  * `github_installations` row exists AND `status === 'active'` AND the repo is
  * still in the install's selection (`repository_selection === 'all'`, or the
- * immutable numeric repo id is in the cached `repositories` set). A null
- * `repositoryId` fails closed for a `selected` install (membership unprovable by
- * id) but an active `all` install still grants coverage (id irrelevant).
+ * immutable numeric repo id is in the cached `repositories` set). A missing
+ * connection id or repository id fails closed.
  *
  * Used by the container `BuildManager.startBuild` to re-verify coverage at token
  * mint, AFTER a queue wait during which an uninstall/suspension/repo-removal
@@ -4442,19 +4359,14 @@ async function installationCoversRepoInTx(
  */
 export async function installationCoversRepo(
   db: Db,
-  connectionId: string | null | undefined,
+  connectionId: string,
   projectId: string,
   installationId: string,
   repositoryId: string | null,
 ): Promise<boolean> {
-  if (!connectionId) {
+  if (!connectionId || !repositoryId) {
     return false;
   }
-  // An `all`-repos install grants every repo regardless of id; only a `selected`
-  // install needs the immutable numeric id in the cached set, so a null repo id
-  // can't match there and fails closed via the `false` arm below. Checking null
-  // BEFORE the `all` branch (the old unconditional `return false`) wrongly treated
-  // a legacy null-id connection on an `all` install as install-revoked.
   const [row] = await db
     .select({ id: githubConnections.id })
     .from(githubConnections)
@@ -4472,9 +4384,7 @@ export async function installationCoversRepo(
         githubConnectionAuthorityClause(),
         or(
           eq(githubInstallations.repository_selection, 'all'),
-          repositoryId === null
-            ? sql`false`
-            : sql`${githubInstallations.repositories} @> ${JSON.stringify([{ id: Number(repositoryId) }])}::jsonb`,
+          sql`${githubInstallations.repositories} @> ${JSON.stringify([{ id: Number(repositoryId) }])}::jsonb`,
         ),
       ),
     )
@@ -4547,7 +4457,9 @@ export async function supersedeAndCreateContainerBuild(
     // Resolve the size of record from the same owner row whose lock serializes
     // admission. A plan change that lands while webhook processing is doing its
     // network checks must take effect before this enqueue commits.
-    const instanceType = ownerState ? getBuildInstanceType(ownerState.plan) : null;
+    const instanceType = ownerState
+      ? (await resolvePlan(tx, ownerState.plan)).buildInstanceType
+      : null;
 
     // Serialize against PATCH /projects/:id/github: lock + re-read the single
     // connection (project_id is UNIQUE). If a concurrent config change committed
@@ -4957,7 +4869,8 @@ export async function createGithubActionsBuildWithinLimit(
     expectedWorkflowPath: string;
   },
 ): Promise<
-  | { outcome: 'created' | 'reused'; build: Build }
+  | { outcome: 'created'; build: Build; timeoutMinutes: number }
+  | { outcome: 'reused'; build: Build }
   | { outcome: 'limit-exceeded' }
   | { outcome: 'connection-removed' }
   | { outcome: 'connection-replaced' }
@@ -5001,7 +4914,8 @@ export async function createGithubActionsBuildWithinLimit(
     if (ownerState && isAdminSuspended(ownerState.suspendedReason)) {
       return { outcome: 'owner-suspended' };
     }
-    const limit = ownerState ? getPlanLimits(ownerState.plan).concurrentBuilds : 0;
+    const ownerPlan = ownerState ? await resolvePlan(tx, ownerState.plan) : null;
+    const limit = ownerPlan?.limits.concurrentBuilds ?? 0;
 
     // Serialize against DELETE /projects/:id/github: lock + re-read the connection
     // inside this tx. If a concurrent disconnect committed first, the row is gone
@@ -5122,7 +5036,7 @@ export async function createGithubActionsBuildWithinLimit(
     // the current attempt can't self-cancel. Marking them terminal frees the
     // owner's concurrency slot and revokes their deploy token so they can't race
     // `void deploy` for the project — without this, a still-ACTIVE attempt-1
-    // (whose completion webhook was missed) would survive until the 60m reaper.
+    // (whose completion webhook was missed) would survive until the stale-build reaper.
     // (The scaffolded workflow's `concurrency: cancel-in-progress` cancels the
     // older RUN on GitHub's side; this is the server-side backstop.)
     if (args.branch != null && args.branch !== '') {
@@ -5167,7 +5081,11 @@ export async function createGithubActionsBuildWithinLimit(
         logs_url: args.logsUrl ?? null,
       })
       .returning();
-    return { outcome: 'created', build: row };
+    return {
+      outcome: 'created',
+      build: row,
+      timeoutMinutes: ownerPlan?.limits.buildTimeoutMinutes ?? 0,
+    };
   });
 }
 
@@ -5183,7 +5101,7 @@ export async function claimBuildForStartWithinLimit(
     userId: string;
     projectId: string;
   },
-): Promise<{ instanceType: string; ownerPlan: PlanId } | null> {
+): Promise<{ instanceType: string; ownerPlan: PlanId; timeoutMinutes: number } | null> {
   return db.transaction(async (tx) => {
     const [owner] = await tx
       .select({ plan: users.plan, suspendedReason: users.suspended_reason })
@@ -5195,7 +5113,8 @@ export async function claimBuildForStartWithinLimit(
       return null;
     }
 
-    const limit = getPlanLimits(owner.plan).concurrentBuilds;
+    const plan = await resolvePlan(tx, owner.plan);
+    const limit = plan.limits.concurrentBuilds;
     if (limit > 0) {
       const [result] = await tx
         .select({ count: count() })
@@ -5224,7 +5143,7 @@ export async function claimBuildForStartWithinLimit(
       .set({
         status: 'starting',
         started_at: sql`now()`,
-        instance_type: sql`coalesce(${builds.instance_type}, ${getBuildInstanceType(owner.plan)})`,
+        instance_type: sql`coalesce(${builds.instance_type}, ${plan.buildInstanceType})`,
       })
       .where(and(eq(builds.id, args.buildId), eq(builds.status, 'queued')))
       .returning();
@@ -5237,6 +5156,7 @@ export async function claimBuildForStartWithinLimit(
     return {
       instanceType: claimed.instance_type,
       ownerPlan: owner.plan,
+      timeoutMinutes: plan.limits.buildTimeoutMinutes,
     };
   });
 }
@@ -5269,15 +5189,13 @@ export async function createGitHubConnection(
     projectId: string;
     installationId: string;
     repoFullName: string;
-    // The repo's immutable numeric GitHub id (as text), captured from the
-    // installation's cached repository list at connect time. Optional only so
-    // pre-existing callers/tests compile; the connect handler always supplies it
-    // and webhook/OIDC resolution keys on it (full_name is mutable).
-    repositoryId?: string | null;
-    // Set after repository access was proven with the project owner or
-    // administrator's own GitHub OAuth token. Legacy organization connections
-    // remain null and are rejected by every runtime resolver until reconnected.
-    authorizedByUserId?: string | null;
+    // The repo's immutable numeric GitHub id (as text), resolved at connect time.
+    // Webhook/OIDC resolution keys on it (full_name is mutable).
+    repositoryId: string;
+    // The project owner or administrator who proved repository access while
+    // connecting. Runtime authority requires this user to remain the owner or
+    // an administrator.
+    authorizedByUserId: string;
     branch?: string;
     buildExecutor?: GitHubConnection['build_executor'];
     // The `.github/workflows/*.yml` file the OIDC exchange binds the deploy
@@ -5295,8 +5213,8 @@ export async function createGitHubConnection(
       project_id: args.projectId,
       installation_id: args.installationId,
       repo_full_name: args.repoFullName,
-      repository_id: args.repositoryId ?? null,
-      authorized_by_user_id: args.authorizedByUserId ?? null,
+      repository_id: args.repositoryId,
+      authorized_by_user_id: args.authorizedByUserId,
       branch: args.branch ?? 'main',
       build_executor: args.buildExecutor ?? 'container',
       ...(args.workflowPath !== undefined ? { workflow_path: args.workflowPath } : {}),
@@ -5341,50 +5259,16 @@ export async function hasGitHubConnectionAuthority(
   return row !== undefined;
 }
 
-export async function authorizeGitHubOrganizationConnection(
-  db: Db,
-  args: {
-    projectId: string;
-    installationId: string;
-    repoFullName: string;
-    repositoryId: string;
-    userId: string;
-  },
-): Promise<GitHubConnection | null> {
-  const [row] = await db
-    .update(githubConnections)
-    .set({
-      authorized_by_user_id: args.userId,
-      repository_id: args.repositoryId,
-      updated_at: sql`now()`,
-    })
-    .where(
-      and(
-        eq(githubConnections.project_id, args.projectId),
-        eq(githubConnections.installation_id, args.installationId),
-        eq(githubConnections.repo_full_name, args.repoFullName),
-      ),
-    )
-    .returning();
-  return row ?? null;
-}
-
 /**
  * Look up the connection for a webhook-delivered repo within an installation,
  * joining `projects` to surface the owning `user_id` (needed to attribute a
  * build and enforce that user's tier concurrency). Returns the connection
  * fields plus `user_id`, or null when no project is connected to that repo.
  *
- * Resolution keys on the IMMUTABLE numeric repository id (`repository.id` in
- * webhook payloads) so a repo rename/delete/name-reuse under the same
- * installation can't match a DIFFERENT repository to this connection. When the
- * caller has a `repositoryId`, a connection is matched ONLY by that id — it
- * FAILS CLOSED: a `repository_id IS NULL` row is NOT matched by name fallback,
- * because a deleted/renamed-and-reused repo name under the same installation
- * could otherwise match a stale null-id connection and authorize the WRONG
- * project. Only when the caller has no `repositoryId` (malformed/partial
- * webhook) does every connection fall back to a `repo_full_name` match — the
- * pre-id behavior.
+ * Resolution keys ONLY on the IMMUTABLE numeric repository id (`repository.id`
+ * in webhook payloads) so a repo rename/delete/name-reuse under the same
+ * installation can't match a DIFFERENT repository to this connection. The
+ * mutable `repo_full_name` is never a routing key.
  *
  * Returns ALL connections for the repo within the installation: a repo may back
  * multiple projects (only `project_id` is unique), so the caller disambiguates
@@ -5409,13 +5293,8 @@ export async function authorizeGitHubOrganizationConnection(
 export async function getGitHubConnectionsByRepo(
   db: Db,
   installationId: string,
-  repoFullName: string,
-  repositoryId?: string | null,
+  repositoryId: string,
 ): Promise<Array<GitHubConnection & { user_id: string }>> {
-  const matchClause =
-    repositoryId === undefined || repositoryId === null
-      ? eq(githubConnections.repo_full_name, repoFullName)
-      : eq(githubConnections.repository_id, repositoryId);
   const rows = await db
     .select({
       ...getTableColumns(githubConnections),
@@ -5430,19 +5309,16 @@ export async function getGitHubConnectionsByRepo(
     .where(
       and(
         eq(githubConnections.installation_id, installationId),
-        matchClause,
+        eq(githubConnections.repository_id, repositoryId),
         eq(githubInstallations.status, 'active'),
         githubConnectionAuthorityClause(),
         or(
           // "all repositories" install => every repo is granted.
           eq(githubInstallations.repository_selection, 'all'),
           // "selected" install => enforce the repo is in the cached set. The
-          // `repositories` jsonb stores `id` as a NUMBER, so when the caller has
-          // the immutable repo id, check membership by id (rename-safe). Fall
-          // back to name membership only when no id is available.
-          repositoryId === undefined || repositoryId === null
-            ? sql`${githubInstallations.repositories} @> ${JSON.stringify([{ full_name: repoFullName }])}::jsonb`
-            : sql`${githubInstallations.repositories} @> ${JSON.stringify([{ id: Number(repositoryId) }])}::jsonb`,
+          // `repositories` jsonb stores `id` as a NUMBER; check membership by
+          // the immutable id (rename-safe).
+          sql`${githubInstallations.repositories} @> ${JSON.stringify([{ id: Number(repositoryId) }])}::jsonb`,
         ),
       ),
     );
@@ -5477,10 +5353,10 @@ export async function updateGitHubConnectionRepoNamesByRepoId(
  * Resolve the GitHub Actions connection for a repo at OIDC-exchange time.
  *
  * The Actions executor authenticates by presenting a GitHub OIDC token whose
- * `repository` claim names the repo; there is no installation id in that flow,
- * so we look up by `repo_full_name` alone and require `build_executor =
- * 'github_actions'` (a `container`-executor connection must never be driven by
- * the OIDC endpoint). Joins `projects` to surface the owning `user_id` (to
+ * `repository_id` claim names the repo; there is no installation id in that
+ * flow, so we look up by the immutable repository id and require
+ * `build_executor = 'github_actions'` (a `container`-executor connection must
+ * never be driven by the OIDC endpoint). Joins `projects` to surface the owning `user_id` (to
  * attribute the build) and `slug` (to cross-check the workflow's declared
  * `--project <slug>`). When multiple connections name the same repo, the
  * newest by `created_at` wins.
@@ -5502,31 +5378,17 @@ export async function updateGitHubConnectionRepoNamesByRepoId(
  * projects (only `project_id` is unique). The caller disambiguates by the
  * workflow's requested project slug.
  *
- * When `repositoryOwnerId` (the OIDC `repository_owner_id` claim) is supplied,
- * an OIDC match additionally requires the repo's CURRENT owner account to equal
- * the installation's `account_id`. The `repository_id` is immutable across a
- * repo TRANSFER, so without this an org→org transfer (same id, new owner) would
- * match the OLD owner's stale `all`-repos connection and mint a deploy token for
- * the wrong project. A null/undefined owner id (legacy, no claim) skips the
- * owner check to preserve pre-claim behavior; the OIDC route always passes it.
+ * A match also requires the repo's CURRENT owner account (the OIDC
+ * `repository_owner_id` claim) to equal the installation's `account_id`. The
+ * `repository_id` is immutable across a repo TRANSFER, so without this an
+ * org→org transfer (same id, new owner) would match the OLD owner's stale
+ * `all`-repos connection and mint a deploy token for the wrong project.
  */
 export async function getGitHubActionsConnectionsByRepo(
   db: Db,
-  repoFullName: string,
-  repositoryId?: string | null,
-  repositoryOwnerId?: string | null,
+  repositoryId: string,
+  repositoryOwnerId: string,
 ): Promise<Array<GitHubConnection & { user_id: string; project_slug: string }>> {
-  // Key on the IMMUTABLE numeric repository id (`claims.repository_id`) so a
-  // rename/name-reuse can't point a stale `repo_full_name` at this connection.
-  // When the claim carries an id, connections are matched ONLY by id and the
-  // lookup FAILS CLOSED: a null-id row is NOT matched by name fallback, since a
-  // renamed-and-reused repo name could otherwise match a stale null-id
-  // connection and mint a deploy token for the WRONG project. Only a missing
-  // claim id falls back to `repo_full_name` for every row (pre-id behavior).
-  const repoMatch =
-    repositoryId === undefined || repositoryId === null
-      ? eq(githubConnections.repo_full_name, repoFullName)
-      : eq(githubConnections.repository_id, repositoryId);
   const rows = await db
     .select({
       ...getTableColumns(githubConnections),
@@ -5541,16 +5403,13 @@ export async function getGitHubActionsConnectionsByRepo(
     )
     .where(
       and(
-        repoMatch,
+        eq(githubConnections.repository_id, repositoryId),
         // Bind the connection's installation account to the OIDC repo owner. The
         // `repository_id` is immutable across a repo TRANSFER, so this top-level
         // condition (applies to BOTH the 'all' and 'selected' branches below)
         // rejects a transferred repo (same id, NEW owner) that would otherwise
-        // match the old owner's stale connection. Skipped when no owner id is
-        // supplied (legacy/no-claim).
-        repositoryOwnerId === undefined || repositoryOwnerId === null || repositoryOwnerId === ''
-          ? undefined
-          : eq(githubInstallations.account_id, repositoryOwnerId),
+        // match the old owner's stale connection.
+        eq(githubInstallations.account_id, repositoryOwnerId),
         eq(githubConnections.build_executor, 'github_actions'),
         eq(githubInstallations.status, 'active'),
         githubConnectionAuthorityClause(),
@@ -5559,13 +5418,9 @@ export async function getGitHubActionsConnectionsByRepo(
           eq(githubInstallations.repository_selection, 'all'),
           // "selected" install => enforce the repo is in the cached set. The
           // `repositories` jsonb stores `id` as a NUMBER (see
-          // `GitHubInstallationRepository.id: number` and `normalizeRepositories`),
-          // so when the caller has the immutable repo id, check membership by id
-          // (rename-safe). Fall back to name membership only when no id is
-          // available (legacy/no-claim).
-          repositoryId === undefined || repositoryId === null
-            ? sql`${githubInstallations.repositories} @> ${JSON.stringify([{ full_name: repoFullName }])}::jsonb`
-            : sql`${githubInstallations.repositories} @> ${JSON.stringify([{ id: Number(repositoryId) }])}::jsonb`,
+          // `GitHubInstallationRepository.id: number` and `normalizeRepositories`);
+          // check membership by the immutable id (rename-safe).
+          sql`${githubInstallations.repositories} @> ${JSON.stringify([{ id: Number(repositoryId) }])}::jsonb`,
         ),
       ),
     );
@@ -5645,13 +5500,13 @@ export async function upsertGitHubInstallation(
     .onConflictDoUpdate({
       target: githubInstallations.installation_id,
       set: {
-        // Preserve an already-linked user_id when a webhook upsert arrives with
-        // no user (install-before-signin can be backfilled later). When a user
-        // is provided, adopt it ONLY if the row is unowned or already owned by
-        // the same user — never re-own a row linked to a DIFFERENT user. This
-        // guards the concurrent-callback race (realistic for org installs) that
-        // the non-transactional read-then-write backstop in routes/github.ts
-        // cannot catch. (Done in the column expression, not setWhere: setWhere
+        // Only personal (account_type='User') installs carry an owner;
+        // organization installs always pass a null user. Preserve an
+        // already-linked user_id when a webhook upsert arrives with no user
+        // (install-before-signin can be backfilled later). When a user is
+        // provided, adopt it ONLY if the row is unowned or already owned by the
+        // same user — never re-own a row linked to a DIFFERENT user, even if two
+        // callbacks race. (Done in the column expression, not setWhere: setWhere
         // would freeze repositories/status refreshes on the webhook re-upsert,
         // and `user_id = NULL` is never true.)
         user_id:
@@ -5725,9 +5580,9 @@ export async function getGitHubInstallationsByUser(
   db: Db,
   userId: string,
 ): Promise<ReadonlyArray<GitHubInstallation>> {
-  // Personal-account owner OR active member. Organization `user_id` values
-  // written by older code are visibility hints, not authority, so they never
-  // satisfy this query without a live membership. The EXISTS correlates on the NUMERIC
+  // Personal-account owner OR active member. Organization installs have no
+  // owner (`user_id` is null), so they are visible only through a live
+  // membership. The EXISTS correlates on the NUMERIC
   // `installation_id` (githubInstallations.installation_id) — the key the
   // membership cache is stored under — NOT the surrogate `.id`. The membership
   // arm honors the TTL (`expires_at > now()`, DB clock). owner-OR-EXISTS yields
@@ -5871,35 +5726,6 @@ export async function getGitHubInstallationsByAccount(
     );
 }
 
-/**
- * Guarded clear of the installer/owner pointer for a removed user. The
- * `user_id = userId` guard means a concurrent re-own or a different owner is
- * never clobbered. Membership rows are removed separately
- * (`deleteGitHubInstallationMembers`); this only nulls the single owner pointer.
- * No-op returning 0 on an empty id list so we never emit a `WHERE ... IN ()`.
- * The count is read through `updatedRowCount` so it is correct on both the
- * production pg driver (`rowCount`) and the PGlite test driver (`affectedRows`).
- */
-export async function clearGitHubInstallationOwnerForUser(
-  db: Db,
-  installationIds: ReadonlyArray<string>,
-  userId: string,
-): Promise<number> {
-  if (installationIds.length === 0) {
-    return 0;
-  }
-  const result = await db
-    .update(githubInstallations)
-    .set({ user_id: null, updated_at: sql`now()` })
-    .where(
-      and(
-        inArray(githubInstallations.installation_id, installationIds),
-        eq(githubInstallations.user_id, userId),
-      ),
-    );
-  return updatedRowCount(result);
-}
-
 // ---------------------------------------------------------------------------
 // github_installation_members — cached org co-membership (TTL, no stored token)
 //
@@ -5971,46 +5797,6 @@ export async function hasActiveInstallationMembership(
     )
     .limit(1);
   return rows.length > 0;
-}
-
-/** All cached memberships for a user, newest verification first. */
-export async function getGitHubInstallationMembersByUser(
-  db: Db,
-  userId: string,
-): Promise<ReadonlyArray<GitHubInstallationMember>> {
-  return db
-    .select()
-    .from(githubInstallationMembers)
-    .where(eq(githubInstallationMembers.user_id, userId))
-    .orderBy(desc(githubInstallationMembers.verified_at));
-}
-
-/** All cached members of an installation, newest verification first. */
-export async function getGitHubInstallationMembers(
-  db: Db,
-  installationId: string,
-): Promise<ReadonlyArray<GitHubInstallationMember>> {
-  return db
-    .select()
-    .from(githubInstallationMembers)
-    .where(eq(githubInstallationMembers.installation_id, installationId))
-    .orderBy(desc(githubInstallationMembers.verified_at));
-}
-
-/** Remove one cached membership. Silent no-op when the row is absent. */
-export async function deleteGitHubInstallationMember(
-  db: Db,
-  installationId: string,
-  userId: string,
-): Promise<void> {
-  await db
-    .delete(githubInstallationMembers)
-    .where(
-      and(
-        eq(githubInstallationMembers.installation_id, installationId),
-        eq(githubInstallationMembers.user_id, userId),
-      ),
-    );
 }
 
 /**

@@ -3,6 +3,55 @@ import { parsePlatformArgs } from '../../src/cli/platform-args.ts';
 import { assertNoninteractivePlatformMutationAcknowledged } from '../../src/cli/platform-lifecycle.ts';
 
 describe('platform args', () => {
+  it('accepts explicit planned choices and rejects contradictory configuration', () => {
+    expect(
+      parsePlatformArgs([
+        'install',
+        '--no-control-plane-domain',
+        '--no-dedicated-zone',
+        '--hyperdrive',
+        'drive-id',
+        '--login-methods',
+        'google,oidc',
+        '--no-access-protection',
+      ]),
+    ).toMatchObject({
+      noControlPlaneDomain: true,
+      dedicatedZoneSpecified: true,
+      hyperdrive: 'drive-id',
+      loginMethods: ['google', 'oidc'],
+      accessProtection: false,
+    });
+    for (const flags of [
+      ['--control-plane-domain', 'api.example.com', '--no-control-plane-domain'],
+      ['--dedicated-zone', '--no-dedicated-zone'],
+      ['--access-protection', '--no-access-protection'],
+      ['--auth-config', 'auth.json', '--login-methods', 'github'],
+      ['--auth-config', 'auth.json', '--access-protection'],
+      ['--login-methods', 'unknown'],
+      ['--login-methods', 'github,'],
+    ]) {
+      expect(() => parsePlatformArgs(['install', ...flags])).toThrow();
+    }
+  });
+
+  it('configures dashboard origins only in install, upgrade, and repair', () => {
+    for (const command of ['install', 'upgrade', 'repair']) {
+      expect(
+        parsePlatformArgs([command, '--dashboard-url', 'https://DASH.example.com:8443/']),
+      ).toMatchObject({ dashboardUrl: 'https://dash.example.com:8443' });
+      expect(parsePlatformArgs([command])).not.toHaveProperty('dashboardUrl');
+      expect(() =>
+        parsePlatformArgs([command, '--dashboard-url', 'https://dash.example.com/account']),
+      ).toThrow('HTTPS origin');
+      expect(() => parsePlatformArgs([command, '--dashboard-url'])).toThrow('requires a value');
+    }
+    for (const command of ['enable', 'disable', 'rollback', 'uninstall']) {
+      expect(() =>
+        parsePlatformArgs([command, '--dashboard-url', 'https://dash.example.com']),
+      ).toThrow();
+    }
+  });
   it('parses resumable domain setup without confusing app-domain commands', () => {
     expect(
       parsePlatformArgs(['domain', 'set', 'example.com', '--installation', 'team', '--plan']),

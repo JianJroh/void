@@ -2,15 +2,70 @@
 
 ## Local verification
 
-Run the smallest relevant test target while developing:
+Start with the smallest relevant test file or case while developing:
 
 ```sh
-vp test run packages/void
+vp test run packages/void/test/unit/plugin-routing.test.ts
+vp test run packages/void/test/unit/plugin-routing.test.ts -t 'routing'
 vp run check
 ```
 
 Type-only contracts use `*.typecheck.ts`. Package typechecking verifies them; the Vitest runtime
 does not need to execute their `expectTypeOf` assertions.
+
+### Affected local tests
+
+`vp run test` is the local affected-tests default; `vp test run`, `vp run test:full`, and CI still
+run the full suite. The selector's result caching is disabled: Git state must be inspected on every run.
+Do not pass `vp run --cache` to this task.
+
+```sh
+vp run test --list                 # Preview files and fallback reasons; no builds or test hooks
+vp run test                       # Staged, unstaged, and untracked changes against HEAD
+vp run test --base origin/main     # Branch commits since merge-base, plus local changes
+vp run test --unit                 # Faster iteration only; explicitly skips integration projects
+```
+
+Pass shortcut arguments directly after the task name, without an extra `--`. A clean working tree
+selects nothing unless `--base` includes earlier commits. Invalid Git refs or selection failures
+fail the command rather than silently skipping coverage.
+
+The runner uses Vitest's static import graph, including transitive and literal dynamic imports.
+It supplies changed paths through [Vitest's `experimental.vcsProvider` hook](https://vitest.dev/config/experimental#experimental-vcsprovider).
+Independent Git queries run asynchronously in parallel, and filtering reuses one snapshot per invocation.
+Neither test results nor Git state are cached between commands. Built public exports join that snapshot
+before import-based selection. The hook is specific to the smart runner: native `vp test run --changed`
+still lacks the repository's integration fallbacks.
+
+The runner adds coverage that imports cannot describe:
+
+- SDK source changes rebuild public packages, select all SDK build/server/browser integrations,
+  and include built public exports in the related graph so platform and adapter consumers are covered.
+- Platform source, migration, and fixture changes select the owning package's tests, including
+  both API integration worker pools. Ordinary changed test files use the native related graph.
+- Playground changes select suites mentioning that fixture path. An unmapped playground selects
+  all SDK integrations; shared test tooling, configuration, dependencies, deletions/renames,
+  and unknown ownership fall back to the full selection.
+- Documentation-only changes skip runtime tests. Verify documentation rendering/examples separately.
+
+`--list` does not refresh builds, so built-export coverage can expand when the command executes.
+Affected selection is conservative, not a proof that all behavior is covered: computed imports,
+filesystem reads, generated artifacts, and external services can introduce additional dependencies.
+Explicitly run a known consumer when changing one of those boundaries, and add a selector regression
+when introducing a new fixture layout. Changes to packaging still need the packed checks below;
+changes to metaframework output still need `build:all` and the artifact check.
+
+For a leaf-module edit with known import-based consumers, Vitest's native related command is useful:
+
+```sh
+vp test related --run packages/void/src/runtime/sse.ts --project unit --project cli-unit
+vp test list packages/void/test/unit/plugin-routing.test.ts --filesOnly
+```
+
+Agents should run a focused regression first, then affected verification and `vp run check` after a
+batch. Use unit-only runs during iteration, but run the affected integration selection before
+handoff. Run the full suite once for final verification, not after every edit. For interactive
+development, `vp test watch <test-file>` keeps the transform graph in memory between edits.
 
 The named shortcuts select the current test projects:
 
@@ -32,12 +87,47 @@ vpr test:all
 `vpr test:all` formats, lints, builds, typechecks, and tests the merged monorepo. Investigate slow
 or hanging tests when they occur instead of routinely increasing timeouts.
 
-Platform projects run first; SDK unit and integration files then share a scheduling phase. Unit files
-use worker threads to reduce startup time; integration files use forks. This keeps database engines
-from competing with all framework compilers at startup. Keep module isolation enabled: these suites
-mock globals, keep database state, and exercise real process/lock boundaries.
+Subprocess and provisioning-lock unit tests start alongside the platform projects so their real
+process deadlines can overlap database work. The remaining SDK unit and integration files then
+share a scheduling phase. `vp run test:unit` includes both `unit` and `cli-unit`; CI does the same.
+Unit files and most API integration files use isolated worker threads to reduce startup time. API tests that
+change the process timezone use forks, because threads cannot change Node's timezone. Select every
+API file with `vp test run --project 'platform-api-integration*'`. SDK integration files use forks.
+This keeps database engines from competing with all framework compilers at startup. Keep module
+isolation enabled: these suites mock globals, keep database state, and exercise real process/lock boundaries.
 The full verification command builds before running the platform's type-aware lint, so it also
 works without a pre-existing dashboard `.void/tsconfig.json`.
+
+## Reusing transforms
+
+Persistent `fsModuleCache` is enabled to reuse transformations across invocations. It does not
+cache test results or remove per-file module isolation. The first run primes it; compare repeated
+runs with the same selection and machine load. For a control use `--no-fsModuleCache`; use
+`vp test --clearCache` only when diagnosing cache problems, not before ordinary tests.
+
+## Profiling slow tests
+
+Vitest 5's import diagnostics are opt-in so ordinary runs stay quiet:
+
+```sh
+vp run test:profile packages/void/test/unit/plugin-routing.test.ts
+vp run test:profile --project 'platform-api-integration*' api-delete-accounting.test.ts
+vp test doctor packages/void/test/unit/plugin-routing.test.ts
+```
+
+The profile shortcut enables `experimental.importDurations.print` and reports the top 20 imports
+with the default reporter. Use `--experimental.importDurations.print=verbose` or `=tree` when more
+detail is useful. `Self` is work attributed to the module; `Total` includes imported dependencies,
+so do not add totals together. Prefer narrow entry points and production lazy loading when an
+optional feature brings in a heavy graph. Do not replace production imports with mocks just to
+make the measurement smaller. See [Vitest's profiling guide](https://main.vitest.dev/guide/profiling-test-performance).
+
+If import/transform time dominates, inspect import diagnostics or a main-thread CPU profile. If
+test time dominates, investigate real code, database setup/reset, server readiness, and teardown.
+Worker phase percentages are aggregated and are not independent wall-clock savings. `doctor`
+executes its selection multiple times; never run it on the whole monorepo as a routine agent step.
+Its suggestions require correctness checks: this repository's native dependencies and timezone
+tests rule out blanket VM pools, and shared mocks/state require keeping isolation enabled.
 
 ## Suite organization and CI scheduling
 
@@ -69,6 +159,10 @@ form interactions run in the adapter browser matrix.
 The in-memory API deletion tests schedule the fixed container-orphan sweep delay immediately.
 They still execute both sweeps and all provider/database assertions. Production timing and the
 real subprocess/lock deadline tests retain their actual timing semantics.
+
+API integration fixtures reset their tables with one ordered SQL block. Use `clearTables` rather
+than repeating per-table cleanup; it keeps foreign-key delete behavior and migration history
+intact in both PGlite and the shared PostgreSQL compatibility run.
 
 CLI and deploy tests that stub their network boundary and call production functions directly run
 in the unit project. The integration project is reserved for real builds, subprocesses, servers,

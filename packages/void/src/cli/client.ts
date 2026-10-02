@@ -172,6 +172,36 @@ export type ProjectDeployCredentialResponse = {
   revokedAt: string | null;
 };
 
+export type ProjectZeroTrustState = {
+  project_id: string;
+  desired_protected: boolean;
+  effective_protected: boolean;
+  state: 'public' | 'protected' | 'reconciling' | 'error';
+  last_error: string | null;
+  updated_at: string;
+};
+
+/** `GET /projects/:id/zero-trust`. */
+export type ProjectZeroTrustResponse = {
+  /** Whether a project owner or admin can change protection now. */
+  available: boolean;
+  platformStatus:
+    | 'not_configured'
+    | 'invalid_configuration'
+    | 'configuring'
+    | 'ready'
+    | 'disabling'
+    | 'error';
+  protectNewProjects: boolean;
+  project: ProjectZeroTrustState | null;
+};
+
+/** `PUT /projects/:id/zero-trust` and `POST /projects/:id/zero-trust/reconcile`. */
+export type ProjectZeroTrustUpdateResponse = {
+  ok: true;
+  project: ProjectZeroTrustState;
+};
+
 export type IssuedProjectDeployCredentialResponse = ProjectDeployCredentialResponse & {
   token: string;
 };
@@ -180,6 +210,8 @@ export type CreateProjectResponse = {
   url?: string;
   id: string;
   slug: string;
+  warnings?: Array<string>;
+  zero_trust?: ProjectZeroTrustState;
   /**
    * Present exactly when the platform scheduled the project owner's own
    * address to be registered as an outbound email destination. The
@@ -268,6 +300,7 @@ export type BuildLogsResponse = {
   lastSeq: number;
   status: string;
   terminal: boolean;
+  logsComplete?: boolean | null;
   external: string | null;
 };
 
@@ -327,6 +360,12 @@ export type EmailSettingsResponse = {
     projectSlug?: string;
   };
   recipientPolicy?: { mode: 'verified' | 'domains' | 'any'; domains: Array<string> };
+  sharedInbound?: {
+    recipient: string;
+    status: string;
+    reason: string | null;
+    observedAt: string | null;
+  } | null;
 };
 
 export type EmailDomainResponse = {
@@ -435,7 +474,6 @@ export type GithubConnection = {
   branch: string;
   build_executor: 'container' | 'github_actions';
   workflow_path: string;
-  requires_reconnect?: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -472,13 +510,54 @@ export type ManifestOnlyDeployPayload = DeployUploadPayload;
  *   the server's precheck, the only atomic (project-locked) verdict: if
  *   an earlier attempt or a concurrent deploy is still in flight, the
  *   replay is rejected with 409 and surfaced as a deploy conflict
- *   naming the deployment id. A client-side GET-then-decide lookup can
- *   never be authoritative (the row can transition between lookup and
- *   replay), so no dedupe query is made — the residual case is the lost
- *   attempt completing within seconds and being redeployed identically.
+ *   naming the deployment id. Receipt-aware platforms additionally bind
+ *   the stable invocation key to the accepted artifact, so an accepted
+ *   request can be recovered without creating another execution. Older
+ *   platforms retain their concurrency guard. No client-side deployment
+ *   lookup may authorize replay or identify an unrelated conflicting row.
  */
 const DEPLOY_POST_MAX_RETRIES = 3;
 const DEPLOY_POST_BACKOFF_MS = [1000, 5000, 10000];
+const DEPLOY_OBSERVATION_TIMEOUT_MS = 30_000;
+const DEPLOY_OBSERVATION_DEADLINE_MS = 30 * 60_000;
+const DEPLOY_OBSERVATION_BACKOFF_MS = [1000, 2000, 5000, 10_000, 30_000];
+const DEPLOY_EVENT_MAX_BYTES = 1024 * 1024;
+
+type SequencedDeployEvent = DeployEvent & { seq?: number };
+class DeploymentProtocolError extends Error {}
+
+function parseDeployEvent(value: unknown): SequencedDeployEvent {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    !('event' in value) ||
+    typeof value.event !== 'string'
+  ) {
+    throw new DeploymentProtocolError('Invalid deployment event from platform.');
+  }
+  const event = value as SequencedDeployEvent;
+  if (event.seq !== undefined && (!Number.isSafeInteger(event.seq) || event.seq < 1)) {
+    throw new DeploymentProtocolError('Invalid deployment event sequence from platform.');
+  }
+  if (
+    (event.event === 'start' && typeof event.deploymentId !== 'string') ||
+    (event.event === 'done' &&
+      (typeof event.deployment !== 'string' ||
+        typeof event.url !== 'string' ||
+        !Array.isArray(event.urls) ||
+        !event.urls.every((url) => typeof url === 'string') ||
+        !Number.isSafeInteger(event.assets) ||
+        event.assets < 0 ||
+        !Number.isSafeInteger(event.workers) ||
+        event.workers < 0 ||
+        (event.published !== undefined && typeof event.published !== 'boolean'))) ||
+    (event.event === 'error' &&
+      (typeof event.message !== 'string' || typeof event.step !== 'string'))
+  ) {
+    throw new DeploymentProtocolError('Invalid deployment result from platform.');
+  }
+  return event;
+}
 
 /**
  * HTTP client for the Void platform API.
@@ -615,13 +694,15 @@ export class PlatformClient {
     return res.json();
   }
 
-  /** A lightweight project list for interactive linking; older platforms use the full list. */
+  /** A lightweight project list for interactive linking. */
   async listProjectChoices(): Promise<Array<ProjectResponse>> {
     const res = await this.request(`${this.baseUrl}/projects/choices`, {
       headers: { ...this.authHeaders },
     });
     if (res.status === 404) {
-      return this.listProjects();
+      throw new Error(
+        'This platform does not support project lookup. Ask its administrator to upgrade the platform runtime.',
+      );
     }
     if (!res.ok) {
       await throwPlatformApiError('Failed to list project choices', res);
@@ -643,14 +724,15 @@ export class PlatformClient {
     return res.json();
   }
 
-  /** New platforms resolve a slug directly; older installations retain the list fallback. */
+  /** Resolve a slug through the current platform contract. */
   async findProjectBySlug(slug: string): Promise<ProjectResponse | null> {
     const url = new URL(`${this.baseUrl}/projects/resolve`);
     url.searchParams.set('slug', slug);
     const res = await this.request(url.toString(), { headers: { ...this.authHeaders } });
     if (res.status === 404) {
-      const projects = await this.listProjects();
-      return projects.find((project) => project.slug === slug) ?? null;
+      throw new Error(
+        'This platform does not support project lookup. Ask its administrator to upgrade the platform runtime.',
+      );
     }
     if (!res.ok) {
       await throwPlatformApiError('Failed to resolve project', res);
@@ -665,6 +747,42 @@ export class PlatformClient {
     });
     if (!res.ok) {
       await throwPlatformApiError('Failed to list project tokens', res, 'owner');
+    }
+    return res.json();
+  }
+
+  async getProjectZeroTrust(projectId: string): Promise<ProjectZeroTrustResponse> {
+    const res = await this.request(`${this.baseUrl}/projects/${projectId}/zero-trust`, {
+      headers: { ...this.authHeaders },
+    });
+    if (!res.ok) {
+      await throwPlatformApiError('Failed to inspect project Zero Trust', res, 'read');
+    }
+    return res.json();
+  }
+
+  async setProjectZeroTrust(
+    projectId: string,
+    protectedProject: boolean,
+  ): Promise<ProjectZeroTrustUpdateResponse> {
+    const res = await this.request(`${this.baseUrl}/projects/${projectId}/zero-trust`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', ...this.authHeaders },
+      body: JSON.stringify({ protected: protectedProject }),
+    });
+    if (!res.ok) {
+      await throwPlatformApiError('Failed to update project Zero Trust', res, 'settings');
+    }
+    return res.json();
+  }
+
+  async reconcileProjectZeroTrust(projectId: string): Promise<ProjectZeroTrustUpdateResponse> {
+    const res = await this.request(`${this.baseUrl}/projects/${projectId}/zero-trust/reconcile`, {
+      method: 'POST',
+      headers: { ...this.authHeaders },
+    });
+    if (!res.ok) {
+      await throwPlatformApiError('Failed to reconcile project Zero Trust', res, 'settings');
     }
     return res.json();
   }
@@ -1009,6 +1127,7 @@ export class PlatformClient {
       headers: {
         'Content-Type': 'application/json',
         ...this.authHeaders,
+        'x-void-deploy-idempotency-key': crypto.randomUUID(),
       },
       body: JSON.stringify(payload),
     });
@@ -1096,7 +1215,25 @@ export class PlatformClient {
       );
     }
 
-    const reader = res.body!.getReader();
+    const receipt = res.headers.get('x-void-deployment-id');
+    if (receipt !== null && !/^[A-Za-z0-9_-]{1,128}$/.test(receipt)) {
+      void res.body?.cancel().catch(() => {});
+      throw new Error('Invalid deployment receipt from platform.');
+    }
+    let cursor = 0;
+    let terminal = false;
+    // Receipt-aware platforms own execution independently of this observer.
+    // Capturing the ID before the first byte also permits recovery when start
+    // was lost. Older platforms retain their original stream-only behavior.
+    if (!res.body) {
+      if (receipt) {
+        yield { event: 'start', deploymentId: receipt };
+        yield* this.followDeploymentEvents(projectId, receipt, cursor);
+        return;
+      }
+      throw new Error('Platform returned no deployment event stream.');
+    }
+    const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
     let bytesRead = 0;
@@ -1104,11 +1241,64 @@ export class PlatformClient {
     const startedAt = Date.now();
     let eventCount = 0;
     let lastEventName = '<none>';
+    let streamFinished = false;
+    let readTimer: ReturnType<typeof setTimeout> | undefined;
+    const read = async () => {
+      if (!receipt) {
+        return reader.read();
+      }
+      try {
+        return await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => {
+            readTimer = setTimeout(
+              () => reject(new TypeError('Deployment event stream timed out.')),
+              DEPLOY_OBSERVATION_TIMEOUT_MS,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(readTimer);
+      }
+    };
+    const parseLine = (line: string): SequencedDeployEvent | null => {
+      if (Buffer.byteLength(line) > DEPLOY_EVENT_MAX_BYTES) {
+        throw new DeploymentProtocolError('Deployment event exceeds the platform response limit.');
+      }
+      if (!line.trim()) {
+        return null;
+      }
+      const event = parseDeployEvent(JSON.parse(line));
+      if (event.seq !== undefined) {
+        if (event.seq <= cursor) {
+          return null;
+        }
+        cursor = event.seq;
+      }
+      eventCount++;
+      lastEventName = event.event;
+      cliLog?.info('deploy_event', { eventCount, event: lastEventName, raw: line.slice(0, 200) });
+      // The receipt already supplied start, but still advance its sequence.
+      if (receipt && event.event === 'start') {
+        return null;
+      }
+      terminal = event.event === 'done' || event.event === 'error';
+      return event;
+    };
 
     try {
+      if (receipt) {
+        yield { event: 'start', deploymentId: receipt };
+      }
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await read();
         if (done) {
+          streamFinished = true;
+          buffer += decoder.decode();
+          const event = parseLine(buffer);
+          if (event) {
+            yield event;
+          }
           cliLog?.info('deploy_stream_eof', {
             bytesRead,
             eventCount,
@@ -1127,17 +1317,18 @@ export class PlatformClient {
         while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
           const line = buffer.slice(0, newlineIdx);
           buffer = buffer.slice(newlineIdx + 1);
-          if (line.trim()) {
-            const event = JSON.parse(line) as DeployEvent;
-            eventCount++;
-            lastEventName = (event as { event?: string }).event ?? '<no-event-field>';
-            cliLog?.info('deploy_event', {
-              eventCount,
-              event: lastEventName,
-              raw: line.slice(0, 200),
-            });
+          const event = parseLine(line);
+          if (event) {
             yield event;
+            if (terminal) {
+              return;
+            }
           }
+        }
+        if (Buffer.byteLength(buffer) > DEPLOY_EVENT_MAX_BYTES) {
+          throw new DeploymentProtocolError(
+            'Deployment event exceeds the platform response limit.',
+          );
         }
       }
     } catch (err) {
@@ -1146,8 +1337,113 @@ export class PlatformClient {
         eventCount,
         lastEvent: lastEventName,
       });
-      throw err;
+      // Parse/protocol errors are not transient transport failures. Never hide
+      // them behind polling, and never replay a POST that yielded a receipt.
+      if (
+        !receipt ||
+        err instanceof DeploymentProtocolError ||
+        err instanceof SyntaxError ||
+        (err instanceof DOMException && err.name === 'AbortError')
+      ) {
+        throw err;
+      }
+    } finally {
+      clearTimeout(readTimer);
+      if (!streamFinished) {
+        // An underlying cancellation can stall; observer cleanup must not wait
+        // indefinitely for a closed or broken network connection.
+        void reader.cancel().catch(() => {});
+      }
+      reader.releaseLock();
     }
+    if (receipt && !terminal) {
+      yield* this.followDeploymentEvents(projectId, receipt, cursor);
+    }
+  }
+
+  private async *followDeploymentEvents(
+    projectId: string,
+    deploymentId: string,
+    since: number,
+  ): AsyncGenerator<DeployEvent> {
+    let cursor = since;
+    let failures = 0;
+    const deadline = Date.now() + DEPLOY_OBSERVATION_DEADLINE_MS;
+    while (Date.now() < deadline) {
+      const url = `${this.baseUrl}/projects/${encodeURIComponent(projectId)}/deployments/${encodeURIComponent(deploymentId)}/events?since=${cursor}`;
+      let page: {
+        deploymentId: string;
+        events: Array<{ seq: number; event: unknown }>;
+        lastSeq: number;
+        terminal: boolean;
+      };
+      try {
+        const response = await this.request(url, {
+          headers: { ...this.authHeaders },
+          signal: AbortSignal.timeout(DEPLOY_OBSERVATION_TIMEOUT_MS),
+        });
+        if (!response.ok) {
+          await throwPlatformApiError('Failed to observe deployment', response, 'read');
+        }
+        page = (await response.json()) as typeof page;
+      } catch (err) {
+        const transient =
+          err instanceof TypeError ||
+          (err instanceof DOMException && err.name === 'TimeoutError') ||
+          (err instanceof PlatformApiError && (err.status === 429 || err.status >= 500));
+        if (!transient || failures >= DEPLOY_OBSERVATION_BACKOFF_MS.length) {
+          throw err;
+        }
+        const delayMs = DEPLOY_OBSERVATION_BACKOFF_MS[failures++];
+        this.cliLog?.warn('deploy_observation_retry', { deploymentId, cursor, delayMs });
+        await sleep(delayMs);
+        continue;
+      }
+      failures = 0;
+      if (
+        !page ||
+        page.deploymentId !== deploymentId ||
+        !Array.isArray(page.events) ||
+        page.events.length > 1000 ||
+        !Number.isSafeInteger(page.lastSeq) ||
+        page.lastSeq < cursor ||
+        typeof page.terminal !== 'boolean'
+      ) {
+        throw new Error('Invalid deployment observation response from platform.');
+      }
+      let previousSeq = 0;
+      for (const row of page.events) {
+        if (
+          !row ||
+          !Number.isSafeInteger(row.seq) ||
+          row.seq <= previousSeq ||
+          row.seq > page.lastSeq
+        ) {
+          throw new Error('Invalid deployment observation sequence from platform.');
+        }
+        previousSeq = row.seq;
+        const event = parseDeployEvent(row.event);
+        if (row.seq <= cursor) {
+          continue;
+        }
+        cursor = row.seq;
+        if (event.event !== 'start') {
+          yield event;
+        }
+        if (event.event === 'done' || event.event === 'error') {
+          return;
+        }
+      }
+      // Never skip a missing event merely because the server advertises a
+      // later high-water mark. Only consumed events advance the cursor.
+      if (page.terminal) {
+        throw new Error('Platform finished deployment without a terminal result.');
+      }
+      await sleep(1000);
+    }
+    throw new Error(
+      `Timed out observing deployment ${deploymentId}. Inspect with \`void project status\`.`,
+    );
   }
 
   async listSecrets(projectId: string): Promise<Array<{ name: string }>> {

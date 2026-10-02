@@ -1,9 +1,11 @@
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { log } from '@clack/prompts';
+import { stripVTControlCharacters } from 'node:util';
+import { log, outro } from '@clack/prompts';
 import { createPlatformDeploymentManifest, transitionInstallation } from '@void/platform';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
+import { pc } from '../../src/cli/output.ts';
 import { parsePlatformArgs } from '../../src/cli/platform-args.ts';
 import {
   PlatformCloudflareApiError,
@@ -244,13 +246,28 @@ async function interruptedInstall() {
 
 describe('platform credential onboarding', () => {
   it('prints a command to install a fresh read-only plan without saving a draft', async () => {
+    const colors = pc.createColors(true);
+    vi.spyOn(pc, 'bold').mockImplementation(colors.bold);
+    vi.spyOn(pc, 'cyan').mockImplementation(colors.cyan);
     await runPlatformLifecycleCommand(parsePlatformArgs([...args, '--plan']));
+    const lastOutput = vi.mocked(console.log).mock.calls.at(-1)![0] as string;
+    expect(lastOutput).toContain(
+      colors.bold(colors.cyan('Next step: run this command to install')),
+    );
+    expect(stripVTControlCharacters(lastOutput)).toMatch(
+      /Next step: run this command to install\n\nvoid platform install /,
+    );
+    expect(vi.mocked(outro).mock.invocationCallOrder.at(-1)).toBeLessThan(
+      vi.mocked(console.log).mock.invocationCallOrder.at(-1)!,
+    );
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining(
         'void platform install --name test-setup --account account --display-name Test --workers-dev',
       ),
     );
-    expect(console.log).toHaveBeenCalledWith('Choose the same login methods when prompted.\n');
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining('--login-methods github --no-access-protection'),
+    );
     expect(listInstallationManifests()).toEqual([]);
   });
 
@@ -261,6 +278,9 @@ describe('platform credential onboarding', () => {
     );
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining(`void platform install --resume --name ${interrupted.id}`),
+    );
+    expect(console.log).toHaveBeenLastCalledWith(
+      expect.stringContaining('Next step: run this command to resume'),
     );
   });
 
@@ -488,7 +508,7 @@ describe('platform credential onboarding', () => {
         [reason]: true,
       }));
       await runPlatformLifecycleCommand(parsePlatformArgs(args));
-      expect(mocks.progress.stop).toHaveBeenCalledWith('Installation paused; progress is saved.');
+      expect(mocks.progress.stop).toHaveBeenCalledWith('Installation paused. Progress is saved.');
       expect(mocks.progress.error).not.toHaveBeenCalled();
     },
   );
@@ -800,7 +820,7 @@ describe('platform credential onboarding', () => {
     );
     expect(mocks.text).toHaveBeenCalledWith(
       expect.objectContaining({
-        message: 'Optional custom API hostname (leave empty for workers.dev):',
+        message: 'Custom API hostname. Leave empty for workers.dev:',
       }),
     );
     const draft = listInstallationManifests()[0]!;
@@ -809,7 +829,9 @@ describe('platform credential onboarding', () => {
     expect(draft.deployment.resources).toEqual(preview.deployment.resources);
     expect(isPlatformSetupDraft(draft)).toBe(true);
     const callback = `https://${draft.deployment.resources.apiWorker}.void-platform-e2e-test.workers.dev/auth/callback`;
-    expect(console.log).toHaveBeenCalledWith(expect.stringContaining('Redirect URI: ' + callback));
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining('Login callback: ' + callback),
+    );
     expect(info).toHaveBeenCalledWith(expect.stringContaining('Redirect URI: ' + callback));
     mocks.password.mockImplementation(normalPassword);
     mocks.open.mockClear();
@@ -861,6 +883,27 @@ describe('platform credential onboarding', () => {
     expect(listInstallationManifests()).toEqual([]);
     expect(readdirSync(directory)).toEqual([]);
     expect(mocks.spinner).not.toHaveBeenCalled();
+  });
+  it('continues from the printed command without repeating nonsecret choices', async () => {
+    await runPlatformLifecycleCommand(parsePlatformArgs([...args, '--plan']));
+    const output = stripVTControlCharacters(vi.mocked(console.log).mock.calls.flat().join('\n'));
+    const command = output
+      .split('\n')
+      .find((line) => /^void(?:-dev)? platform install /.test(line))!;
+    expect(command).toContain('--no-control-plane-domain');
+    expect(command).toContain('--hyperdrive create');
+    expect(command).toContain('--login-methods github --no-access-protection');
+    expect(listInstallationManifests()).toEqual([]);
+    expect(mocks.password).not.toHaveBeenCalled();
+    vi.clearAllMocks();
+    await runPlatformLifecycleCommand(parsePlatformArgs(command.split(' ').slice(2)));
+    expect(mocks.multiselect).not.toHaveBeenCalled();
+    expect(mocks.select).not.toHaveBeenCalled();
+    expect(
+      mocks.text.mock.calls.some(([input]) => input.message.startsWith('Custom API hostname')),
+    ).toBe(false);
+    expect(mocks.password).toHaveBeenCalled();
+    expect(mocks.install).toHaveBeenCalledOnce();
   });
   it('does not save a draft or open pages when the plan is declined', async () => {
     mocks.confirm.mockResolvedValue(false);

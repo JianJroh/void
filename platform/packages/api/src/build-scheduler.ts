@@ -18,8 +18,8 @@ import {
   updateBuildStatus,
 } from './db.ts';
 import type { ApiEnv } from './env.ts';
+import { readPlanCatalog, planFromCatalog } from './plans.ts';
 import { isAdminSuspended } from './suspension.ts';
-import { getPlanLimits } from './tiers.ts';
 
 /** A poke arms the alarm this far ahead so the next scan runs almost immediately. */
 const POKE_DELAY_MS = 50;
@@ -75,12 +75,13 @@ export class BuildScheduler extends DurableObject<ApiEnv['Bindings']> {
       .filter((owner) => isAdminSuspended(owner.suspendedReason))
       .map((owner) => owner.userId);
     await cancelQueuedContainerBuildsForUsers(db, suspendedUserIds);
+    const catalog = await readPlanCatalog(db);
     const cappedUserIds = owners
       .filter((o) => {
         if (isAdminSuspended(o.suspendedReason)) {
           return false;
         }
-        const limit = getPlanLimits(o.plan).concurrentBuilds;
+        const limit = planFromCatalog(catalog, o.plan).limits.concurrentBuilds;
         return limit > 0 && o.activeBuilds >= limit;
       })
       .map((o) => o.userId);
@@ -159,7 +160,7 @@ export class BuildScheduler extends DurableObject<ApiEnv['Bindings']> {
       }
       if (!(await hasGitHubConnectionAuthority(db, connection.id, build.project_id))) {
         await updateBuildStatus(db, build.id, 'cancelled', {
-          error: 'github organization repository must be reconnected to renew authorization',
+          error: 'github repository authorization is no longer valid; reconnect the repository',
           completedAt: new Date().toISOString(),
         });
         continue;
@@ -242,10 +243,10 @@ export class BuildScheduler extends DurableObject<ApiEnv['Bindings']> {
         // project (resolved above by the UNIQUE project_id) is the source of
         // truth — mirrors webhooks.ts / auth-oidc.ts. startBuild re-verifies the
         // App installation still covers this repo before minting the deploy
-        // token; a null id fails that check closed.
+        // token; a missing id fails that check closed.
         repositoryId: connection.repository_id,
         instanceType,
-        timeoutMinutes: getPlanLimits(claimed.ownerPlan).buildTimeoutMinutes,
+        timeoutMinutes: claimed.timeoutMinutes,
       };
 
       // `ns` (the build's target fleet) was resolved above; address the per-build

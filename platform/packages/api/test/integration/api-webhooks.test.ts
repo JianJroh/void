@@ -11,13 +11,11 @@ import {
   vi,
 } from 'vite-plus/test';
 import {
-  createBuild,
   createGitHubConnection as createGitHubConnectionRecord,
   deleteGitHubConnection,
   getBuild,
   getGitHubConnection,
   getGitHubInstallation,
-  getGitHubInstallationMembers,
   getInstallationRevocationAt,
   getProject,
   getProjectBuilds,
@@ -43,6 +41,8 @@ import {
   projectMembers,
 } from '../../src/schema.ts';
 import {
+  getTestGitHubInstallationMembers,
+  createTestBuild,
   clearTables,
   createTestDeployment,
   createTestProject,
@@ -211,7 +211,9 @@ async function clearBuildTables(db: Db): Promise<void> {
 
 async function createGitHubConnection(
   db: Db,
-  args: Parameters<typeof createGitHubConnectionRecord>[1],
+  args: Omit<Parameters<typeof createGitHubConnectionRecord>[1], 'authorizedByUserId'> & {
+    authorizedByUserId?: string;
+  },
 ) {
   const project = await getProject(db, args.projectId);
   if (!project) {
@@ -219,8 +221,7 @@ async function createGitHubConnection(
   }
   return createGitHubConnectionRecord(db, {
     ...args,
-    authorizedByUserId:
-      args.authorizedByUserId === undefined ? project.user_id : args.authorizedByUserId,
+    authorizedByUserId: args.authorizedByUserId ?? project.user_id,
   });
 }
 
@@ -541,6 +542,7 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '555',
       repoFullName: 'octo/repo',
+      repositoryId: '715167',
       branch: 'main',
       buildExecutor: 'container',
     });
@@ -555,7 +557,7 @@ describe('POST /webhooks/github', () => {
       ref: 'refs/heads/main',
       after: 'oldsha1',
       installation: { id: 555 },
-      repository: { full_name: 'octo/repo' },
+      repository: { full_name: 'octo/repo', id: 715167 },
     });
 
     expect(res.status).toBe(200);
@@ -617,11 +619,12 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '555',
       repoFullName: 'octo/repo',
+      repositoryId: '715167',
       branch: 'main',
       buildExecutor: 'container',
     });
     await seedInstallation(env.db, '555');
-    const existing = await createBuild(env.db, {
+    const existing = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -640,7 +643,7 @@ describe('POST /webhooks/github', () => {
       ref: 'refs/heads/main',
       after: 'abandonedsha',
       installation: { id: 555 },
-      repository: { full_name: 'octo/repo' },
+      repository: { full_name: 'octo/repo', id: 715167 },
     });
 
     expect(res.status).toBe(200);
@@ -662,13 +665,14 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '555',
       repoFullName: 'octo/repo',
+      repositoryId: '715167',
       branch: 'main',
       buildExecutor: 'container',
     });
     await seedInstallation(env.db, '555');
     // An existing queued build (e.g. from a newer push) that must NOT be
     // superseded by this unverifiable older delivery.
-    const existing = await createBuild(env.db, {
+    const existing = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -685,7 +689,7 @@ describe('POST /webhooks/github', () => {
       ref: 'refs/heads/main',
       after: 'unverifiable',
       installation: { id: 555 },
-      repository: { full_name: 'octo/repo' },
+      repository: { full_name: 'octo/repo', id: 715167 },
     });
 
     expect(res.status).toBe(200);
@@ -708,11 +712,12 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '555',
       repoFullName: 'octo/repo',
+      repositoryId: '715167',
       branch: 'main',
       buildExecutor: 'container',
     });
     await seedInstallation(env.db, '555');
-    const existing = await createBuild(env.db, {
+    const existing = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -729,7 +734,7 @@ describe('POST /webhooks/github', () => {
       ref: 'refs/heads/main',
       after: 'orphansha',
       installation: { id: 555 },
-      repository: { full_name: 'octo/repo' },
+      repository: { full_name: 'octo/repo', id: 715167 },
     });
 
     expect(res.status).toBe(200);
@@ -751,6 +756,7 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '555',
       repoFullName: 'octo/repo',
+      repositoryId: '715167',
       branch: 'main',
       buildExecutor: 'container',
     });
@@ -761,7 +767,7 @@ describe('POST /webhooks/github', () => {
       ref: 'refs/heads/feature',
       after: 'abc1234',
       installation: { id: 555 },
-      repository: { full_name: 'octo/repo' },
+      repository: { full_name: 'octo/repo', id: 715167 },
     });
 
     expect(res.status).toBe(200);
@@ -776,6 +782,7 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '777',
       repoFullName: 'octo/actions-repo',
+      repositoryId: '886845',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
@@ -786,7 +793,7 @@ describe('POST /webhooks/github', () => {
       ref: 'refs/heads/main',
       after: 'def5678',
       installation: { id: 777 },
-      repository: { full_name: 'octo/actions-repo' },
+      repository: { full_name: 'octo/actions-repo', id: 886845 },
     });
 
     expect(res.status).toBe(200);
@@ -804,6 +811,7 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '555',
       repoFullName: 'octo/repo',
+      repositoryId: '715167',
       branch: 'main',
       buildExecutor: 'container',
     });
@@ -813,7 +821,7 @@ describe('POST /webhooks/github', () => {
       ref: 'refs/heads/main',
       after: '0000000000000000000000000000000000000000',
       installation: { id: 555 },
-      repository: { full_name: 'octo/repo' },
+      repository: { full_name: 'octo/repo', id: 715167 },
     });
 
     expect(res.status).toBe(200);
@@ -1152,7 +1160,7 @@ describe('POST /webhooks/github', () => {
       branch: 'main',
       buildExecutor: 'container',
     });
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -1196,6 +1204,7 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '321',
       repoFullName: 'octo/wfr',
+      repositoryId: '855536',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
@@ -1208,7 +1217,7 @@ describe('POST /webhooks/github', () => {
       .set({ commit: 'sha-success' })
       .where(eq(deployments.id, deployment.id));
 
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1222,7 +1231,7 @@ describe('POST /webhooks/github', () => {
     const res = await post(app, appEnv, 'workflow_run', {
       action: 'completed',
       installation: { id: 321 },
-      repository: { full_name: 'octo/wfr' },
+      repository: { full_name: 'octo/wfr', id: 855536 },
       workflow_run: { id: 123456, conclusion: 'success', head_sha: 'sha-success' },
     });
 
@@ -1240,11 +1249,12 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '322',
       repoFullName: 'octo/wfr-fail',
+      repositoryId: '871475',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
     await seedInstallation(env.db, '322');
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1258,7 +1268,7 @@ describe('POST /webhooks/github', () => {
     const res = await post(app, appEnv, 'workflow_run', {
       action: 'completed',
       installation: { id: 322 },
-      repository: { full_name: 'octo/wfr-fail' },
+      repository: { full_name: 'octo/wfr-fail', id: 871475 },
       workflow_run: { id: 654321, conclusion: 'failure', head_sha: 'sha-fail' },
     });
 
@@ -1278,11 +1288,12 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '331',
       repoFullName: 'octo/check-ok',
+      repositoryId: '766742',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
     await seedInstallation(env.db, '331');
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1304,7 +1315,7 @@ describe('POST /webhooks/github', () => {
     const res = await post(app, appEnv, 'workflow_run', {
       action: 'completed',
       installation: { id: 331 },
-      repository: { full_name: 'octo/check-ok' },
+      repository: { full_name: 'octo/check-ok', id: 766742 },
       workflow_run: { id: 424250, conclusion: 'success', head_sha: 'sha-check-ok' },
     });
 
@@ -1328,11 +1339,12 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '332',
       repoFullName: 'octo/check-fail',
+      repositoryId: '739072',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
     await seedInstallation(env.db, '332');
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1352,7 +1364,7 @@ describe('POST /webhooks/github', () => {
     const res = await post(app, appEnv, 'workflow_run', {
       action: 'completed',
       installation: { id: 332 },
-      repository: { full_name: 'octo/check-fail' },
+      repository: { full_name: 'octo/check-fail', id: 739072 },
       workflow_run: { id: 424251, conclusion: 'failure', head_sha: 'sha-check-fail' },
     });
 
@@ -1375,11 +1387,12 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '333',
       repoFullName: 'octo/check-none',
+      repositoryId: '811598',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
     await seedInstallation(env.db, '333');
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1399,7 +1412,7 @@ describe('POST /webhooks/github', () => {
     const res = await post(app, appEnv, 'workflow_run', {
       action: 'completed',
       installation: { id: 333 },
-      repository: { full_name: 'octo/check-none' },
+      repository: { full_name: 'octo/check-none', id: 811598 },
       workflow_run: { id: 424252, conclusion: 'success', head_sha: 'sha-check-none' },
     });
 
@@ -1417,11 +1430,12 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '334',
       repoFullName: 'octo/check-throw',
+      repositoryId: '870692',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
     await seedInstallation(env.db, '334');
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1443,7 +1457,7 @@ describe('POST /webhooks/github', () => {
       const res = await post(app, appEnv, 'workflow_run', {
         action: 'completed',
         installation: { id: 334 },
-        repository: { full_name: 'octo/check-throw' },
+        repository: { full_name: 'octo/check-throw', id: 870692 },
         workflow_run: { id: 424253, conclusion: 'success', head_sha: 'sha-check-throw' },
       });
 
@@ -1471,13 +1485,14 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '335',
       repoFullName: 'octo/check-terminal',
+      repositoryId: '796140',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
     await seedInstallation(env.db, '335');
     // Seed the build ALREADY terminal (an out-of-band cancel won the race before
     // the completion webhook arrived) but carrying a check_run_id.
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1497,7 +1512,7 @@ describe('POST /webhooks/github', () => {
     const res = await post(app, appEnv, 'workflow_run', {
       action: 'completed',
       installation: { id: 335 },
-      repository: { full_name: 'octo/check-terminal' },
+      repository: { full_name: 'octo/check-terminal', id: 796140 },
       workflow_run: { id: 424260, conclusion: 'cancelled', head_sha: 'sha-check-terminal' },
     });
 
@@ -1522,6 +1537,7 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '323',
       repoFullName: 'octo/wfr-throw',
+      repositoryId: '823577',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
@@ -1531,7 +1547,7 @@ describe('POST /webhooks/github', () => {
       .update(deployments)
       .set({ commit: 'sha-throw' })
       .where(eq(deployments.id, deployment.id));
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1554,7 +1570,7 @@ describe('POST /webhooks/github', () => {
       const res = await post(app, appEnv, 'workflow_run', {
         action: 'completed',
         installation: { id: 323 },
-        repository: { full_name: 'octo/wfr-throw' },
+        repository: { full_name: 'octo/wfr-throw', id: 823577 },
         workflow_run: { id: 777777, conclusion: 'success', head_sha: 'sha-throw' },
       });
 
@@ -1584,6 +1600,7 @@ describe('POST /webhooks/github', () => {
       projectId: projectX.id,
       installationId: '900',
       repoFullName: 'octo/x',
+      repositoryId: '872525',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
@@ -1591,6 +1608,7 @@ describe('POST /webhooks/github', () => {
       projectId: projectY.id,
       installationId: '901',
       repoFullName: 'octo/y',
+      repositoryId: '894906',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
@@ -1598,7 +1616,7 @@ describe('POST /webhooks/github', () => {
     await seedInstallation(env.db, '901');
 
     // Both projects have an in-flight build for the SAME run_id.
-    const buildX = await createBuild(env.db, {
+    const buildX = await createTestBuild(env.db, {
       projectId: projectX.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1607,7 +1625,7 @@ describe('POST /webhooks/github', () => {
       branch: 'main',
       githubRunId: '500',
     });
-    const buildY = await createBuild(env.db, {
+    const buildY = await createTestBuild(env.db, {
       projectId: projectY.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1622,7 +1640,7 @@ describe('POST /webhooks/github', () => {
     const res = await post(app, appEnv, 'workflow_run', {
       action: 'completed',
       installation: { id: 900 },
-      repository: { full_name: 'octo/x' },
+      repository: { full_name: 'octo/x', id: 872525 },
       workflow_run: { id: 500, conclusion: 'failure', head_sha: 'sha-x' },
     });
 
@@ -1678,7 +1696,7 @@ describe('POST /webhooks/github', () => {
       .where(eq(deployments.id, deploymentB.id));
 
     // Both projects have an ACTIVE build sharing ONE run_id (different project_id).
-    const buildA = await createBuild(env.db, {
+    const buildA = await createTestBuild(env.db, {
       projectId: projectA.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1687,7 +1705,7 @@ describe('POST /webhooks/github', () => {
       branch: 'main',
       githubRunId: '960',
     });
-    const buildB = await createBuild(env.db, {
+    const buildB = await createTestBuild(env.db, {
       projectId: projectB.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1733,13 +1751,14 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '950',
       repoFullName: 'octo/rerun',
+      repositoryId: '889911',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
     await seedInstallation(env.db, '950');
 
     // Prior attempt 1 for run 800, already terminal.
-    const terminal = await createBuild(env.db, {
+    const terminal = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1750,7 +1769,7 @@ describe('POST /webhooks/github', () => {
       githubRunAttempt: '1',
     });
     // The rerun: a fresh ACTIVE build for the SAME run_id, attempt 2.
-    const rerun = await createBuild(env.db, {
+    const rerun = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1765,7 +1784,7 @@ describe('POST /webhooks/github', () => {
     const res = await post(app, appEnv, 'workflow_run', {
       action: 'completed',
       installation: { id: 950 },
-      repository: { full_name: 'octo/rerun' },
+      repository: { full_name: 'octo/rerun', id: 889911 },
       workflow_run: { id: 800, run_attempt: 2, conclusion: 'success', head_sha: 'sha-new' },
     });
 
@@ -1795,13 +1814,14 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '951',
       repoFullName: 'octo/redeliver',
+      repositoryId: '874787',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
     await seedInstallation(env.db, '951');
 
     // Attempt 1 for run 801, already terminal (failed).
-    const attempt1 = await createBuild(env.db, {
+    const attempt1 = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1812,7 +1832,7 @@ describe('POST /webhooks/github', () => {
       githubRunAttempt: '1',
     });
     // Attempt 2 for the SAME run_id, currently ACTIVE.
-    const attempt2 = await createBuild(env.db, {
+    const attempt2 = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1828,7 +1848,7 @@ describe('POST /webhooks/github', () => {
     const res = await post(app, appEnv, 'workflow_run', {
       action: 'completed',
       installation: { id: 951 },
-      repository: { full_name: 'octo/redeliver' },
+      repository: { full_name: 'octo/redeliver', id: 874787 },
       workflow_run: { id: 801, run_attempt: 1, conclusion: 'success', head_sha: 'sha-a1' },
     });
 
@@ -1850,7 +1870,7 @@ describe('POST /webhooks/github', () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id, 'wh-no-conn');
     // A build exists for the run_id, but the payload repo maps to no connection.
-    await createBuild(env.db, {
+    await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1864,7 +1884,7 @@ describe('POST /webhooks/github', () => {
     const res = await post(app, appEnv, 'workflow_run', {
       action: 'completed',
       installation: { id: 999 },
-      repository: { full_name: 'octo/unknown' },
+      repository: { full_name: 'octo/unknown', id: 881839 },
       workflow_run: { id: 600, conclusion: 'success', head_sha: 'sha-z' },
     });
 
@@ -1999,18 +2019,17 @@ describe('POST /webhooks/github', () => {
     expect(healed!.repo_full_name).toBe('octo/new');
   });
 
-  // A null-`repository_id` connection must NOT match an id-bearing push.
-  // When the push payload carries `repository.id`, resolution keys on the id only
-  // and fails closed: a legacy null-id connection sharing the repo name is not
-  // matched (a recreated/reused name could otherwise deploy to the wrong project).
-  it('does not match a null-repository_id connection when the push carries a repository id', async () => {
+  // Resolution keys on the immutable repository id only: a connection sharing the
+  // repo name but recording a different id is not matched (a recreated/reused
+  // name could otherwise deploy to the wrong project).
+  it('does not match a connection by name when the push carries a different repository id', async () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id, 'wh-null-id');
-    // Legacy connection with NO repository_id (predates the column).
     await createGitHubConnection(env.db, {
       projectId: project.id,
       installationId: '650',
       repoFullName: 'octo/legacy',
+      repositoryId: '722400',
       branch: 'main',
       buildExecutor: 'container',
     });
@@ -2162,7 +2181,7 @@ describe('POST /webhooks/github', () => {
       buildExecutor: 'github_actions',
     });
     await seedInstallation(env.db, '612');
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -2200,6 +2219,7 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '7301',
       repoFullName: 'octo/susp',
+      repositoryId: '764776',
       branch: 'main',
       buildExecutor: 'container',
     });
@@ -2211,7 +2231,7 @@ describe('POST /webhooks/github', () => {
       ref: 'refs/heads/main',
       after: 'abc1234',
       installation: { id: 7301 },
-      repository: { full_name: 'octo/susp' },
+      repository: { full_name: 'octo/susp', id: 764776 },
     });
 
     expect(res.status).toBe(200);
@@ -2228,6 +2248,7 @@ describe('POST /webhooks/github', () => {
       projectId: project.id,
       installationId: '7302',
       repoFullName: 'octo/del',
+      repositoryId: '873576',
       branch: 'main',
       buildExecutor: 'container',
     });
@@ -2239,7 +2260,7 @@ describe('POST /webhooks/github', () => {
       ref: 'refs/heads/main',
       after: 'abc1234',
       installation: { id: 7302 },
-      repository: { full_name: 'octo/del' },
+      repository: { full_name: 'octo/del', id: 873576 },
     });
 
     expect(res.status).toBe(200);
@@ -2546,7 +2567,7 @@ describe('POST /webhooks/github — push idempotency + latest-wins', () => {
     await seedInstallation(env.db, '700');
 
     // B1: a previously-deployed commit C1, already `complete`.
-    const b1 = await createBuild(env.db, {
+    const b1 = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -2558,7 +2579,7 @@ describe('POST /webhooks/github — push idempotency + latest-wins', () => {
     await createTestDeployment(env.db, project.id, 'live', undefined, undefined, { commit: 'C2' });
     // B2: a NEWER in-flight build for C2 on the same project+branch (the commit
     // the branch advanced to, now being rolled back away from).
-    const b2 = await createBuild(env.db, {
+    const b2 = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -2607,7 +2628,7 @@ describe('POST /webhooks/github — push idempotency + latest-wins', () => {
     const depA = await createTestDeployment(env.db, project.id, 'live', undefined, undefined, {
       commit: 'C1',
     });
-    const b1 = await createBuild(env.db, {
+    const b1 = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -2690,7 +2711,7 @@ describe('scheduled() re-arms BUILD_SCHEDULER for orphaned queued builds', () =>
     const project = await createTestProject(env.db, user.id, 'wh-reaper');
     // Simulate the webhook having inserted the row but its poke having failed:
     // the row is queued, yet no alarm was armed.
-    await createBuild(env.db, {
+    await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -2716,7 +2737,7 @@ describe('scheduled() re-arms BUILD_SCHEDULER for orphaned queued builds', () =>
     const project = await createTestProject(env.db, user.id, 'wh-no-reaper');
     // A non-queued container build and a queued github_actions build must NOT
     // trigger the reaper — only queued container builds are scheduler-drained.
-    await createBuild(env.db, {
+    await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -2724,7 +2745,7 @@ describe('scheduled() re-arms BUILD_SCHEDULER for orphaned queued builds', () =>
       commitSha: 'sha-running',
       branch: 'main',
     });
-    await createBuild(env.db, {
+    await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -2745,7 +2766,7 @@ describe('scheduled() re-arms BUILD_SCHEDULER for orphaned queued builds', () =>
   it('does not throw if the scheduler poke fails (isolated from the rest of the tick)', async () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id, 'wh-reaper-fail');
-    await createBuild(env.db, {
+    await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -2801,7 +2822,7 @@ describe('scheduled() reaps over-age active github_actions builds', () => {
   it('fails an over-age active github_actions build', async () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id, 'wh-stale-actions');
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -2823,7 +2844,7 @@ describe('scheduled() reaps over-age active github_actions builds', () => {
   it('does not reap a recent active github_actions build', async () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id, 'wh-fresh-actions');
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -2843,7 +2864,7 @@ describe('scheduled() reaps over-age active github_actions builds', () => {
   it('does not reap an over-age active container build (DO timeout owns those)', async () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id, 'wh-stale-container');
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -2889,10 +2910,11 @@ describe('POST /webhooks/github — revoke builds on App removal', () => {
       projectId: project.id,
       installationId: '8001',
       repoFullName: 'octo/del',
+      repositoryId: '873576',
       branch: 'main',
       buildExecutor: 'container',
     });
-    const container = await createBuild(env.db, {
+    const container = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -2938,7 +2960,7 @@ describe('POST /webhooks/github — revoke builds on App removal', () => {
       branch: 'main',
       buildExecutor: 'github_actions',
     });
-    const container = await createBuild(env.db, {
+    const container = await createTestBuild(env.db, {
       projectId: containerProject.id,
       userId: user.id,
       executor: 'container',
@@ -2946,7 +2968,7 @@ describe('POST /webhooks/github — revoke builds on App removal', () => {
       commitSha: 'sha-susp-c',
       branch: 'main',
     });
-    const actions = await createBuild(env.db, {
+    const actions = await createTestBuild(env.db, {
       projectId: actionsProject.id,
       userId: user.id,
       executor: 'github_actions',
@@ -2993,7 +3015,7 @@ describe('POST /webhooks/github — revoke builds on App removal', () => {
       branch: 'main',
       buildExecutor: 'github_actions',
     });
-    const removedBuild = await createBuild(env.db, {
+    const removedBuild = await createTestBuild(env.db, {
       projectId: removedProject.id,
       userId: user.id,
       executor: 'container',
@@ -3001,7 +3023,7 @@ describe('POST /webhooks/github — revoke builds on App removal', () => {
       commitSha: 'sha-rm',
       branch: 'main',
     });
-    const keptBuild = await createBuild(env.db, {
+    const keptBuild = await createTestBuild(env.db, {
       projectId: keptProject.id,
       userId: user.id,
       executor: 'github_actions',
@@ -3050,7 +3072,7 @@ describe('POST /webhooks/github — revoke builds on App removal', () => {
       branch: 'main',
       buildExecutor: 'container',
     });
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -3098,10 +3120,11 @@ describe('POST /webhooks/github — revoke builds on App removal', () => {
       projectId: project.id,
       installationId: '8004',
       repoFullName: 'octo/unsusp',
+      repositoryId: '763767',
       branch: 'main',
       buildExecutor: 'container',
     });
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -3134,7 +3157,7 @@ describe('POST /webhooks/github — revoke builds on App removal', () => {
       branch: 'main',
       buildExecutor: 'container',
     });
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -3178,7 +3201,7 @@ describe('POST /webhooks/github — supersede stale actions builds on push', () 
       buildExecutor: 'github_actions',
     });
     await seedInstallation(env.db, '8101');
-    const stale = await createBuild(env.db, {
+    const stale = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -3221,7 +3244,7 @@ describe('POST /webhooks/github — supersede stale actions builds on push', () 
     });
     await seedInstallation(env.db, '8102');
     // A build that already exchanged OIDC for the new head commit c2.
-    const fresh = await createBuild(env.db, {
+    const fresh = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -3257,7 +3280,7 @@ describe('POST /webhooks/github — supersede stale actions builds on push', () 
     await seedInstallation(env.db, '8103');
     // An active build on a DIFFERENT branch (dev) must not be superseded by a
     // push to main.
-    const devBuild = await createBuild(env.db, {
+    const devBuild = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -3325,7 +3348,7 @@ describe('POST /webhooks/github — supersede stale container builds on push', (
       buildExecutor: 'container',
     });
     await seedInstallation(env.db, '9101');
-    const stale = await createBuild(env.db, {
+    const stale = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -3371,7 +3394,7 @@ describe('POST /webhooks/github — supersede stale container builds on push', (
     });
     await seedInstallation(env.db, '9102');
     // A build already in flight for the new head commit c2 (a redelivery race).
-    const fresh = await createBuild(env.db, {
+    const fresh = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -3411,7 +3434,7 @@ describe('POST /webhooks/github — supersede stale container builds on push', (
     await seedInstallation(env.db, '9103');
     // An active build on a DIFFERENT branch (dev) must not be superseded by a
     // push to main.
-    const devBuild = await createBuild(env.db, {
+    const devBuild = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -3445,7 +3468,7 @@ describe('POST /webhooks/github — supersede stale container builds on push', (
       buildExecutor: 'container',
     });
     await seedInstallation(env.db, '9104');
-    const building = await createBuild(env.db, {
+    const building = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -3606,7 +3629,7 @@ describe('POST /webhooks/github — repo removal matches immutable repository_id
       branch: 'main',
       buildExecutor: 'container',
     });
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -3632,44 +3655,6 @@ describe('POST /webhooks/github — repo removal matches immutable repository_id
     expect(cancelledIds).toContain(build.id);
   });
 
-  it('cancels a legacy null-repository_id connection by name fallback', async () => {
-    const user = await createTestUser(env.db);
-    const project = await createTestProject(env.db, user.id, 'f19-2-legacy');
-    await seedInstallation(env.db, '9202');
-    // A legacy connection that predates the repository_id column.
-    await createGitHubConnection(env.db, {
-      projectId: project.id,
-      installationId: '9202',
-      repoFullName: 'octo/legacy',
-      repositoryId: undefined,
-      branch: 'main',
-      buildExecutor: 'container',
-    });
-    const build = await createBuild(env.db, {
-      projectId: project.id,
-      userId: user.id,
-      executor: 'container',
-      status: 'building',
-      commitSha: 'sha-legacy',
-      branch: 'main',
-    });
-
-    const { app, appEnv, cancelledIds } = recordingApp();
-    const res = await post(app, appEnv, 'installation_repositories', {
-      action: 'removed',
-      installation: { id: 9202 },
-      repositories_added: [],
-      repositories_removed: [{ full_name: 'octo/legacy', id: 8402 }],
-      repository_selection: 'selected',
-    });
-
-    expect(res.status).toBe(200);
-    const updated = await getBuild(env.db, build.id);
-    expect(updated!.status).toBe('cancelled');
-    expect(updated!.error).toBe('repository removed from github app');
-    expect(cancelledIds).toContain(build.id);
-  });
-
   it('spares a connection whose repository_id is NOT in the removed set', async () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id, 'f19-2-kept');
@@ -3682,7 +3667,7 @@ describe('POST /webhooks/github — repo removal matches immutable repository_id
       branch: 'main',
       buildExecutor: 'container',
     });
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -3722,6 +3707,7 @@ describe('POST /webhooks/github — CAS workflow_run completion', () => {
       projectId: project.id,
       installationId: '8201',
       repoFullName: 'octo/cas',
+      repositoryId: '791148',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
@@ -3734,7 +3720,7 @@ describe('POST /webhooks/github — CAS workflow_run completion', () => {
       .set({ commit: 'sha-cas' })
       .where(eq(deployments.id, deployment.id));
     // Seed the build ALREADY cancelled (a concurrent terminalizer won the race).
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -3748,7 +3734,7 @@ describe('POST /webhooks/github — CAS workflow_run completion', () => {
     const res = await post(app, appEnv, 'workflow_run', {
       action: 'completed',
       installation: { id: 8201 },
-      repository: { full_name: 'octo/cas' },
+      repository: { full_name: 'octo/cas', id: 791148 },
       workflow_run: { id: 87001, conclusion: 'success', head_sha: 'sha-cas' },
     });
 
@@ -3795,7 +3781,7 @@ describe('POST /webhooks/github — revoke builds on branch delete', () => {
       branch: 'main',
       buildExecutor: 'container',
     });
-    const inflight = await createBuild(env.db, {
+    const inflight = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -3805,7 +3791,7 @@ describe('POST /webhooks/github — revoke builds on branch delete', () => {
     });
     // No created_at backdating needed: the handler reads its monotonic fence from
     // the DB clock (`select now()`) on the same clock that stamped this build, and
-    // captures it AFTER createBuild ran, so created_at <= fence holds naturally.
+    // captures it AFTER createTestBuild ran, so created_at <= fence holds naturally.
 
     const { app, appEnv, cancelledIds } = recordingApp();
     const res = await post(app, appEnv, 'push', {
@@ -3848,7 +3834,7 @@ describe('POST /webhooks/github — revoke builds on branch delete', () => {
       buildExecutor: 'container',
     });
     // An active build on the dev branch — a delete of `main` must NOT touch it.
-    const devBuild = await createBuild(env.db, {
+    const devBuild = await createTestBuild(env.db, {
       projectId: devProject.id,
       userId: user.id,
       executor: 'container',
@@ -3886,7 +3872,7 @@ describe('POST /webhooks/github — revoke builds on branch delete', () => {
     });
     // An active build on the connected branch, but the delete targets a branch
     // with no connection — nothing should be terminalized.
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -3924,7 +3910,7 @@ describe('POST /webhooks/github — revoke builds on branch delete', () => {
     });
     // A COMPLETE build for the branch being deleted — terminateBuildsForProject's
     // status guard (queued/starting/building/deploying only) must not touch it.
-    const done = await createBuild(env.db, {
+    const done = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -3967,7 +3953,7 @@ describe('POST /webhooks/github — revoke builds on branch delete', () => {
       buildExecutor: 'container',
     });
     // A fresh in-flight build for the recreated branch (a newer push enqueued it).
-    const inflight = await createBuild(env.db, {
+    const inflight = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -4012,7 +3998,7 @@ describe('POST /webhooks/github — revoke builds on branch delete', () => {
       branch: 'main',
       buildExecutor: 'container',
     });
-    const inflight = await createBuild(env.db, {
+    const inflight = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -4036,51 +4022,6 @@ describe('POST /webhooks/github — revoke builds on branch delete', () => {
     expect(await res.json()).toEqual({ ok: true, ignored: 'branch delete' });
     expect((await getBuild(env.db, inflight.id))!.status).toBe('building');
     expect(cancelledIds).not.toContain(inflight.id);
-  });
-
-  // a legacy connection whose repository_id IS NULL must still be
-  // revoked when its repo_full_name + branch match, even though the delete
-  // payload carries a repository.id. The revocation matcher is inclusive (id
-  // can't disqualify a row that never stored one). The old id-only matcher
-  // (`repoIdStr !== null ? conn.repository_id === repoIdStr : …`) skipped this
-  // connection because the payload had an id but the row's repository_id is null.
-  it('cancels a null-repository_id connection matched by name even when the delete payload carries an id', async () => {
-    const user = await createTestUser(env.db);
-    const project = await createTestProject(env.db, user.id, 'f18-4-legacy-null-id');
-    await seedInstallation(env.db, '8607', [{ full_name: 'octo/legacy-del', id: 8617 }]);
-    // Legacy connection with NO repository_id (predates the column).
-    await createGitHubConnection(env.db, {
-      projectId: project.id,
-      installationId: '8607',
-      repoFullName: 'octo/legacy-del',
-      branch: 'main',
-      buildExecutor: 'container',
-    });
-    const inflight = await createBuild(env.db, {
-      projectId: project.id,
-      userId: user.id,
-      executor: 'container',
-      status: 'building',
-      commitSha: 'sha-legacy-del',
-      branch: 'main',
-    });
-
-    const { app, appEnv, cancelledIds } = recordingApp();
-    const res = await post(app, appEnv, 'push', {
-      ref: 'refs/heads/main',
-      after: '0000000000000000000000000000000000000000',
-      installation: { id: 8607 },
-      // The delete payload DOES carry a repository.id — the null-id connection
-      // must still be matched by name and revoked.
-      repository: { full_name: 'octo/legacy-del', id: 8617 },
-    });
-
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, ignored: 'branch delete' });
-    const updated = await getBuild(env.db, inflight.id);
-    expect(updated!.status).toBe('cancelled');
-    expect(updated!.error).toBe('branch deleted');
-    expect(cancelledIds).toContain(inflight.id);
   });
 
   // TOCTOU fence — the absence check is point-in-time, so a build
@@ -4110,7 +4051,7 @@ describe('POST /webhooks/github — revoke builds on branch delete', () => {
     // column is `timestamp without time zone`, so a UTC string written directly
     // has its offset dropped and lands at the wrong instant under the harness's
     // non-UTC session timezone — mirror how `defaultNow` writes.
-    const orphan = await createBuild(env.db, {
+    const orphan = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -4124,7 +4065,7 @@ describe('POST /webhooks/github — revoke builds on branch delete', () => {
       .where(eq(builds.id, orphan.id));
     // Build for the recreated branch — modeled as enqueued AFTER the fence (the
     // check-to-cancel window) via a created_at an hour in the future.
-    const recreated = await createBuild(env.db, {
+    const recreated = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -4173,16 +4114,12 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
     return { app, appEnv, cancelledIds };
   }
 
-  // Seed an Organization installation (account_id = orgId, 'Organization'),
-  // optionally owned by `ownerId`.
-  async function seedOrgInstall(
-    installationId: string,
-    orgId: string,
-    ownerId: string | null,
-  ): Promise<void> {
+  // Seed an Organization installation (account_id = orgId, 'Organization').
+  // Organization installs have no owner.
+  async function seedOrgInstall(installationId: string, orgId: string): Promise<void> {
     await upsertGitHubInstallation(env.db, {
       installationId,
-      userId: ownerId,
+      userId: null,
       accountLogin: `org-${orgId}`,
       accountId: orgId,
       accountType: 'Organization',
@@ -4195,10 +4132,9 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
   const ORG2 = '9200';
   const G = '7777'; // removed user's linked GitHub id
 
-  it('severs the removed member: deletes connection, membership, owner pointer, and terminates the in-flight build', async () => {
+  it('severs the removed member: deletes the connection they authorized, membership, and terminates the in-flight build', async () => {
     const user = await createTestUser(env.db, 'org-removed', 'github', G);
-    // U owns this org install (installer/owner pointer set to U).
-    await seedOrgInstall('8100', ORG, user.id);
+    await seedOrgInstall('8100', ORG);
     const project = await createTestProject(env.db, user.id, 'org-sever');
     await createGitHubConnection(env.db, {
       projectId: project.id,
@@ -4207,7 +4143,6 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
       repositoryId: '81001',
       branch: 'main',
       buildExecutor: 'container',
-      authorizedByUserId: null,
     });
     await upsertGitHubInstallationMember(env.db, {
       installationId: '8100',
@@ -4215,7 +4150,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
       githubAccountId: G,
       ttlSeconds: 3600,
     });
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -4236,10 +4171,8 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
     // Connection severed (future auto-deploy trigger removed).
     expect(await getGitHubConnection(env.db, project.id)).toBeNull();
     // Membership cache cleared.
-    const members = await getGitHubInstallationMembers(env.db, '8100');
+    const members = await getTestGitHubInstallationMembers(env.db, '8100');
     expect(members.some((m) => m.user_id === user.id)).toBe(false);
-    // Owner pointer cleared (U owned the install).
-    expect((await getGitHubInstallation(env.db, '8100'))!.user_id).toBeNull();
     // In-flight build token revoked (build-row terminalized) + DO cancelled.
     const updated = await getBuild(env.db, build.id);
     expect(updated!.status).toBe('cancelled');
@@ -4250,7 +4183,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
   it('severs a shared-project connection authorized by the removed project admin', async () => {
     const owner = await createTestUser(env.db, 'org-shared-owner');
     const admin = await createTestUser(env.db, 'org-shared-admin', 'github', G);
-    await seedOrgInstall('8101', ORG, owner.id);
+    await seedOrgInstall('8101', ORG);
     const project = await createTestProject(env.db, owner.id, 'org-shared-sever');
     await env.db.insert(projectMembers).values({
       project_id: project.id,
@@ -4273,7 +4206,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
       githubAccountId: G,
       ttlSeconds: 3600,
     });
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: owner.id,
       executor: 'container',
@@ -4307,10 +4240,10 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
     const X = '99999'; // removed GitHub id: NO oauth link, NO membership proof-id
     // Two installs under ORG so we can assert the tombstone lands on EACH.
     const owner = await createTestUser(env.db, 'org-hole-owner', 'github', G);
-    await seedOrgInstall('8110', ORG, owner.id);
-    await seedOrgInstall('8111', ORG, owner.id);
+    await seedOrgInstall('8110', ORG);
+    await seedOrgInstall('8111', ORG);
     // A DIFFERENT org's install must NOT be tombstoned.
-    await seedOrgInstall('8112', ORG2, owner.id);
+    await seedOrgInstall('8112', ORG2);
     // An unrelated connection (owned by owner, not X) must survive — nothing to sever.
     const project = await createTestProject(env.db, owner.id, 'org-hole-survives');
     await createGitHubConnection(env.db, {
@@ -4359,7 +4292,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
     // no github oauth id), included here to prove it is NOT severed.
     const X = '6551234';
     const v = await createTestUser(env.db, 'org-f1-v', 'google', 'google-f1-v');
-    await seedOrgInstall('8190', ORG, null);
+    await seedOrgInstall('8190', ORG);
     const project = await createTestProject(env.db, v.id, 'org-f1-proj');
     await createGitHubConnection(env.db, {
       projectId: project.id,
@@ -4375,7 +4308,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
       githubAccountId: X,
       ttlSeconds: 3600,
     });
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: v.id,
       executor: 'container',
@@ -4395,7 +4328,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
     expect(await res.json()).toEqual({ ok: true });
     // V's X-keyed membership cache is DELETED (arm b, keyed by the github id).
     expect(
-      (await getGitHubInstallationMembers(env.db, '8190')).some((m) => m.user_id === v.id),
+      (await getTestGitHubInstallationMembers(env.db, '8190')).some((m) => m.user_id === v.id),
     ).toBe(false);
     // The durable tombstone for (install, X) — keyed by the removed GitHub id — is
     // still written, closing a later pre-removal connect_grant replay even after V
@@ -4422,7 +4355,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
     const X = '7551234';
     const u = await createTestUser(env.db, 'org-union-u', 'github', X);
     const v = await createTestUser(env.db, 'org-union-v', 'google', 'google-union-v');
-    await seedOrgInstall('8200', ORG, null);
+    await seedOrgInstall('8200', ORG);
     const uProj = await createTestProject(env.db, u.id, 'org-union-u-proj');
     const vProj = await createTestProject(env.db, v.id, 'org-union-v-proj');
     await createGitHubConnection(env.db, {
@@ -4469,7 +4402,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
     // V's oauth id is not X.
     expect(await getGitHubConnection(env.db, vProj.id)).not.toBeNull();
     // Both X-keyed memberships are voided (U's via arm a, V's via arm b).
-    const members = await getGitHubInstallationMembers(env.db, '8200');
+    const members = await getTestGitHubInstallationMembers(env.db, '8200');
     expect(members.some((m) => m.user_id === u.id)).toBe(false);
     expect(members.some((m) => m.user_id === v.id)).toBe(false);
     // Tombstoned ONCE, keyed by the removed GitHub id X — a single row covers X.
@@ -4486,11 +4419,11 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
     const X = '3330001';
     const Z = '3330002';
     const v = await createTestUser(env.db, 'org-r8-v', 'github', Z);
-    // I1: historical/uninstalled org install; I2: the reinstalled active one, owned
-    // by V. Same org account → BOTH resolve into orgInstallIds
+    // I1: historical/uninstalled org install; I2: the reinstalled active one.
+    // Same org account → BOTH resolve into orgInstallIds
     // (getGitHubInstallationsByAccount has NO status filter).
-    await seedOrgInstall('8210', ORG, null); // I1
-    await seedOrgInstall('8211', ORG, v.id); // I2 (owned by V)
+    await seedOrgInstall('8210', ORG); // I1
+    await seedOrgInstall('8211', ORG); // I2
     // Mark I1 deleted to mirror uninstall→reinstall history. installation.deleted
     // does NOT remove membership rows, so V's stale X-membership persists on I1.
     await markGitHubInstallationStatus(env.db, '8210', 'deleted');
@@ -4518,7 +4451,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
       githubAccountId: Z,
       ttlSeconds: 3600,
     });
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: vProj.id,
       userId: v.id,
       executor: 'container',
@@ -4544,11 +4477,11 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
     expect(cancelledIds).not.toContain(build.id);
     // V's stale (I1, X) browser-proof membership IS deleted (arm b).
     expect(
-      (await getGitHubInstallationMembers(env.db, '8210')).some((m) => m.user_id === v.id),
+      (await getTestGitHubInstallationMembers(env.db, '8210')).some((m) => m.user_id === v.id),
     ).toBe(false);
     // V's current (I2, Z) membership SURVIVES (not X-keyed).
     expect(
-      (await getGitHubInstallationMembers(env.db, '8211')).some(
+      (await getTestGitHubInstallationMembers(env.db, '8211')).some(
         (m) => m.user_id === v.id && m.github_account_id === Z,
       ),
     ).toBe(true);
@@ -4560,7 +4493,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
   it('ignores member_removed when the org has no installs', async () => {
     const user = await createTestUser(env.db, 'org-noinstall', 'github', G);
     // A connection under a DIFFERENT org — must survive since ORG2 has no installs.
-    await seedOrgInstall('8120', ORG, user.id);
+    await seedOrgInstall('8120', ORG);
     const project = await createTestProject(env.db, user.id, 'org-other');
     await createGitHubConnection(env.db, {
       projectId: project.id,
@@ -4585,7 +4518,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
 
   it('ignores a non-removal action (member_added) — connection + membership survive', async () => {
     const user = await createTestUser(env.db, 'org-added', 'github', G);
-    await seedOrgInstall('8130', ORG, user.id);
+    await seedOrgInstall('8130', ORG);
     const project = await createTestProject(env.db, user.id, 'org-added-proj');
     await createGitHubConnection(env.db, {
       projectId: project.id,
@@ -4612,14 +4545,14 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, ignored: 'organization:member_added' });
     expect(await getGitHubConnection(env.db, project.id)).not.toBeNull();
-    const members = await getGitHubInstallationMembers(env.db, '8130');
+    const members = await getTestGitHubInstallationMembers(env.db, '8130');
     expect(members.some((m) => m.user_id === user.id)).toBe(true);
   });
 
   it('SCOPE: does not sever the removed user’s connection under a DIFFERENT org', async () => {
     const user = await createTestUser(env.db, 'org-scope-org', 'github', G);
-    await seedOrgInstall('8140', ORG, user.id);
-    await seedOrgInstall('8141', ORG2, user.id);
+    await seedOrgInstall('8140', ORG);
+    await seedOrgInstall('8141', ORG2);
     const inOrg = await createTestProject(env.db, user.id, 'org-scope-in');
     const inOrg2 = await createTestProject(env.db, user.id, 'org-scope-out');
     await createGitHubConnection(env.db, {
@@ -4656,7 +4589,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
   it('SCOPE: leaves another user’s connection + membership under the same org intact', async () => {
     const removed = await createTestUser(env.db, 'org-scope-u', 'github', G);
     const other = await createTestUser(env.db, 'org-scope-v', 'github', '8888');
-    await seedOrgInstall('8150', ORG, removed.id);
+    await seedOrgInstall('8150', ORG);
     const removedProj = await createTestProject(env.db, removed.id, 'org-u-proj');
     const otherProj = await createTestProject(env.db, other.id, 'org-v-proj');
     await createGitHubConnection(env.db, {
@@ -4701,35 +4634,14 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
     // …but V's connection under the SAME org install stays.
     expect(await getGitHubConnection(env.db, otherProj.id)).not.toBeNull();
     // V's membership stays; only U's is deleted.
-    const members = await getGitHubInstallationMembers(env.db, '8150');
+    const members = await getTestGitHubInstallationMembers(env.db, '8150');
     expect(members.some((m) => m.user_id === removed.id)).toBe(false);
     expect(members.some((m) => m.user_id === other.id)).toBe(true);
   });
 
-  it('OWNER-CLEAR SCOPE: does not clear an install under the org owned by a DIFFERENT user', async () => {
-    const removed = await createTestUser(env.db, 'org-own-u', 'github', G);
-    const other = await createTestUser(env.db, 'org-own-v', 'github', '8888');
-    // Two installs under ORG: one owned by U (cleared), one owned by V (kept).
-    await seedOrgInstall('8160', ORG, removed.id);
-    await seedOrgInstall('8161', ORG, other.id);
-
-    const { app, appEnv } = recordingApp();
-    const res = await post(app, appEnv, 'organization', {
-      action: 'member_removed',
-      organization: { id: Number(ORG) },
-      membership: { user: { id: Number(G) } },
-    });
-
-    expect(res.status).toBe(200);
-    // U's install owner pointer cleared…
-    expect((await getGitHubInstallation(env.db, '8160'))!.user_id).toBeNull();
-    // …but V's install (same org, different owner) keeps its owner pointer.
-    expect((await getGitHubInstallation(env.db, '8161'))!.user_id).toBe(other.id);
-  });
-
   it('is idempotent on redelivery: two deliveries both 200, single net effect', async () => {
     const user = await createTestUser(env.db, 'org-idem', 'github', G);
-    await seedOrgInstall('8170', ORG, user.id);
+    await seedOrgInstall('8170', ORG);
     const project = await createTestProject(env.db, user.id, 'org-idem-proj');
     await createGitHubConnection(env.db, {
       projectId: project.id,
@@ -4745,7 +4657,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
       githubAccountId: G,
       ttlSeconds: 3600,
     });
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -4768,15 +4680,14 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
     expect(await res2.json()).toEqual({ ok: true });
     // Still exactly one net effect: connection gone, membership gone, build terminal.
     expect(await getGitHubConnection(env.db, project.id)).toBeNull();
-    const members = await getGitHubInstallationMembers(env.db, '8170');
+    const members = await getTestGitHubInstallationMembers(env.db, '8170');
     expect(members.some((m) => m.user_id === user.id)).toBe(false);
     expect((await getBuild(env.db, build.id))!.status).toBe('cancelled');
-    expect((await getGitHubInstallation(env.db, '8170'))!.user_id).toBeNull();
   });
 
   it('ignores payloads missing organization.id or membership.user.id', async () => {
     const user = await createTestUser(env.db, 'org-missing', 'github', G);
-    await seedOrgInstall('8180', ORG, user.id);
+    await seedOrgInstall('8180', ORG);
 
     const { app, appEnv } = recordingApp();
 
@@ -4802,9 +4713,9 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
   it('records a revocation tombstone for every org install of the removed user', async () => {
     const user = await createTestUser(env.db, 'org-tomb', 'github', G);
     // Two installs under ORG (both should get a tombstone); one under ORG2 (must NOT).
-    await seedOrgInstall('8190', ORG, user.id);
-    await seedOrgInstall('8191', ORG, user.id);
-    await seedOrgInstall('8192', ORG2, user.id);
+    await seedOrgInstall('8190', ORG);
+    await seedOrgInstall('8191', ORG);
+    await seedOrgInstall('8192', ORG2);
 
     const before = Date.now();
     const { app, appEnv } = recordingApp();
@@ -4828,7 +4739,7 @@ describe('POST /webhooks/github — organization member_removed revocation', () 
 
   it('redelivery keeps a single tombstone and never regresses revoked_at (monotonic)', async () => {
     const user = await createTestUser(env.db, 'org-tomb-idem', 'github', G);
-    await seedOrgInstall('8195', ORG, user.id);
+    await seedOrgInstall('8195', ORG);
 
     const { app, appEnv } = recordingApp();
     const payload = {
@@ -4917,7 +4828,7 @@ describe('POST /webhooks/github — rerun from the check run', () => {
     user: { id: string },
     status: 'queued' | 'failed' | 'complete' = 'failed',
   ) {
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -4948,7 +4859,7 @@ describe('POST /webhooks/github — rerun from the check run', () => {
   it('enqueues a fresh build when the previous build for the commit FAILED', async () => {
     const { project, user } = await seedContainerProject('wh-rerun-failed');
     // The state the button exists for: a terminal failed build on the branch head.
-    const failed = await createBuild(env.db, {
+    const failed = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -5079,7 +4990,7 @@ describe('POST /webhooks/github — rerun from the check run', () => {
       buildExecutor: 'github_actions',
     });
     await seedInstallation(env.db, '900');
-    const clicked = await createBuild(env.db, {
+    const clicked = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -5190,7 +5101,7 @@ describe('POST /webhooks/github — rerun from the check run', () => {
     const { project: clicked, user } = await seedContainerProject('wh-rerun-target');
     const { project: sibling } = await seedSiblingProject('wh-rerun-sibling', 'container');
     // The check the user clicked belongs to THIS build, on THIS project.
-    const failed = await createBuild(env.db, {
+    const failed = await createTestBuild(env.db, {
       projectId: clicked.id,
       userId: user.id,
       executor: 'container',
@@ -5218,7 +5129,7 @@ describe('POST /webhooks/github — rerun from the check run', () => {
       'wh-rerun-container-sib',
       'container',
     );
-    const actionsBuild = await createBuild(env.db, {
+    const actionsBuild = await createTestBuild(env.db, {
       projectId: actions.project.id,
       userId: actions.user.id,
       executor: 'github_actions',
@@ -5328,7 +5239,7 @@ describe('POST /webhooks/github — rerun from the check run', () => {
     // here would let anyone with rerun rights clear branch protection on a commit
     // that never built.
     const { project, user } = await seedContainerProject('wh-rerun-no-bypass');
-    const failed = await createBuild(env.db, {
+    const failed = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -5386,7 +5297,7 @@ describe('POST /webhooks/github — rerun from the check run', () => {
 
   it('completes a refused rerun as cancelled when the run had no conclusion', async () => {
     const { project, user } = await seedContainerProject('wh-rerun-null-conclusion');
-    const failed = await createBuild(env.db, {
+    const failed = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -5419,7 +5330,7 @@ describe('POST /webhooks/github — rerun from the check run', () => {
     const { project, user } = await seedContainerProject('wh-rerun-queued-reuse');
     // A queued build for this exact commit already exists — a duplicate webhook
     // delivery, or a push that landed first. The supersede tx REUSES it.
-    const queued = await createBuild(env.db, {
+    const queued = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -5454,7 +5365,7 @@ describe('POST /webhooks/github — rerun from the check run', () => {
 
   it('reports success, not neutral, when the commit is already built and live', async () => {
     const { project, user } = await seedContainerProject('wh-rerun-already-live');
-    const done = await createBuild(env.db, {
+    const done = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',

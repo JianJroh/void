@@ -20,7 +20,6 @@ import {
 import type { WrapperFeatures } from '../../src/cli/wrapper.ts';
 
 const base: WrapperFeatures = {
-  auth: null,
   crons: [],
   queues: [],
 };
@@ -31,6 +30,33 @@ describe('repeated wrapper generation', () => {
     for (const root of roots.splice(0)) {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it('reports the served framework version through its authored metadata binding', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'void-wrapper-version-'));
+    roots.push(root);
+    writeFileSync(
+      join(root, 'index.mjs'),
+      'export default { fetch() { throw new Error("app reached"); } };',
+    );
+    await generateWrapper(root, 'index.mjs', root, {
+      ...base,
+      readiness: true,
+      versionMetadataBinding: 'AUTHORED_VERSION',
+    });
+    const worker = (await import(pathToFileURL(join(root, 'index.mjs')).href)).default;
+    const response = await worker.fetch(
+      new Request('https://app.example/__void/ready', {
+        headers: { 'Cloudflare-Workers-Version-Overrides': 'app="new-version"' },
+      }),
+      { AUTHORED_VERSION: { id: 'old-version', tag: 'private-tag' } },
+      {},
+    );
+    expect(await response.json()).toEqual({ ready: true, versionId: 'old-version' });
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(
+      await (await worker.fetch(new Request('https://app.example/__void/ready'), {}, {})).json(),
+    ).toEqual({ ready: true });
   });
 
   it('preserves the real application across repeated skip-build preparation', async () => {

@@ -1,3 +1,4 @@
+import { PLAN_EDITABLE_LIMIT_KEYS } from '@void/platform/plans';
 import { count, desc, eq } from 'drizzle-orm';
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { AuthenticationConfigurationError } from '../auth/configuration.ts';
@@ -45,6 +46,16 @@ function accessPatterns(value: unknown) {
     : undefined;
 }
 
+function boundedIds(value: unknown) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 16) {
+    return undefined;
+  }
+  const values = value.map((entry) => boundedString(entry, 128));
+  return values.every((entry): entry is string => entry !== undefined)
+    ? [...new Set(values)]
+    : undefined;
+}
+
 function rollbackVersions(value: unknown) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return undefined;
@@ -71,6 +82,34 @@ function auditTarget(
       connectionId: pathIdentifier(segments[3]),
       action: pathIdentifier(segments[4] ?? segments[2]),
       revision: typeof body.revision === 'number' ? body.revision : undefined,
+    });
+  }
+  if (segments[0] === 'config' && segments[1] === 'plans') {
+    const limits =
+      body.limits && typeof body.limits === 'object' && !Array.isArray(body.limits)
+        ? Object.fromEntries(
+            Object.entries(body.limits).filter(
+              ([key, value]) =>
+                (PLAN_EDITABLE_LIMIT_KEYS as ReadonlyArray<string>).includes(key) &&
+                Number.isSafeInteger(value) &&
+                (value as number) >= 0,
+            ),
+          )
+        : undefined;
+    return JSON.stringify({
+      planId: segments[3] ? pathIdentifier(segments[2]) : boundedString(body.id, 64),
+      action: pathIdentifier(segments[3] ?? segments[2]),
+      expectedRevision: Number.isSafeInteger(body.expectedRevision)
+        ? body.expectedRevision
+        : undefined,
+      name: boundedString(body.name, 80),
+      copyFrom: boundedString(body.copyFrom, 64),
+      replacementPlanId: boundedString(body.replacementPlanId, 64),
+      defaultPlanId: boundedString(body.planId, 64),
+      archived: typeof body.archived === 'boolean' ? body.archived : undefined,
+      buildInstanceType: boundedString(body.buildInstanceType, 32),
+      allowShortSlugs: typeof body.allowShortSlugs === 'boolean' ? body.allowShortSlugs : undefined,
+      limits,
     });
   }
   if (segments[0] === 'users' && id) {
@@ -117,7 +156,7 @@ function auditTarget(
     if (segments[2] === 'owner') {
       return JSON.stringify({ projectId: id, userId: boundedString(body.userId, 512) });
     }
-    if (segments[2] === 'delete') {
+    if (segments[2] === 'delete' || segments[2] === 'normalize') {
       return JSON.stringify({ projectId: id });
     }
   }
@@ -180,6 +219,15 @@ function auditTarget(
         reason: boundedString(body.reason, 500),
       });
     }
+    if (segments[1] === 'shared-recipients' && segments[3] === 'resolve') {
+      return JSON.stringify({
+        recipientId: pathIdentifier(segments[2]),
+        ended: body.ended === true,
+        outcome: boundedString(body.outcome, 32),
+        reason: boundedString(body.reason, 500),
+        recoveryFence: boundedString(body.recoveryFence, 64),
+      });
+    }
     // Never the credential: `apiToken` rides the add body and stays out.
     const domain = boundedString(segments[2], 253, true);
     if (segments[1] === 'domains' && segments.length === 2) {
@@ -213,6 +261,28 @@ function auditTarget(
       if (segments[3] === 'destinations' && destinationId && segments[5] === 'remove') {
         return JSON.stringify({ project, destinationId });
       }
+    }
+  }
+  if (segments[0] === 'zero-trust') {
+    if (segments[1] === 'configure') {
+      return JSON.stringify({
+        accountId: boundedString(body.accountId, 128),
+        identityProviderIds: boundedIds(body.identityProviderIds),
+        policyIds: boundedIds(body.policyIds),
+        protectNewProjects: body.protectNewProjects === true,
+        existingProjects: boundedString(body.existingProjects, 16),
+      });
+    }
+    if (segments[1] === 'reconcile' || segments[1] === 'disable') {
+      return JSON.stringify({ installation: 'platform' });
+    }
+    if (segments[1] === 'projects' && segments[2]) {
+      return JSON.stringify({
+        projectId: pathIdentifier(segments[2]),
+        ...(segments[3] === 'reconcile'
+          ? { reconcile: true }
+          : { protected: body.protected === true }),
+      });
     }
   }
   if (segments[0] === 'system' && segments[1] === 'backfill-queue-tokens') {

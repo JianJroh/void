@@ -33,7 +33,9 @@ export {
   createPlatformDeploymentManifest,
   createPlatformResourceNames,
   normalizeApplicationDomain,
+  normalizePlatformDashboardUrl,
   normalizeInstallationSlug,
+  platformDashboardUrl,
   parsePlatformDeploymentManifest,
   type PlatformApplicationRoute,
   type PlatformCapabilities,
@@ -83,9 +85,12 @@ export {
   type PlatformWorkerConfigSet,
 } from './worker-config.ts';
 export {
+  PLATFORM_HEALTH_HOSTNAME_LABEL,
+  platformHealthHostname,
   platformProjectHostname,
   platformProjectHostnames,
   platformProjectIngressName,
+  platformProjectIngressPrefix,
   platformProjectWorkersDevHostname,
   platformWorkersDevAliasKey,
   readPlatformApplication,
@@ -95,3 +100,5 @@ export {
   type PlatformApplication,
   type PlatformApplicationProject,
 } from './application.ts';
+
+export * from './plans.ts';

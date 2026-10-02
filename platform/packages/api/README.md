@@ -34,7 +34,8 @@ src/
   sandbox-concurrency-counter.ts # Trusted sandbox leases and server-clock metering
   usage-queue.ts              # Queue consumer logic
   usage-auth.ts               # Platform-only signing envelope and ROUTING key bootstrap
-  tiers.ts                    # Plan limits + helpers (incl. concurrentBuilds, buildTimeoutMinutes; getBuildInstanceType selects the build-container size/class by plan)
+  plans.ts                    # Installation plan catalog and effective policy resolution
+  tiers.ts                    # Built-in compatibility defaults and billing-period helpers
   build-scheduler.ts          # Durable Object: global build queue + per-tier concurrency
   build-manager.ts            # Durable Objects (extend @cloudflare/containers Container): BuildManager (free standard-3 = 2/8/16) + BuildManagerLarge (paid standard-4)
   build-namespace.ts          # buildManagerNamespace: maps builds.instance_type -> the BuildManager/BuildManagerLarge DO class
@@ -99,6 +100,7 @@ drizzle/
     `POST /projects/:id/tokens/:credentialId/renew`, and
     `DELETE /projects/:id/tokens/:credentialId`)
   - project members and invitations
+  - project Zero Trust status and owner/admin overrides
   - PostgreSQL and MySQL project database provisioning/update
   - `POST /projects/:id/prerender-token` — mint a five-minute, project-scoped token accepted only by the remote-binding proxy
   - `/projects/:id/github` — connect/inspect/update/disconnect the GitHub repo (POST/GET/PATCH/DELETE; readers may inspect, owners and project administrators may mutate)
@@ -204,6 +206,7 @@ recovery or promotion bypass.
 - `/admin/deployments`
 - `/admin/email/:projectId` — per-project email usage, caps, inbound/outbound suspension, and destination list
 - `/admin/signup-control`
+- `/admin/config/plans` — installation plan catalog, reviewed edits and management actions, and resumable account updates
 
 ## Auth Flow
 
@@ -256,7 +259,7 @@ Connect a repo through a GitHub App; a `git push` then builds and deploys automa
 - **Connect**: an owner or project administrator installs or joins the App (`/github/install-url` -> `/github/callback`) and links a repo they can access via `/projects/:id/github`. The connection records that authorizing user and is invalidated if they lose that level of project access. Installation-to-user mapping lives in `github_installations`; the OAuth callback backfills it on sign-in.
 - **Trigger**: `POST /webhooks/github` verifies the HMAC signature, then on `push` writes a `builds` row and pokes the `BuildScheduler`.
 - **Executors** (per `github_connections.build_executor`, default `container`):
-  - **CF Container** — `BuildScheduler` (global, alarm-driven queue with per-tier concurrency from `tiers.ts`) atomically claims a build and starts a container on one of two classes by the owner's plan: `BuildManager` (free, `standard-3` = 2 vCPU / 8 GiB / 16 GB) or `BuildManagerLarge` (paid, `standard-4` = 4 vCPU / 12 GiB / 20 GB, Cloudflare's max per-container size). The class is routed by the persisted `builds.instance_type` (`standard-3` / `standard-4`, derived from the plan by `getBuildInstanceType`) via `buildManagerNamespace` in `build-namespace.ts`; cancel and reaper paths use the same picker, so they address the same class the build started on. `BuildManagerLarge` extends `BuildManager`, which extends `@cloudflare/containers` `Container`, enforces a timeout alarm, and persists status to Postgres via Hyperdrive.
+  - **CF Container** — `BuildScheduler` (global, alarm-driven queue with per-plan concurrency from the installation catalog) atomically claims a build and starts its configured instance size: `BuildManager` (`standard-3` = 2 vCPU / 8 GiB / 16 GB) or `BuildManagerLarge` (`standard-4` = 4 vCPU / 12 GiB / 20 GB). The class is routed by the persisted `builds.instance_type` (`standard-3` / `standard-4`, captured from the effective plan at admission) via `buildManagerNamespace` in `build-namespace.ts`; cancel and reaper paths use the same picker, so they address the same class the build started on. `BuildManagerLarge` extends `BuildManager`, which extends `@cloudflare/containers` `Container`, enforces a timeout alarm, and persists status to Postgres via Hyperdrive.
   - **GitHub Actions** — `void init --github` scaffolds a workflow that calls `POST /auth/github-oidc`; the verified job runs `void deploy` and reports back via the `workflow_run` webhook.
 - **Build mechanism**: both executors run the real `void deploy` CLI with a short-lived, project-scoped deploy token (`aud: "deploy"`, minted by `auth/deploy-token.ts`). There is no artifact-upload endpoint; `routes/deploy.ts` is unchanged. The container agent (`container/build-agent.mjs`) downloads the source tarball, installs deps, and runs `npx void deploy --project <slug>` with `VOID_TOKEN` + `VOID_API_URL`.
 - **Check Run**: container builds publish a "Void Build" GitHub Check Run (head SHA = the build's `commit_sha`/webhook `after`), created `in_progress` at build start and finalized `success`/`failure`/`cancelled` at every terminal site. Best-effort — a Check Run API error never fails or perturbs a build/deploy. `details_url` is the application URL derived from the configured `SITE_DOMAIN` for the in-progress/success/failure states (omitted on cancel). The helper (`github/check-run.ts`) is executor-agnostic; Actions check-runs are deferred (the native workflow check already covers them) and the helper is ready for a future PR. Configure Checks write permission and the relevant webhook subscriptions when enabling this integration. `builds.check_run_id` has no index (nothing queries by it — deferred).
@@ -294,6 +297,23 @@ Only reservations that never started can be cancelled and refunded. Started or u
 `/admin/email/:projectId` displays current-month recipient attempts and inbound receipts, effective limits, sender identity, verified destinations, and custom-domain readiness. Operators can suspend email, change monthly or burst limits, revoke destination consent, and manage domain operations. A blank limit restores the default.
 
 Destinations are added through the owner/project-administrator `POST /projects/:id/email/destinations` consent flow. Operators cannot consent on a recipient’s behalf. Incomplete provider operations retain their operation ID and outcome for reconciliation or audited recovery; the page must not report them as completed.
+
+Shared inbound recipient creation has the same explicit recovery boundary:
+operators discover intents with `void platform email shared-recipients`, inspect
+the exact provider resource, and use `shared-recipient-resolve --plan` before
+applying an attested outcome. Recovery waits at least 24 hours, requires the
+original execution to have ended, and pins the inspected identity and attempt.
+Not-applied recovery requires provider-audit evidence as well as repeated
+absence readback. Applied recovery records only the exact owned rule ID.
+Recovery performs no provider writes and keeps deleting projects closed; normal
+reconciliation or cleanup verifies the remaining work. Operator intents and
+outcomes use the existing `operator_events` audit.
+
+Allocate shared inbound rules only for the validated incoming manifest or an
+active live deployment declaring `emailProtocolVersion: 1`. Project creation
+and send-only apps must not allocate them. Scheduled repair filters eligible
+deployments before its batch limit. Preserve existing ownership records for
+rollback and deletion cleanup when a later deployment removes its handlers.
 
 Every admin write is additionally same-origin checked in `admin/middleware/auth.ts` before authentication runs; a `POST` whose `Origin` (or, failing that, `Referer`) does not match the request host is rejected with `403`, as is one that carries neither.
 
@@ -353,6 +373,7 @@ Notable sections:
 - per-project Builds section (ongoing build highlighted) plus a build detail page with a client-side polling live-log tail for container builds (mirrors the deployment live-tail; not a WebSocket), or a GitHub Actions link for `github_actions` builds. The tail polls `GET /admin/builds/:id/logs?since=N`, which fronts the `BuildManager`/`BuildManagerLarge` DO's read-only `GET /logs?since=N` (DO chosen by `instance_type` via `buildManagerNamespace`).
 - per-project email page (linked from the project detail view): usage, caps, inbound/outbound suspension, destinations
 - signup restrictions and allowlists
+- project Zero Trust page (saved state; the "Check with Cloudflare" link adds `?check=1` for a live Access check) with configure, reconcile, and disable, plus a Zero Trust section on the project detail page (saved state only) with protect, make public, and reconcile
 - CLI version deployment history
 
 Admin writes are same-origin guarded: `admin/middleware/auth.ts` rejects any non-`GET` request whose `Origin`/`Referer` host does not match the request host, before the cookie is even read.

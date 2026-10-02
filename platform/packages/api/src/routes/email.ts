@@ -32,8 +32,9 @@ import {
   getEmailRecipientPolicy,
   repairEmailRecipientPolicyMirror,
 } from '../email/settings.ts';
+import { getSharedEmailRecipientReadiness } from '../email/shared-recipient-service.ts';
 import type { ApiEnv } from '../env.ts';
-import { isForeignKeyViolation, isUniqueViolation } from '../pg-errors.ts';
+import { isForeignKeyViolation } from '../pg-errors.ts';
 import {
   ProjectAccessDeniedError,
   ProjectNotFoundError,
@@ -533,15 +534,17 @@ const app = new Hono<ApiEnv>()
     if (access instanceof Response) {
       return access;
     }
-    const [management, recipientPolicy] = await Promise.all([
+    const [management, recipientPolicy, sharedInbound] = await Promise.all([
       getEmailDomainManagement(db),
       getEmailRecipientPolicy(db),
+      getSharedEmailRecipientReadiness(db, context.env, projectId, true),
     ]);
     // Republish a drifted recipient-policy mirror for the proxy's local gate.
     await repairEmailRecipientPolicyMirror(db, context.env.ROUTING);
     return context.json({
       domains: { management, projectSlug: access.project.slug },
       recipientPolicy: { mode: recipientPolicy.mode, domains: [...recipientPolicy.domains] },
+      sharedInbound,
     });
   })
 

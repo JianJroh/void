@@ -1,8 +1,10 @@
+import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vite-plus/test';
-import { createBuild, updateBuildStatus } from '../../src/db.ts';
+import { updateBuildStatus } from '../../src/db.ts';
 import app from '../../src/index.ts';
 import { builds } from '../../src/schema.ts';
 import {
+  createTestBuild,
   clearTables,
   createTestProject,
   createTestUser,
@@ -51,12 +53,12 @@ describe('user-facing build routes', () => {
   it('lists a project builds newest-first for the owner', async () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id);
-    const b1 = await createBuild(env.db, {
+    const b1 = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
     });
-    const b2 = await createBuild(env.db, {
+    const b2 = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -82,7 +84,7 @@ describe('user-facing build routes', () => {
   it('fronts the BuildManager DO for a container build logs', async () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id);
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -121,16 +123,22 @@ describe('user-facing build routes', () => {
     // Stale-active window: a completion path set the DO terminal FIRST, then its
     // Postgres CAS write threw — so the PG build row is still non-terminal
     // ('queued' default) while the DO/container is already 'complete'. The route
-    // must OR in the DO's terminal so `--follow` stops promptly (not ~2h later).
+    // must OR in the DO's terminal so `--follow` can finish after its log drain.
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id);
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
     });
 
-    const base = spyNamespace({ lines: [], lastSeq: 0, status: 'complete', terminal: true });
+    const base = spyNamespace({
+      lines: [],
+      lastSeq: 0,
+      status: 'complete',
+      terminal: true,
+      logsComplete: false,
+    });
     env.BUILD_MANAGER = base.ns;
 
     const res = await authGet(
@@ -139,9 +147,33 @@ describe('user-facing build routes', () => {
       env,
     );
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { status: string; terminal: boolean };
+    const body = (await res.json()) as {
+      status: string;
+      terminal: boolean;
+      logsComplete: boolean | null;
+    };
     expect(body.terminal).toBe(true); // DO-authoritative terminal closes the window
     expect(body.status).toBe('complete'); // reflects the DO's terminal status
+    expect(body.logsComplete).toBe(false); // terminal status is not producer completion
+
+    env.BUILD_MANAGER = spyNamespace({
+      lines: [{ seq: 1, line: 'final tail', stream: 'stdout', ts: 1 }],
+      lastSeq: 1,
+      status: 'complete',
+      terminal: true,
+      logsComplete: true,
+    }).ns;
+    const complete = await authGet(
+      `/projects/${project.id}/builds/${build.id}/logs?since=0`,
+      user.jwt,
+      env,
+    );
+    expect(await complete.json()).toMatchObject({
+      lines: [{ seq: 1, line: 'final tail' }],
+      lastSeq: 1,
+      terminal: true,
+      logsComplete: true,
+    });
   });
 
   it('lets fresh Postgres win the status word over a lost-CAS DO terminal', async () => {
@@ -153,7 +185,7 @@ describe('user-facing build routes', () => {
     // there to make the interleave deterministic.
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id);
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -165,7 +197,13 @@ describe('user-facing build routes', () => {
         fetch: async () => {
           // Concurrent terminalize lands after the route's PG snapshot read.
           await updateBuildStatus(env.db, build.id, 'cancelled');
-          return Response.json({ lines: [], lastSeq: 0, status: 'complete', terminal: true });
+          return Response.json({
+            lines: [],
+            lastSeq: 0,
+            status: 'complete',
+            terminal: true,
+            logsComplete: false,
+          });
         },
       }),
     } as unknown as DurableObjectNamespace;
@@ -177,15 +215,46 @@ describe('user-facing build routes', () => {
       env,
     );
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { status: string; terminal: boolean };
+    const body = (await res.json()) as {
+      status: string;
+      terminal: boolean;
+      logsComplete: boolean | null;
+    };
     expect(body.terminal).toBe(true);
     expect(body.status).toBe('cancelled'); // fresh PG wins over the DO's 'complete'
+    expect(body.logsComplete).toBe(false);
+  });
+
+  it('only infers completion for durable never-started terminal builds', async () => {
+    const user = await createTestUser(env.db);
+    const project = await createTestProject(env.db, user.id);
+    const build = await createTestBuild(env.db, {
+      projectId: project.id,
+      userId: user.id,
+      executor: 'container',
+    });
+    await updateBuildStatus(env.db, build.id, 'cancelled');
+    env.BUILD_MANAGER = spyNamespace({ lines: [], lastSeq: 0 }).ns;
+
+    const neverStarted = await authGet(
+      `/projects/${project.id}/builds/${build.id}/logs`,
+      user.jwt,
+      env,
+    );
+    expect(await neverStarted.json()).toMatchObject({ terminal: true, logsComplete: true });
+
+    await env.db
+      .update(builds)
+      .set({ started_at: new Date().toISOString() })
+      .where(eq(builds.id, build.id));
+    const started = await authGet(`/projects/${project.id}/builds/${build.id}/logs`, user.jwt, env);
+    expect(await started.json()).toMatchObject({ terminal: true, logsComplete: null });
   });
 
   it('normalizes a non-numeric since to 0 when fronting the DO', async () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id);
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'container',
@@ -199,7 +268,7 @@ describe('user-facing build routes', () => {
   it('returns the external GitHub URL for a github_actions build without touching the DO', async () => {
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id);
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -222,7 +291,7 @@ describe('user-facing build routes', () => {
     const user = await createTestUser(env.db);
     const projectA = await createTestProject(env.db, user.id, 'a');
     const projectB = await createTestProject(env.db, user.id, 'b');
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: projectB.id,
       userId: user.id,
       executor: 'container',
@@ -235,7 +304,7 @@ describe('user-facing build routes', () => {
     const owner = await createTestUser(env.db, 'owner2');
     const other = await createTestUser(env.db, 'intruder2');
     const project = await createTestProject(env.db, owner.id);
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: owner.id,
       executor: 'container',

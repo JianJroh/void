@@ -32,7 +32,6 @@ it('authenticates framework cron HTTP requests while leaving native events usabl
     'export default (_controller, env) => { env.calls.push("ran"); };',
   );
   await generateWrapper(root, 'index.mjs', root, {
-    auth: null,
     queues: [],
     crons: [{ name: 'job', filePath: 'job.mjs', crons: ['* * * * *'] }],
   });
@@ -89,8 +88,7 @@ it.each(['native', 'framework'])(
         null,
         {
           honoPath: '/hono',
-          responsePath: '/response',
-          handlerPath: '/handler',
+
           runtimeEnvPath: '/env',
           projectRoot: '/project',
           homeDir: '/home',
@@ -136,7 +134,7 @@ it.each(['native', 'framework'])(
       }`,
         );
       }
-      await generateWrapper(root, 'index.mjs', root, { auth: null, queues: [], crons: jobs });
+      await generateWrapper(root, 'index.mjs', root, { queues: [], crons: jobs });
       scheduled = (await import(pathToFileURL(join(root, 'index.mjs')).href)).default.scheduled;
     }
     const env: JobEnv = { calls: [], fail: false };

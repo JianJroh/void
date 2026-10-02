@@ -44,20 +44,14 @@
  *     its permissions, so it is gated by the reads, which fail closed; a Global API Key is
  *     refused by name (no single bearer for the two REST-only calls).
  *
- * The prose parsers retain the historical Wrangler fixture format (see
- * `WRANGLER_EMAIL_PROSE_VERSION` and `test/fixtures/wrangler-email/<version>/`).
- * The private cf adapter emits that format from cf's structured responses.
- * A parser miss fails CLOSED: the row reads `unknown` and the checklist says to run
- * `void email setup`. Every `wrangler email` command prints an "open beta command"
- * warning on stderr, so the parsers read STDOUT only; stderr is consulted solely for
- * wrangler's `[code: N]` API error token on a FAILED command.
+ * Email reads return structured Cloudflare data through the private command adapter.
+ * Invalid data fails closed: the row reads `unknown` and the checklist directs the
+ * developer to `void email setup`. Failed commands retain their API error codes.
  */
 
+import type { CloudflareOperation, CloudflareCommandResult } from '@void/deploy-cloudflare';
 import type { EmailHandlersScan } from '../router/email.ts';
 import { findBindingNameOwner } from './wrangler.ts';
-
-/** Historical fixture version for the email prose compatibility parser. */
-export const WRANGLER_EMAIL_PROSE_VERSION = '4.131.0';
 
 /** The `send_email` binding name Void provisions and the runtime reads. */
 export const SEND_EMAIL_BINDING = 'SEND_EMAIL';
@@ -96,23 +90,11 @@ export const SENDING_FREE_PLAN_HINT =
 
 // ── Injected seams ─────────────────────────────────────────────────────────────
 
-/** Mirrors the deploy runner's structured result (`DeployWranglerRunResult`). */
-export type EmailWranglerRunResult = {
-  status: number;
-  stdout: string;
-  stderr: string;
-  /** Non-null ONLY when the child was killed by a signal — a HARD failure. */
-  signal?: NodeJS.Signals | null;
-  /** Spawn-error message when the child could not start — a HARD failure. */
-  error?: string | null;
-};
+/** Provider results are structured at the subprocess boundary. */
+export type EmailWranglerRunResult = CloudflareCommandResult;
 
-/**
- * Seam over void's pinned wrangler — structurally the deploy orchestrator's
- * `DeployWranglerRun`, declared here so this module never imports `deploy.ts`.
- */
 export type EmailWranglerRun = (
-  args: Array<string>,
+  operation: CloudflareOperation,
   opts: { capture: boolean },
 ) => EmailWranglerRunResult | Promise<EmailWranglerRunResult>;
 
@@ -151,8 +133,8 @@ export interface EmailCloudflareInputs {
   configConflicts?: Array<string>;
   /** Number of source files calling `sendEmail()` — shown in the header line only. */
   sendEmailFiles?: number;
-  /** Extra argv appended to every wrangler call (the deploy passes `-c <cfg> --env=`). */
-  wranglerArgs?: Array<string>;
+  /** The pinned project config used for provider operations. */
+  configPath?: string;
   apiBaseUrl?: string;
   runWrangler: EmailWranglerRun;
   getSessionBearer: () => Promise<string | null>;
@@ -298,7 +280,7 @@ export function deriveAddresses(
   return { addresses, refused, routes };
 }
 
-// ── Prose parsers (pinned to WRANGLER_EMAIL_PROSE_VERSION) ─────────────────────
+// ── Structured command results ────────────────────────────────────────────────
 
 /**
  * `wrangler whoami --json` — the fields Mode B reads. `tokenPermissions` is filled from
@@ -316,203 +298,169 @@ export interface WhoamiJson {
   tokenPermissions?: Array<string>;
 }
 
-export function parseWhoamiJson(stdout: string): WhoamiJson | null {
-  // The JSON is the whole of stdout for `--json`; tolerate a leading banner anyway.
-  const start = stdout.indexOf('{');
-  if (start < 0) {
+export function parseWhoamiJson(data: unknown): WhoamiJson | null {
+  if (!isRecord(data) || typeof data.loggedIn !== 'boolean') {
     return null;
   }
-  try {
-    const parsed = JSON.parse(stdout.slice(start)) as unknown;
-    if (
-      !parsed ||
-      typeof parsed !== 'object' ||
-      typeof (parsed as WhoamiJson).loggedIn !== 'boolean'
-    ) {
-      return null;
-    }
-    return parsed as WhoamiJson;
-  } catch {
+  if (
+    data.tokenPermissions !== undefined &&
+    (!Array.isArray(data.tokenPermissions) ||
+      data.tokenPermissions.some((scope) => typeof scope !== 'string'))
+  ) {
     return null;
   }
+  if (
+    data.accounts !== undefined &&
+    (!Array.isArray(data.accounts) ||
+      data.accounts.some(
+        (account) =>
+          !isRecord(account) || typeof account.id !== 'string' || typeof account.name !== 'string',
+      ))
+  ) {
+    return null;
+  }
+  return data as unknown as WhoamiJson;
 }
 
-/**
- * `wrangler email routing settings <zone>` stdout (4.131 `src/email-routing/settings.ts`):
- *
- *   Email Routing for void.cloud:
- *     Enabled:  true
- *     Status:   ready
- *     Created:  …
- *     Modified: …
- *     Tag:      5b66f5cb84fd7dcfdd0170515e622181
- *
- * `Tag` is the Email Routing settings tag, which is the ZONE ID in practice (measured:
- * void.app's tag equals its zone id). `GET /zones?name=` is the documented authority;
- * it is consulted only when the session bearer is already in hand (see `preflightEmail`).
- */
-export interface RoutingSettingsProse {
+export interface RoutingSettings {
   name: string;
   enabled: boolean;
   status: string;
   tag: string;
 }
 
-export function parseRoutingSettings(stdout: string): RoutingSettingsProse | null {
-  const name = /^Email Routing for (\S+):\s*$/m.exec(stdout)?.[1];
-  const enabled = /^\s*Enabled:\s+(true|false)\s*$/m.exec(stdout)?.[1];
-  const status = /^\s*Status:\s+(\S+)\s*$/m.exec(stdout)?.[1];
-  const tag = /^\s*Tag:\s+([0-9a-f]{32})\s*$/m.exec(stdout)?.[1];
-  if (!name || !enabled || !status || !tag) {
-    return null;
-  }
-  return { name, enabled: enabled === 'true', status, tag };
-}
-
-export interface RoutingRuleProse {
+export interface RoutingRule {
   id: string;
   name: string;
   enabled: boolean;
-  /** `to:<address>` matchers, lowercased addresses. */
   to: Array<string>;
-  /** `worker:<name>`, `forward:<a>,<b>`, `drop` — verbatim wrangler tokens. */
   actions: Array<string>;
 }
 
-export interface RoutingRulesProse {
-  rules: Array<RoutingRuleProse>;
+export interface RoutingRules {
+  rules: Array<RoutingRule>;
   catchAll: { enabled: boolean; actions: Array<string> } | null;
 }
 
-/**
- * `wrangler email routing rules list <zone>` stdout (4.131 `src/email-routing/rules/list.ts`):
- *
- *   Rule: <id>
- *     Name:     <name|(none)>
- *     Enabled:  true
- *     Matchers: to:support@void.cloud
- *     Actions:  worker:acme-support
- *     Priority: 0
- *
- *   Catch-all rule: disabled, action: drop
- *     (use `wrangler email routing rules get catch-all` to view details)
- *
- * With no rule at all: `No routing rules found.` / no custom rule: `No custom routing
- * rules found.`. Both forms are pinned by fixture.
- */
-export function parseRoutingRules(stdout: string): RoutingRulesProse | null {
-  const lines = stdout.split(/\r?\n/);
-  const rules: Array<RoutingRuleProse> = [];
-  let catchAll: RoutingRulesProse['catchAll'] = null;
-  let sawSentinel = false;
-  let current: RoutingRuleProse | null = null;
-
-  for (const raw of lines) {
-    const line = raw.trimEnd();
-    if (/^No (custom )?routing rules found\.$/.test(line)) {
-      sawSentinel = true;
-      continue;
-    }
-    const catchAllMatch = /^Catch-all rule: (enabled|disabled), action: (.*)$/.exec(line);
-    if (catchAllMatch) {
-      catchAll = {
-        enabled: catchAllMatch[1] === 'enabled',
-        actions: splitActionList(catchAllMatch[2] ?? ''),
-      };
-      current = null;
-      continue;
-    }
-    const ruleMatch = /^Rule: (\S+)$/.exec(line);
-    if (ruleMatch) {
-      current = { id: ruleMatch[1] as string, name: '', enabled: false, to: [], actions: [] };
-      rules.push(current);
-      continue;
-    }
-    if (!current) {
-      continue;
-    }
-    const field = /^\s{2}(Name|Enabled|Matchers|Actions|Priority):\s*(.*)$/.exec(line);
-    if (!field) {
-      continue;
-    }
-    const value = (field[2] ?? '').trim();
-    switch (field[1]) {
-      case 'Name':
-        current.name = value;
-        break;
-      case 'Enabled':
-        current.enabled = value === 'true';
-        break;
-      case 'Matchers':
-        current.to = value
-          .split(', ')
-          .filter((m) => m.startsWith('to:'))
-          .map((m) => m.slice(3).toLowerCase());
-        break;
-      case 'Actions':
-        current.actions = splitActionList(value);
-        break;
-      default:
-        break;
-    }
-  }
-
-  // Fail closed on prose we did not recognise: an output with neither a sentinel, a
-  // rule, nor a catch-all line is not this wrangler's rules listing.
-  if (!sawSentinel && rules.length === 0 && !catchAll) {
-    return null;
-  }
-  return { rules, catchAll };
-}
-
-function splitActionList(value: string): Array<string> {
-  return value
-    .split(', ')
-    .map((a) => a.trim())
-    .filter(Boolean);
-}
-
-/**
- * `wrangler email sending settings <domain>` stdout (4.131 `src/email-routing/sending/settings.ts`):
- *
- *   Email Sending for void.cloud:
- *     Enabled:            true
- *     Tag:                19af4fdbee924a92916afea0de5a8fdd
- *     …
- *     Return-path domain: cf-bounce.void.cloud
- *
- * Not onboarded: exit 1 with `No sending subdomain found for \`<domain>\`.` on STDERR.
- */
-export interface SendingSettingsProse {
+export interface SendingSettings {
   name: string;
   enabled: boolean;
   tag: string;
 }
 
-export function parseSendingSettings(stdout: string): SendingSettingsProse | null {
-  const name = /^Email Sending for (\S+):\s*$/m.exec(stdout)?.[1];
-  const enabled = /^\s*Enabled:\s+(true|false)\s*$/m.exec(stdout)?.[1];
-  const tag = /^\s*Tag:\s+([0-9a-f]{32})\s*$/m.exec(stdout)?.[1];
-  if (!name || !enabled || !tag) {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function readRoutingSettings(data: unknown): RoutingSettings | null {
+  return isRecord(data) &&
+    typeof data.name === 'string' &&
+    data.name.length > 0 &&
+    typeof data.enabled === 'boolean' &&
+    typeof data.status === 'string' &&
+    data.status.length > 0 &&
+    typeof data.tag === 'string' &&
+    /^[0-9a-f]{32}$/.test(data.tag)
+    ? { name: data.name, enabled: data.enabled, status: data.status, tag: data.tag }
+    : null;
+}
+
+export function readRoutingRules(data: unknown): RoutingRules | null {
+  if (!Array.isArray(data)) {
     return null;
   }
-  return { name, enabled: enabled === 'true', tag };
+  const rules: Array<RoutingRule> = [];
+  let catchAll: RoutingRules['catchAll'] = null;
+  for (const entry of data) {
+    if (
+      !isRecord(entry) ||
+      typeof entry.enabled !== 'boolean' ||
+      !Array.isArray(entry.actions) ||
+      entry.actions.length === 0 ||
+      !Array.isArray(entry.matchers) ||
+      entry.matchers.length === 0
+    ) {
+      return null;
+    }
+    const actions: Array<string> = [];
+    for (const action of entry.actions) {
+      if (!isRecord(action) || typeof action.type !== 'string') {
+        return null;
+      }
+      if (action.type === 'drop') {
+        actions.push('drop');
+      } else if (action.type === 'worker' || action.type === 'forward') {
+        const values = typeof action.value === 'string' ? [action.value] : action.value;
+        if (
+          !Array.isArray(values) ||
+          values.length === 0 ||
+          !values.every((value) => typeof value === 'string' && value.length > 0)
+        ) {
+          return null;
+        }
+        if (action.type === 'worker') {
+          actions.push('worker:' + values.join(','));
+        } else {
+          actions.push('forward:' + values.join(','));
+        }
+      } else {
+        // Unknown actions cannot prove ownership or authorize taking over a rule.
+        return null;
+      }
+    }
+    const to: Array<string> = [];
+    let all = false;
+    for (const matcher of entry.matchers) {
+      if (!isRecord(matcher)) {
+        return null;
+      }
+      if (matcher.type === 'all') {
+        all = true;
+      } else if ((matcher.type === 'literal' && matcher.field === 'to') || matcher.type === 'to') {
+        if (typeof matcher.value !== 'string' || matcher.value.length === 0) {
+          return null;
+        }
+        to.push(matcher.value.toLowerCase());
+      } else {
+        return null;
+      }
+    }
+    if (all) {
+      if (catchAll || entry.matchers.length !== 1) {
+        return null;
+      }
+      catchAll = { enabled: entry.enabled, actions };
+    } else {
+      if (
+        typeof entry.id !== 'string' ||
+        entry.id.length === 0 ||
+        (entry.name !== undefined && typeof entry.name !== 'string')
+      ) {
+        return null;
+      }
+      rules.push({ id: entry.id, name: entry.name ?? '', enabled: entry.enabled, to, actions });
+    }
+  }
+  return { rules, catchAll };
 }
 
-/** wrangler renders an `APIError` note as `<message> [code: <n>]`; extract the code. */
-export function wranglerApiErrorCode(text: string): number | null {
-  const match = /\[code:\s*(\d+)\]/.exec(stripAnsi(text));
-  return match ? Number(match[1]) : null;
+export function readSendingSettings(data: unknown): SendingSettings | null {
+  if (!isRecord(data)) {
+    return null;
+  }
+  const tag = data.tag ?? data.id;
+  return typeof data.name === 'string' &&
+    data.name.length > 0 &&
+    typeof data.enabled === 'boolean' &&
+    typeof tag === 'string' &&
+    /^[0-9a-f]{32}$/.test(tag)
+    ? { name: data.name, enabled: data.enabled, tag }
+    : null;
 }
 
-const ANSI_SGR_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
-
-function stripAnsi(text: string): string {
-  return text.replace(ANSI_SGR_RE, '');
+function providerErrorCode(result: EmailWranglerRunResult): number | null {
+  return result.errorCode ?? result.errors?.find((error) => error.code !== undefined)?.code ?? null;
 }
-
-const ZONE_NOT_FOUND_RE = /Could not find (?:a )?zone for `([^`]+)`/;
-const SENDING_NOT_FOUND_RE = /No sending subdomain found for `([^`]+)`/;
 
 function isHardFailure(result: EmailWranglerRunResult): boolean {
   return Boolean(result.signal) || Boolean(result.error);
@@ -670,9 +618,11 @@ export async function preflightEmail(inputs: EmailCloudflareInputs): Promise<Ema
     );
   }
   const apiBaseUrl = inputs.apiBaseUrl ?? CLOUDFLARE_API_BASE_URL;
-  const extra = inputs.wranglerArgs ?? [];
-  const run = async (args: Array<string>): Promise<EmailWranglerRunResult> =>
-    inputs.runWrangler([...args, ...extra], { capture: true });
+  const run = async (operation: CloudflareOperation): Promise<EmailWranglerRunResult> =>
+    inputs.runWrangler(
+      { ...operation, ...(inputs.configPath ? { configPath: inputs.configPath } : {}) },
+      { capture: true },
+    );
 
   const usageHandlers = [
     ...inputs.handlers.addresses.map((d) => `email/${d.filePath}`),
@@ -729,8 +679,8 @@ export async function preflightEmail(inputs: EmailCloudflareInputs): Promise<Ema
   //    scope and Global API Key branches) says what to clear first: `void cloudflare
   //    logout`, or the CLOUDFLARE_API_KEY pair, which wrangler prefers over both an OAuth
   //    session and CLOUDFLARE_API_TOKEN.
-  const whoami = await run(['whoami', '--json']);
-  const who = isHardFailure(whoami) || whoami.status !== 0 ? null : parseWhoamiJson(whoami.stdout);
+  const whoami = await run({ type: 'auth.whoami' });
+  const who = isHardFailure(whoami) || whoami.status !== 0 ? null : parseWhoamiJson(whoami.data);
   if (!who) {
     // `whoami --json` failed or printed no session.
     pre.session.state = 'unknown';
@@ -773,24 +723,24 @@ export async function preflightEmail(inputs: EmailCloudflareInputs): Promise<Ema
 
   // 2. Zone: walk the labels the way wrangler's own `resolveDomain` does, through
   //    `email routing settings <candidate>` — the first candidate that is a zone in the
-  //    pinned account is the apex, and its prose also carries routing status + zone id.
-  let settings: RoutingSettingsProse | null = null;
+  //    pinned account is the apex, and its data also carries routing status + zone id.
+  let settings: RoutingSettings | null = null;
   let settingsMiss = false;
   if (pre.session.state === 'ok') {
     for (const candidate of zoneCandidates(domain)) {
-      const result = await run(['email', 'routing', 'settings', candidate]);
+      const result = await run({ type: 'email.routing.settings', domain: candidate });
       if (isHardFailure(result)) {
         settingsMiss = true;
         break;
       }
+      if (result.status === 0 && result.data === null) {
+        continue;
+      }
       if (result.status !== 0) {
-        if (ZONE_NOT_FOUND_RE.test(stripAnsi(result.stderr))) {
-          continue;
-        }
         settingsMiss = true;
         break;
       }
-      settings = parseRoutingSettings(result.stdout);
+      settings = readRoutingSettings(result.data);
       if (!settings) {
         settingsMiss = true;
       }
@@ -829,7 +779,7 @@ export async function preflightEmail(inputs: EmailCloudflareInputs): Promise<Ema
   //    `GET /zones?name=<apex>` (documented zone authority — WITHOUT `account.id`, so a
   //    zone in another account is told apart from one not on Cloudflare, and `type`
   //    refuses partial/secondary zones) and `GET /zones/{z}/email/routing`
-  //    (`support_subaddress`, which the settings prose does not print). A `null` bearer
+  //    (`support_subaddress`, which the settings command does not return). A `null` bearer
   //    leaves both rows `unknown`; nothing about the deploy fails on that.
   let bearer: string | null = null;
   if (pre.session.state === 'ok') {
@@ -973,11 +923,11 @@ export async function preflightEmail(inputs: EmailCloudflareInputs): Promise<Ema
 
   // 6. Derivation, then rules: mine / foreign / absent per derived address.
   pre.derived = deriveAddresses(inputs.handlers, domain, mode);
-  const rulesResult = await run(['email', 'routing', 'rules', 'list', apex]);
+  const rulesResult = await run({ type: 'email.routing.rules.list', domain: apex });
   const rules =
     isHardFailure(rulesResult) || rulesResult.status !== 0
       ? null
-      : parseRoutingRules(rulesResult.stdout);
+      : readRoutingRules(rulesResult.data);
   if (!rules) {
     pre.rules.state = 'unknown';
     block(
@@ -1024,14 +974,14 @@ export async function preflightEmail(inputs: EmailCloudflareInputs): Promise<Ema
   pre.addresses = pre.derived.addresses.filter((a) => !foreign.has(a));
 
   // 7. Sending. Not-found is a clean "not onboarded"; anything else unparsable is unknown.
-  const sendingResult = await run(['email', 'sending', 'settings', domain]);
+  const sendingResult = await run({ type: 'email.sending.settings', domain });
   if (isHardFailure(sendingResult)) {
     pre.sending.state = 'unknown';
-  } else if (sendingResult.status === 0) {
-    const parsed = parseSendingSettings(sendingResult.stdout);
-    pre.sending.state = parsed ? (parsed.enabled ? 'ready' : 'pending') : 'unknown';
-  } else if (SENDING_NOT_FOUND_RE.test(stripAnsi(sendingResult.stderr))) {
+  } else if (sendingResult.status === 0 && sendingResult.data === null) {
     pre.sending.state = 'pending';
+  } else if (sendingResult.status === 0) {
+    const parsed = readSendingSettings(sendingResult.data);
+    pre.sending.state = parsed ? (parsed.enabled ? 'ready' : 'pending') : 'unknown';
   } else {
     pre.sending.state = 'unknown';
   }
@@ -1460,9 +1410,11 @@ export async function applyEmailSetup(
   }
   const apex = pre.apex;
   const apiBaseUrl = inputs.apiBaseUrl ?? CLOUDFLARE_API_BASE_URL;
-  const extra = inputs.wranglerArgs ?? [];
-  const run = async (args: Array<string>): Promise<EmailWranglerRunResult> =>
-    inputs.runWrangler([...args, ...extra], { capture: true });
+  const run = async (operation: CloudflareOperation): Promise<EmailWranglerRunResult> =>
+    inputs.runWrangler(
+      { ...operation, ...(inputs.configPath ? { configPath: inputs.configPath } : {}) },
+      { capture: true },
+    );
 
   // The bearer is borrowed lazily, once, and dropped at the end of this function.
   let bearer: string | null | undefined;
@@ -1516,12 +1468,12 @@ export async function applyEmailSetup(
   const apexRoutingOff = pre.mode === 'subdomain' && pre.routing.enabled !== true;
   if (!result.routingReady) {
     if (pre.mode === 'apex') {
-      const enable = await run(['email', 'routing', 'enable', apex]);
+      const enable = await run({ type: 'email.routing.enable', domain: apex });
       if (!isHardFailure(enable) && enable.status === 0) {
         result.routingReady = true;
         lines.push(`  ✔ routing   ${apex} enabled`);
       } else {
-        const code = wranglerApiErrorCode(enable.stderr);
+        const code = providerErrorCode(enable);
         lines.push(
           `  ✘ routing   could not enable Email Routing on ${apex}${code ? ` [code: ${code}]${CF_EMAIL_ERROR_CODES[code] ? ` — ${CF_EMAIL_ERROR_CODES[code]}` : ''}` : ''}`,
         );
@@ -1589,8 +1541,8 @@ export async function applyEmailSetup(
       lines.push(`  ! sending   ${b.message}`);
     }
   } else if (!result.sendingReady) {
-    const enable = await run(['email', 'sending', 'enable', pre.domain]);
-    const code = isHardFailure(enable) ? null : wranglerApiErrorCode(enable.stderr);
+    const enable = await run({ type: 'email.sending.enable', domain: pre.domain });
+    const code = isHardFailure(enable) ? null : providerErrorCode(enable);
     if (!isHardFailure(enable) && (enable.status === 0 || code === 2040)) {
       result.sendingReady = true;
       lines.push(`  ✔ sending   ${pre.domain} onboarded`);

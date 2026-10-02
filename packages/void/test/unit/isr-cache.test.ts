@@ -175,6 +175,13 @@ function currentSharedCacheResponse(response: Response): Response {
 // ---------------------------------------------------------------------------
 const corruptCases: Array<{ name: string; seed: () => KvRecord }> = [
   {
+    name: 'entry admitted before Vary was checked',
+    seed: () => ({
+      value: packEntry({ vary: 'Accept-Language' }, 'English'),
+      metadata: { s: 200, c: BASE, t: 60, p: 2 } as unknown as IsrCacheMetadata,
+    }),
+  },
+  {
     name: 'legacy entry missing shared-cache policy version',
     seed: () => ({
       value: packEntry({}, 'x'),
@@ -762,6 +769,39 @@ describe('handleIsr', () => {
     expect([...store.keys()].filter((k) => k.startsWith(isrPrefix(DPL))).length).toBe(1);
   });
 
+  it.each(['Accept-Language', 'Origin', '*', 'X-VoidPages, ACCEPT-language'])(
+    'renders each request live when Vary is unsupported: %s',
+    async (vary) => {
+      const { store, kv } = createKvMock();
+      const env = makeEnv(kv);
+      const { render, spy } = createRender(
+        (request) =>
+          new Response(request.headers.get('Accept-Language'), {
+            headers: {
+              'Content-Type': 'text/html',
+              Vary: vary,
+              'x-void-page-data': '{"component":"Home","props":{}}',
+            },
+          }),
+      );
+      for (const language of ['en', 'ja']) {
+        const { ctx, flush } = createCtx();
+        const response = await handleIsr(
+          htmlRequest('/blog/post', { 'Accept-Language': language }),
+          env,
+          ctx,
+          OPTS,
+          render,
+        );
+        expect(await response!.text()).toBe(language);
+        await flush();
+        expect(store.size).toBe(0);
+        expect(edge.store.size).toBe(0);
+      }
+      expect(spy).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it('does not share a MISS whose render sets Set-Cookie', async () => {
     const { store, kv } = createKvMock();
     const env = makeEnv(kv);
@@ -1157,11 +1197,54 @@ describe('handleIsr', () => {
     expect(edge.delete).toHaveBeenCalledWith(htmlEdgeKey(HOST, '/blog/post', DPL));
   });
 
+  describe.each([handleIsr, handleFrameworkIsr])('%s removal convergence', (handle) => {
+    describe.each(['text/plain', 'text/event-stream'])('with %s', (contentType) => {
+      it.each([
+        [404, 60, 30 * 86_400, true],
+        [410, 60, 30 * 86_400, true],
+        [404, 60, 120, false],
+        [410, 60, 86_460, false],
+        [404, 25 * 3600, 25 * 3600 + 60, false],
+        [503, 60, 30 * 86_400, false],
+        [429, 60, 30 * 86_400, false],
+      ])('handles status %i with TTL %i and age %i', async (status, ttl, age, evicted) => {
+        const { store, kv } = createKvMock();
+        const env = makeEnv(kv);
+        seedEntry(store, '/blog/post', { createdAt: BASE, ttl });
+        vi.setSystemTime(BASE + age * 1000);
+        const jsonKey = jsonEdgeKey(HOST, '/blog/post', DPL);
+        edge.store.set(jsonKey, new Response('{"cached":true}'));
+        const render: RenderFn = async () =>
+          new Response('removed or unavailable', {
+            status,
+            headers: {
+              'content-type': contentType,
+              ...(status >= 429 ? { 'cache-control': 'no-store', 'x-revalidate': '0' } : {}),
+            },
+          });
+        const first = createCtx();
+        const request = htmlRequest('/blog/post', { Accept: 'text/html' });
+        const stale = await handle(request, env, first.ctx, OPTS, render);
+        expect(stale!.headers.get('x-isr-cache')).toBe('STALE');
+        await first.flush();
+        expect(store.has(isrKey(DPL, HOST, '/blog/post'))).toBe(!evicted);
+        expect(edge.store.has(jsonKey)).toBe(!evicted);
+        if (evicted) {
+          expect(edge.delete).toHaveBeenCalledWith(htmlEdgeKey(HOST, '/blog/post', DPL));
+          const second = createCtx();
+          expect((await handle(request, env, second.ctx, OPTS, render))!.status).toBe(status);
+          await second.flush();
+        }
+      });
+    });
+  });
+
   it.each([
     ['private', { 'Cache-Control': 'private' }],
     ['no-store', { 'Cache-Control': 'no-store' }],
     ['no-cache', { 'Cache-Control': 'no-cache' }],
     ['Set-Cookie', { 'Set-Cookie': 'sid=private; Path=/; HttpOnly' }],
+    ['Vary', { Vary: 'Accept-Language' }],
   ])(
     'authoritative %s background response evicts previously public HTML, JSON, and KV',
     async (_policy, headers) => {
@@ -1245,6 +1328,29 @@ describe('handleIsr', () => {
     expect(getWithMetadata).not.toHaveBeenCalled();
     expect(store.size).toBe(0);
     expect(edge.store.size).toBe(0);
+  });
+
+  it('bypasses all shared ISR work for an assertion-only Access request', async () => {
+    const { kv, getWithMetadata, put } = createKvMock();
+    const { render, spy } = createRender(() => new Response('private profile'));
+    const { ctx, tasks } = createCtx();
+
+    expect(
+      await handleIsr(
+        htmlRequest('/blog/post', { 'Cf-Access-Jwt-Assertion': 'signed-access-assertion' }),
+        makeEnv(kv),
+        ctx,
+        OPTS,
+        render,
+      ),
+    ).toBeNull();
+
+    expect(edge.match).not.toHaveBeenCalled();
+    expect(getWithMetadata).not.toHaveBeenCalled();
+    expect(edge.put).not.toHaveBeenCalled();
+    expect(put).not.toHaveBeenCalled();
+    expect(spy).not.toHaveBeenCalled();
+    expect(tasks).toHaveLength(0);
   });
 
   it('returns null (caller renders live) for non-GET, credentialed, and non-ISR paths', async () => {

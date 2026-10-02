@@ -1,3 +1,4 @@
+import { createDefaultPlanCatalog } from '@void/platform/plans';
 import { eq } from 'drizzle-orm';
 import { Hono } from 'hono';
 import {
@@ -12,7 +13,6 @@ import {
 } from 'vite-plus/test';
 import { verifyDeployToken } from '../../src/auth/deploy-token.ts';
 import {
-  createBuild,
   createGitHubConnection as createGitHubConnectionRecord,
   createGithubActionsBuildWithinLimit,
   deleteGitHubConnection,
@@ -29,6 +29,7 @@ import {
 import type { Db } from '../../src/db.ts';
 import type { ApiEnv } from '../../src/env.ts';
 import type { GithubOidcClaims } from '../../src/github/oidc-verify.ts';
+import { writePlanCatalog } from '../../src/plans.ts';
 import { oidcRoutes } from '../../src/routes/auth-oidc.ts';
 import {
   builds,
@@ -38,6 +39,7 @@ import {
   users,
 } from '../../src/schema.ts';
 import {
+  createTestBuild,
   JWT_SECRET,
   clearTables,
   createTestProject,
@@ -134,6 +136,7 @@ function setCompareSideEffect(fn: (() => Promise<void>) | null): void {
 // exchange must still mint a token and persist NO check_run_id. Reset each test.
 const CHECK_RUN_ID = '999001';
 let checkRunCreateStatus = 200;
+let checkRunSideEffect: (() => Promise<void>) | null = null;
 function setCheckRunCreateStatus(status: number): void {
   checkRunCreateStatus = status;
 }
@@ -253,7 +256,9 @@ async function seedActiveInstallation(
 
 async function createGitHubConnection(
   db: Db,
-  args: Parameters<typeof createGitHubConnectionRecord>[1],
+  args: Omit<Parameters<typeof createGitHubConnectionRecord>[1], 'authorizedByUserId'> & {
+    authorizedByUserId?: string;
+  },
 ) {
   const project = await getProject(db, args.projectId);
   if (!project) {
@@ -261,8 +266,7 @@ async function createGitHubConnection(
   }
   return createGitHubConnectionRecord(db, {
     ...args,
-    authorizedByUserId:
-      args.authorizedByUserId === undefined ? project.user_id : args.authorizedByUserId,
+    authorizedByUserId: args.authorizedByUserId ?? project.user_id,
   });
 }
 
@@ -287,6 +291,7 @@ beforeEach(async () => {
   setCompareSideEffect(null);
   // Default the best-effort check-run create to succeed with a fixed id.
   setCheckRunCreateStatus(200);
+  checkRunSideEffect = null;
   checkRunCreateCount = 0;
   // The OIDC route now makes a live `GET /repos/{repo}/installation` call
   // and a live `GET /repos/{repo}/compare/{base}...{branch}` call for
@@ -306,6 +311,11 @@ beforeEach(async () => {
         });
       }
       if (url.includes('/check-runs')) {
+        if (checkRunSideEffect) {
+          const effect = checkRunSideEffect;
+          checkRunSideEffect = null;
+          await effect();
+        }
         // The best-effort "Void Build" check-run create (end of the exchange).
         if (checkRunCreateStatus < 200 || checkRunCreateStatus >= 300) {
           return new Response('check-run create failed', { status: checkRunCreateStatus });
@@ -383,9 +393,10 @@ describe('POST /auth/github-oidc', () => {
     expect(res.status).toBe(401);
   });
 
-  it('returns 401 for a legacy organization connection without per-repo proof', async () => {
+  it('returns 401 when the user who authorized the connection is no longer owner or admin', async () => {
     const user = await createTestUser(env.db);
-    const project = await createTestProject(env.db, user.id, 'oidc-legacy-org');
+    const former = await createTestUser(env.db, 'oidc-former-owner');
+    const project = await createTestProject(env.db, user.id, 'oidc-stale-authorizer');
     await seedActiveInstallation(env.db, '1');
     await createGitHubConnection(env.db, {
       projectId: project.id,
@@ -393,7 +404,7 @@ describe('POST /auth/github-oidc', () => {
       repoFullName: 'octo/repo',
       repositoryId: '42',
       buildExecutor: 'github_actions',
-      authorizedByUserId: null,
+      authorizedByUserId: former.id,
     });
     const app = makeApp(env);
     setVerifyResult(makeClaims());
@@ -401,8 +412,8 @@ describe('POST /auth/github-oidc', () => {
     const res = await exchange(app, env, { oidcToken: 't', project: project.slug });
 
     expect(res.status).toBe(401);
-    expect(((await res.json()) as { error: string }).error).toContain(
-      'reconnect the organization repository',
+    expect(((await res.json()) as { error: string }).error).toBe(
+      'no authorized github actions connection for repository; reconnect the repository',
     );
     expect(await getProjectBuilds(env.db, project.id)).toEqual([]);
   });
@@ -451,6 +462,7 @@ describe('POST /auth/github-oidc', () => {
       projectId: project.id,
       installationId: '1',
       repoFullName: 'octo/repo',
+      repositoryId: '42',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
@@ -801,6 +813,42 @@ describe('POST /auth/github-oidc', () => {
     expect(ttl).toBeGreaterThan(15 * 60); // strictly longer than the old default
     // A few seconds of slack for any clock rounding across the mint.
     expect(Math.abs(ttl - (20 * 60 + 5 * 60))).toBeLessThanOrEqual(5);
+  });
+
+  it('freezes a newly admitted Actions token timeout before later plan edits', async () => {
+    const catalog = createDefaultPlanCatalog();
+    const source = catalog.plans.find((plan) => plan.id === 'sponsored')!;
+    const studio = { ...source, id: 'studio', name: 'Studio' };
+    await writePlanCatalog(env.db, { ...catalog, plans: [...catalog.plans, studio] });
+    const user = await createTestUser(env.db, 'snapshot-builder', 'github', undefined, 'studio');
+    const project = await createTestProject(env.db, user.id, 'oidc-timeout-snapshot');
+    await seedActiveInstallation(env.db, '1');
+    await createGitHubConnection(env.db, {
+      projectId: project.id,
+      installationId: '1',
+      repoFullName: 'octo/repo',
+      repositoryId: '42',
+      branch: 'main',
+      buildExecutor: 'github_actions',
+    });
+    checkRunSideEffect = async () => {
+      await writePlanCatalog(env.db, {
+        ...catalog,
+        plans: [
+          ...catalog.plans,
+          { ...studio, limits: { ...studio.limits, buildTimeoutMinutes: 1 } },
+        ],
+      });
+    };
+    setVerifyResult(makeClaims());
+    const response = await exchange(makeApp(env), env, {
+      oidcToken: 'good',
+      project: project.slug,
+    });
+    expect(response.status).toBe(200);
+    const { token } = (await response.json()) as { token: string };
+    const payload = await verifyDeployToken(token, JWT_SECRET);
+    expect(payload!.exp - payload!.iat).toBe(20 * 60 + 5 * 60);
   });
 
   it('accepts the exchange when no project slug is supplied in the body', async () => {
@@ -1195,7 +1243,7 @@ describe('POST /auth/github-oidc', () => {
   it('setBuildCheckRunId is immutable once set (never overwrites a persisted id)', async () => {
     const user = await createTestUser(env.db, 'octo-check-immutable');
     const project = await createTestProject(env.db, user.id, 'oidc-check-immutable');
-    const build = await createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1222,7 +1270,7 @@ describe('POST /auth/github-oidc', () => {
     // (the rerun-correctness fix), and NULL-attempt rows are exempt entirely.
     const user = await createTestUser(env.db);
     const project = await createTestProject(env.db, user.id, 'oidc-unique-index');
-    await createBuild(env.db, {
+    await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1233,7 +1281,7 @@ describe('POST /auth/github-oidc', () => {
 
     // A second active row for the SAME run_id + attempt is rejected.
     await expect(
-      createBuild(env.db, {
+      createTestBuild(env.db, {
         projectId: project.id,
         userId: user.id,
         executor: 'github_actions',
@@ -1245,7 +1293,7 @@ describe('POST /auth/github-oidc', () => {
 
     // A DIFFERENT attempt of the same run_id is allowed to be transiently active
     // (a redelivered late completion for attempt 1 while attempt 2 builds).
-    await createBuild(env.db, {
+    await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       executor: 'github_actions',
@@ -1256,8 +1304,16 @@ describe('POST /auth/github-oidc', () => {
 
     // A NULL github_run_id (the container-build path) is exempt: many rows are
     // allowed, so the partial WHERE clause does not break container builds.
-    await createBuild(env.db, { projectId: project.id, userId: user.id, executor: 'container' });
-    await createBuild(env.db, { projectId: project.id, userId: user.id, executor: 'container' });
+    await createTestBuild(env.db, {
+      projectId: project.id,
+      userId: user.id,
+      executor: 'container',
+    });
+    await createTestBuild(env.db, {
+      projectId: project.id,
+      userId: user.id,
+      executor: 'container',
+    });
     const all = await getProjectBuilds(env.db, project.id);
     expect(all.filter((b) => b.github_run_id === null).length).toBe(2);
   });
@@ -1650,6 +1706,7 @@ describe('POST /auth/github-oidc', () => {
       projectId: project.id,
       installationId: '1',
       repoFullName: 'octo/repo',
+      repositoryId: '42',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
@@ -1839,34 +1896,6 @@ describe('POST /auth/github-oidc', () => {
     expect((await getProjectBuilds(env.db, project.id)).length).toBe(1);
   });
 
-  // Fail closed on a null `repository_id` row when the caller HAS an id.
-  // A connection that predates the id column (repository_id IS NULL) must NOT be
-  // matched by `repo_full_name` when the OIDC claim carries a repository_id: a
-  // deleted-then-recreated repo that reuses the old name would otherwise match
-  // the stale null-id connection and mint a deploy token for the WRONG project.
-  it('returns 401 for a null-repository_id connection when the OIDC claim carries an id (reused name)', async () => {
-    const user = await createTestUser(env.db);
-    const project = await createTestProject(env.db, user.id, 'oidc-null-id-reuse');
-    await seedActiveInstallation(env.db, '1');
-    // Legacy connection for octo/repo with NO repository_id (predates the column).
-    await createGitHubConnection(env.db, {
-      projectId: project.id,
-      installationId: '1',
-      repoFullName: 'octo/repo',
-      branch: 'main',
-      buildExecutor: 'github_actions',
-    });
-
-    const app = makeApp(env);
-    // A token for the SAME full_name but bearing an immutable id (the name was
-    // reused by a different/recreated repo) — the null-id row must NOT match.
-    setVerifyResult(makeClaims({ repository: 'octo/repo', repository_id: '777' }));
-
-    const res = await exchange(app, env, { oidcToken: 'good', project: project.slug });
-    expect(res.status).toBe(401);
-    expect((await getProjectBuilds(env.db, project.id)).length).toBe(0);
-  });
-
   // ---------------------------------------------------------------------------
   // A repo may back MULTIPLE github_actions projects (only project_id is
   // unique). Resolution must select the connection by the workflow's requested
@@ -1952,6 +1981,7 @@ describe('POST /auth/github-oidc', () => {
       projectId: project.id,
       installationId: '1',
       repoFullName: 'octo/repo',
+      repositoryId: '42',
       branch: 'main',
       buildExecutor: 'github_actions',
     });
@@ -1972,6 +2002,7 @@ describe('POST /auth/github-oidc', () => {
       projectId: project.id,
       installationId: '1',
       repoFullName: 'octo/repo',
+      repositoryId: '42',
       branch: 'main',
       buildExecutor: 'github_actions',
     });

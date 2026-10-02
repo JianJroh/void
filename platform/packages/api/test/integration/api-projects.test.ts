@@ -30,8 +30,10 @@ import {
   projectDatabaseCredentials,
   projectDeployCredentials,
   platformLoginConnections,
+  platformSettings,
 } from '../../src/schema.ts';
 import {
+  createTestBuild,
   setupEnv,
   teardownEnv,
   clearTables,
@@ -814,7 +816,7 @@ describe('POST /projects/:id/prerender-token', () => {
   it('binds a derived token to its active build and revokes it with that build', async () => {
     const user = await createTestUser(env.db, 'prerender-bound-ci');
     const project = await createTestProject(env.db, user.id, 'prerender-bound-ci-app');
-    const build = await db.createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: user.id,
       status: 'building',
@@ -846,7 +848,9 @@ describe('POST /projects/:id/prerender-token', () => {
       build: build.id,
     });
     const payload = await verifyPrerenderToken(token, env.JWT_SECRET);
-    expect(payload!.exp - payload!.iat).toBe(15 * 60);
+    const parent = await verifyDeployToken(deployToken, env.JWT_SECRET);
+    expect(payload!.exp).toBeLessThanOrEqual(parent!.exp);
+    expect(payload!.exp).toBeGreaterThanOrEqual(parent!.exp - 1);
 
     const internalAuth = await hmacSignState(project.id, env.JWT_SECRET);
     const verifyBuild = () =>
@@ -1042,7 +1046,7 @@ describe('POST /projects/:id/prerender-token', () => {
       role: 'collaborator',
       added_by_user_id: owner.id,
     });
-    const build = await db.createBuild(env.db, {
+    const build = await createTestBuild(env.db, {
       projectId: project.id,
       userId: collaborator.id,
       status: 'building',
@@ -1858,6 +1862,36 @@ describe('POST /projects', () => {
     expect(body.user_id).toBe(user.id);
   });
 
+  it('returns initialization failures in the standard warnings collection', async () => {
+    const user = await createTestUser(env.db);
+    await env.db.insert(platformSettings).values({
+      key: 'zeroTrust.configuration',
+      value: { version: 999 },
+    });
+
+    const res = await app.fetch(
+      new Request('http://localhost/projects', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${user.jwt}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ slug: 'warning-app' }),
+      }),
+      env,
+    );
+
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body).toMatchObject({
+      slug: 'warning-app',
+      warnings: [
+        'Project created, but its Zero Trust protection is not set up yet, so deploys will wait. Void retries within an hour. To retry now, a project owner or admin can run `void project zero-trust reconcile`; if that reports the platform is not ready, ask a platform administrator.',
+      ],
+    });
+    expect(body).not.toHaveProperty('warning');
+  });
+
   it('rejects missing slug', async () => {
     const user = await createTestUser(env.db);
 
@@ -1958,7 +1992,7 @@ describe('POST /projects', () => {
     );
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({
-      error: 'short slugs (5 characters or fewer) require a paid plan',
+      error: 'the selected plan does not permit short slugs (5 characters or fewer)',
     });
   });
 

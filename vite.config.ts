@@ -5,6 +5,15 @@ import { defineConfig } from 'vite-plus';
 import { SuiteSequencer } from './test/sequencer.ts';
 
 const maxWorkers = process.env.CI ? 2 : Math.max(2, Math.floor(availableParallelism() * 0.75));
+const apiTimezoneTests = [
+  'platform/packages/api/test/integration/api-delete-accounting.test.ts',
+  'platform/packages/api/test/integration/email-connections.test.ts',
+];
+const cliUnitTests = [
+  'packages/void/test/unit/cf-*.test.ts',
+  'packages/void/test/unit/provision-*.test.ts',
+  'packages/void/test/unit/deploy-drift.test.ts',
+];
 
 // Vitest forwards a FILTERED env to test workers — in CI only VOID_E2E_CF_TOKEN survives, while
 // VOID_E2E_CF_ACCOUNT_ID and VOID_E2E_RUN_ID are dropped. The gated live Cloudflare deploy e2e
@@ -385,14 +394,28 @@ export default defineConfig({
   },
   resolve: { alias: platformAlias },
   test: {
+    fsModuleCache: true,
     silent: 'passed-only',
     sequence: { sequencer: SuiteSequencer },
     projects: [
       {
         extends: false,
         test: {
+          name: 'cli-unit',
+          fsModuleCache: true,
+          include: cliUnitTests,
+          pool: 'threads',
+          maxWorkers,
+          ...(process.platform === 'win32' ? { testTimeout: 20_000 } : {}),
+        },
+      },
+      {
+        extends: false,
+        test: {
           name: 'unit',
+          fsModuleCache: true,
           include: ['packages/*/test/unit/**/*.test.ts'],
+          exclude: cliUnitTests,
           sequence: { groupOrder: 2 },
           pool: 'threads',
           maxWorkers,
@@ -406,6 +429,8 @@ export default defineConfig({
         resolve: { alias: platformAlias },
         test: {
           name: 'platform-unit',
+          fsModuleCache: true,
+          pool: 'threads',
           include: ['platform/packages/*/test/**/*.test.ts'],
           exclude: ['platform/packages/api/test/integration/**'],
           maxWorkers,
@@ -416,7 +441,23 @@ export default defineConfig({
         resolve: { alias: platformAlias },
         test: {
           name: 'platform-api-integration',
+          fsModuleCache: true,
+          include: apiTimezoneTests,
+          globalSetup: ['platform/packages/api/test/integration/global-setup.ts'],
+          setupFiles: ['platform/packages/api/test/integration/setup.ts'],
+          ...(process.env.VOID_TEST_DATABASE_URL ? { fileParallelism: false } : {}),
+          maxWorkers,
+        },
+      },
+      {
+        extends: false,
+        resolve: { alias: platformAlias },
+        test: {
+          name: 'platform-api-integration-threads',
+          fsModuleCache: true,
+          pool: 'threads',
           include: ['platform/packages/api/test/integration/**/*.test.ts'],
+          exclude: apiTimezoneTests,
           globalSetup: ['platform/packages/api/test/integration/global-setup.ts'],
           setupFiles: ['platform/packages/api/test/integration/setup.ts'],
           ...(process.env.VOID_TEST_DATABASE_URL ? { fileParallelism: false } : {}),
@@ -429,6 +470,7 @@ export default defineConfig({
           // Every integration file here owns its fixture directory, so one worker pool can
           // schedule the longest files first and fill idle slots across package boundaries.
           name: 'parallel-integration',
+          fsModuleCache: true,
           globalSetup: ['test/playground-snapshots.ts'],
           // Bound simultaneous database engines and framework compilers locally.
           // Unit tests still fill unused integration workers in the same phase.

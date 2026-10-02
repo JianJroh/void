@@ -2,8 +2,10 @@ import { stripVTControlCharacters } from 'node:util';
 import { expect, it, vi } from 'vite-plus/test';
 import {
   cloudflareDeviceCode,
+  cloudflareVerificationUrl,
   printCloudflareLoginPrompt,
 } from '../../src/cli/cloudflare-login-output.ts';
+import { encodeCloudflareOperation } from '../../src/cli/cloudflare-process.ts';
 
 it('extracts the device code from cf output, including streamed and colored output', () => {
   expect(cloudflareDeviceCode('and enter the code:\n\n  a1B2c3D4\n')).toBe('a1B2c3D4');
@@ -16,6 +18,19 @@ it('extracts the device code from cf output, including streamed and colored outp
       'Opening a link in your default browser: https://dash.cloudflare.com/oauth2/device/verify?user_code=a1B2c3D4\n',
     ),
   ).toBe('a1B2c3D4');
+});
+
+it('extracts only the complete verification URL supplied by cf', () => {
+  const url = 'https://dash.cloudflare.com/oauth2/device/verify?user_code=a1B2c3D4';
+  expect(cloudflareVerificationUrl(`Opening a link in your default browser: ${url}\n`)).toBe(url);
+  expect(cloudflareVerificationUrl(`To authorize cf, please visit:\n\n  ${url}\n`)).toBe(url);
+  expect(
+    cloudflareVerificationUrl(`Visit this link to authenticate: \u001b[34m${url}\u001b[0m\n`),
+  ).toBe(url);
+  expect(
+    cloudflareVerificationUrl('Opening a link in your default browser: https://dash.cloud'),
+  ).toBeNull();
+  expect(cloudflareVerificationUrl('and enter the code:\n  a1B2c3D4\n')).toBeNull();
 });
 
 it('prints only the short Void prompt with the actual code', () => {
@@ -46,7 +61,8 @@ child.spawn = () => {
   process.stderr = new EventEmitter();
   setImmediate(() => {
     process.stderr.emit('data', Buffer.from('Attempting to login via OAuth Device Authorization Grant...\\nand enter the code:\\n  a1B2'));
-    process.stderr.emit('data', Buffer.from('c3D4\\nOpening a link in your default browser: https://dash.cloudflare.com/oauth2/device/verify?user_code=a1B2c3D4\\nSuccessfully logged in.\\nConfig file: sample\\n'));
+    process.stderr.emit('data', Buffer.from('c3D4\\nOpening a link in your default browser: https://dash.cloudflare.com/oauth2/device/verify?user_code=a1B2'));
+    process.stderr.emit('data', Buffer.from('c3D4\\nSuccessfully logged in.\\nConfig file: sample\\n'));
     process.emit('close', 0, null);
   });
   return process;
@@ -54,12 +70,24 @@ child.spawn = () => {
 syncBuiltinESMExports();
 `,
     );
-    const entry = join(import.meta.dirname, '..', '..', 'src', 'cli', 'cf-compat.ts');
+    const entry = join(
+      import.meta.dirname,
+      '..',
+      '..',
+      'src',
+      'cli',
+      'cloudflare-operation-process.ts',
+    );
     const output = await new Promise<{ status: number; stdout: string; stderr: string }>(
       (resolve) => {
         execFile(
           process.execPath,
-          ['--import', pathToFileURL(preload).href, entry, 'login'],
+          [
+            '--import',
+            pathToFileURL(preload).href,
+            entry,
+            ...encodeCloudflareOperation({ type: 'auth.login' }),
+          ],
           {
             cwd: directory,
             encoding: 'utf8',
@@ -80,7 +108,7 @@ syncBuiltinESMExports();
     );
     expect(output.status, output.stderr).toBe(0);
     expect(stripVTControlCharacters(output.stdout.trim())).toBe(
-      'Opening Cloudflare login in your browser. Confirm the code a1B2c3D4 in your browser. Press Ctrl+C to cancel.',
+      'Opening Cloudflare login in your browser. Confirm the code a1B2c3D4 in your browser. Press Ctrl+C to cancel.\nOpen this link if your browser did not open: https://dash.cloudflare.com/oauth2/device/verify?user_code=a1B2c3D4',
     );
     expect(output.stdout + output.stderr).not.toContain('Attempting to login');
     expect(output.stdout + output.stderr).not.toContain('Config file:');

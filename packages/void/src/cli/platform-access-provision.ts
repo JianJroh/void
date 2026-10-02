@@ -64,6 +64,22 @@ function text(value: unknown, name: string): string {
   }
   return value;
 }
+export function platformAccessIdentityProvider(provider: ObjectValue): {
+  id: string;
+  name: string;
+} {
+  const id = text(provider.id, 'identity provider ID');
+  // Cloudflare's built-in provider can have an empty display name. Identity
+  // selection still uses its validated ID, including in the interactive picker.
+  const name = provider.name;
+  return {
+    id,
+    name:
+      name == null || (typeof name === 'string' && !name.trim())
+        ? id
+        : text(name, 'identity provider name'),
+  };
+}
 function ids(value: unknown): Array<string> {
   if (!Array.isArray(value)) {
     return [];
@@ -112,6 +128,11 @@ export class PlatformAccessClient {
   }
 }
 
+/**
+ * Project Zero Trust keeps its own, broader copy of this list in
+ * platform/packages/api/src/zero-trust/cloudflare.ts; review both when adding
+ * a rule type.
+ */
 function identityRule(rule: ObjectValue): boolean {
   if (rule.email_domain) {
     const domain = object(rule.email_domain, 'email domain').domain;
@@ -263,10 +284,7 @@ export async function inspectPlatformAccess(
     applications: [{ origin: 'https://validation.example.com', audience: 'validation' }],
   });
   const providers = await client.list('identity_providers');
-  const identityProviders = providers.map((provider) => ({
-    id: text(provider.id, 'identity provider ID'),
-    name: text(provider.name ?? provider.id, 'identity provider name'),
-  }));
+  const identityProviders = providers.map(platformAccessIdentityProvider);
   if (
     !input.identityProviderIds.length ||
     !input.policyIds.length ||

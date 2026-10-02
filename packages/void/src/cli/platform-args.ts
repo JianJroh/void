@@ -1,17 +1,29 @@
+import {
+  normalizePlatformDashboardUrl,
+  PLATFORM_LOGIN_KINDS,
+  type PlatformLoginKind,
+} from '@void/platform';
 import { operatorGroups, parseOperatorArgs, type OperatorArgs } from './operator-args.ts';
 import { parsePlatformConfigArgs, type PlatformConfigArgs } from './platform-config-args.ts';
+import { parsePlatformPlansArgs, type PlatformPlansArgs } from './platform-plans-args.ts';
 import type { SubcommandDef } from './subcommand-prompt.ts';
 
 export const platformSubcommands: Array<SubcommandDef> = [
   {
     name: 'config',
-    hint: 'Configure authentication',
-    description: 'Configure login methods, company protection, or provider recovery',
+    hint: 'Authentication, plans, and limits',
+    description: 'Configure login methods, protection, plans, or limits',
   },
   ...operatorGroups.map((name) => ({
     name,
     hint:
-      name === 'email' ? 'Domains, policy, limits, outcomes, and recovery' : 'Operator commands',
+      name === 'email'
+        ? 'Domains, shared recipients, policy, limits, and recovery'
+        : name === 'zero-trust'
+          ? 'Configure Access protection and project overrides'
+          : name === 'project'
+            ? 'Inspect, normalize, transfer, or remove projects'
+            : 'Operator commands',
     description: `Administer platform ${name}`,
   })),
   { name: 'list', description: 'List installed and connected platforms' },
@@ -25,11 +37,16 @@ export const platformSubcommands: Array<SubcommandDef> = [
   },
   {
     name: 'install',
+    hint: 'Preview choices with --plan, then run the printed install command',
     description: 'Install a Void platform with a domain or workers.dev for testing',
   },
   { name: 'upgrade', arg: '[id]', description: 'Upgrade an installed Void platform' },
   { name: 'rollback', arg: '[id]', description: 'Restore a compatible earlier platform runtime' },
-  { name: 'repair', arg: '[id]', description: 'Reconcile an installed Void platform' },
+  {
+    name: 'repair',
+    arg: '[id]',
+    description: 'Reconcile a platform or configure its dashboard origin',
+  },
   { name: 'disable', arg: '[id]', description: 'Disable traffic without deleting data' },
   { name: 'enable', arg: '[id]', description: 'Restore traffic for a disabled platform' },
   { name: 'uninstall', arg: '[id]', description: 'Safely remove an installed Void platform' },
@@ -37,6 +54,8 @@ export const platformSubcommands: Array<SubcommandDef> = [
 
 export type PlatformArgs =
   | PlatformConfigArgs
+  | PlatformPlansArgs
+  | { subcommand: 'config'; configGroup: ''; plan: false; yes: false }
   | OperatorArgs
   | { subcommand: 'list' }
   | { subcommand: 'use'; selector: string }
@@ -54,9 +73,15 @@ export type PlatformArgs =
   | {
       subcommand: 'install';
       authConfig?: string;
+      loginMethods?: Array<PlatformLoginKind>;
+      accessProtection?: boolean;
+      hyperdrive?: string;
+      noControlPlaneDomain?: true;
+      dedicatedZoneSpecified?: true;
       account: string;
       applicationDomain: string;
       controlPlaneDomain: string;
+      dashboardUrl?: string;
       dedicatedZone: boolean;
       displayName: string;
       name: string;
@@ -69,6 +94,7 @@ export type PlatformArgs =
     }
   | {
       subcommand: 'upgrade' | 'repair' | 'disable' | 'enable';
+      dashboardUrl?: string;
       selector: string;
       plan: boolean;
       runtime: string;
@@ -129,10 +155,18 @@ function parseSelector(
 function parseLifecycleSelector(
   rest: Array<string>,
   subcommand: 'upgrade' | 'rollback' | 'repair' | 'disable' | 'enable',
-): { selector: string; plan: boolean; runtime: string; fromRuntime: string; yes: boolean } {
+): {
+  selector: string;
+  plan: boolean;
+  runtime: string;
+  fromRuntime: string;
+  yes: boolean;
+  dashboardUrl?: string;
+} {
   const positional: Array<string> = [];
   let runtime = '';
   let fromRuntime = '';
+  let dashboardUrl: string | undefined;
   for (let index = 0; index < rest.length; index++) {
     const arg = rest[index]!;
     if (arg === '--runtime') {
@@ -141,6 +175,10 @@ function parseLifecycleSelector(
       }
       const [value, next] = readValue(rest, index, arg);
       runtime = value;
+      index = next;
+    } else if (arg === '--dashboard-url' && (subcommand === 'upgrade' || subcommand === 'repair')) {
+      const [value, next] = readValue(rest, index, arg);
+      dashboardUrl = normalizePlatformDashboardUrl(value);
       index = next;
     } else if (arg === '--from-runtime' && subcommand === 'rollback') {
       const [value, next] = readValue(rest, index, arg);
@@ -154,7 +192,12 @@ function parseLifecycleSelector(
   if (subcommand === 'rollback' && !runtime) {
     throw new Error('platform: rollback requires --runtime <earlier-runtime-directory>.');
   }
-  return { ...parsed, runtime, fromRuntime };
+  return {
+    ...parsed,
+    runtime,
+    fromRuntime,
+    ...(dashboardUrl !== undefined ? { dashboardUrl } : {}),
+  };
 }
 
 export function parsePlatformArgs(args: Array<string>): PlatformArgs {
@@ -166,7 +209,10 @@ export function parsePlatformArgs(args: Array<string>): PlatformArgs {
   }
   const [subcommand, ...rest] = args;
   if (subcommand === 'config') {
-    return parsePlatformConfigArgs(rest);
+    if (rest.length === 0) {
+      return { subcommand: 'config', configGroup: '', plan: false, yes: false };
+    }
+    return rest[0] === 'plans' ? parsePlatformPlansArgs(rest) : parsePlatformConfigArgs(rest);
   }
 
   if (subcommand === 'domain') {
@@ -268,10 +314,20 @@ export function parsePlatformArgs(args: Array<string>): PlatformArgs {
     subcommand === 'disable' ||
     subcommand === 'enable'
   ) {
-    const { selector, plan, runtime, fromRuntime, yes } = parseLifecycleSelector(rest, subcommand);
+    const { selector, plan, runtime, fromRuntime, yes, dashboardUrl } = parseLifecycleSelector(
+      rest,
+      subcommand,
+    );
     return subcommand === 'rollback'
       ? { subcommand, selector, plan, runtime, fromRuntime, yes }
-      : { subcommand, selector, plan, runtime, yes };
+      : {
+          subcommand,
+          selector,
+          plan,
+          runtime,
+          yes,
+          ...(dashboardUrl !== undefined ? { dashboardUrl } : {}),
+        };
   }
   if (subcommand === 'uninstall') {
     const parsed = parseSelector(
@@ -301,11 +357,17 @@ export function parsePlatformArgs(args: Array<string>): PlatformArgs {
     let resume = false;
     let dedicatedZone = false;
     let yes = false;
+    let noControlPlaneDomain = false;
+    let noDedicatedZone = false;
+    let accessProtection: boolean | undefined;
     const valueFlags = new Set([
       '--account',
       '--auth-config',
+      '--login-methods',
+      '--hyperdrive',
       '--application-domain',
       '--control-plane-domain',
+      '--dashboard-url',
       '--display-name',
       '--name',
       '--runtime',
@@ -324,6 +386,16 @@ export function parsePlatformArgs(args: Array<string>): PlatformArgs {
         resume = true;
       } else if (arg === '--dedicated-zone') {
         dedicatedZone = true;
+      } else if (arg === '--no-dedicated-zone') {
+        noDedicatedZone = true;
+      } else if (arg === '--no-control-plane-domain') {
+        noControlPlaneDomain = true;
+      } else if (arg === '--access-protection' || arg === '--no-access-protection') {
+        const enabled = arg === '--access-protection';
+        if (accessProtection !== undefined && accessProtection !== enabled) {
+          throw new Error('platform: Choose either --access-protection or --no-access-protection.');
+        }
+        accessProtection = enabled;
       } else if (arg === '--yes') {
         yes = true;
       } else if (arg === '--workers-dev') {
@@ -331,6 +403,31 @@ export function parsePlatformArgs(args: Array<string>): PlatformArgs {
       } else {
         throw new Error(`platform: Unexpected argument '${arg}'.`);
       }
+    }
+    if (noControlPlaneDomain && values.has('--control-plane-domain')) {
+      throw new Error(
+        'platform: Choose either --control-plane-domain or --no-control-plane-domain.',
+      );
+    }
+    if (noDedicatedZone && dedicatedZone) {
+      throw new Error('platform: Choose either --dedicated-zone or --no-dedicated-zone.');
+    }
+    if (
+      values.has('--auth-config') &&
+      (values.has('--login-methods') || accessProtection !== undefined)
+    ) {
+      throw new Error(
+        'platform: --auth-config cannot be combined with login or Access protection options.',
+      );
+    }
+    const loginMethods = values.get('--login-methods')?.split(',');
+    if (
+      loginMethods &&
+      loginMethods.some((method) => !PLATFORM_LOGIN_KINDS.includes(method as PlatformLoginKind))
+    ) {
+      throw new Error(
+        'platform: --login-methods accepts github, google, oidc, and cloudflare-access.',
+      );
     }
     if (
       workersDev &&
@@ -342,11 +439,21 @@ export function parsePlatformArgs(args: Array<string>): PlatformArgs {
     }
     return {
       subcommand,
+      ...(noControlPlaneDomain ? { noControlPlaneDomain: true as const } : {}),
+      ...(noDedicatedZone ? { dedicatedZoneSpecified: true as const } : {}),
+      ...(values.has('--hyperdrive') ? { hyperdrive: values.get('--hyperdrive')! } : {}),
+      ...(loginMethods
+        ? { loginMethods: [...new Set(loginMethods)] as Array<PlatformLoginKind> }
+        : {}),
+      ...(accessProtection !== undefined ? { accessProtection } : {}),
       ...(workersDev ? { workersDev: true } : {}),
       ...(values.has('--auth-config') ? { authConfig: values.get('--auth-config')! } : {}),
       account: values.get('--account') ?? '',
       applicationDomain: values.get('--application-domain') ?? '',
       controlPlaneDomain: values.get('--control-plane-domain') ?? '',
+      ...(values.has('--dashboard-url')
+        ? { dashboardUrl: normalizePlatformDashboardUrl(values.get('--dashboard-url')!) }
+        : {}),
       dedicatedZone,
       displayName: values.get('--display-name') ?? '',
       name: values.get('--name') ?? '',

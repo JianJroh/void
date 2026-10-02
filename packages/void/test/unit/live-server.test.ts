@@ -163,6 +163,69 @@ describe('live Durable Object runtime', () => {
     expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
 
+  it.each([
+    ['/deliver', 'timeout'],
+    ['/deliver', 'error'],
+    ['/deliver', '503'],
+    ['/check', 'timeout'],
+    ['/check', 'error'],
+    ['/check', '503'],
+  ])('keeps subscriptions after a transient %s %s', async (path, failure) => {
+    let failing = false;
+    const harness = createHarness({
+      fetch(_name, request) {
+        if (failing && new URL(request.url).pathname === path) {
+          if (failure === 'timeout') {
+            return new Promise<Response>(() => {});
+          }
+          if (failure === 'error') {
+            return Promise.reject(new Error('temporarily unavailable'));
+          }
+          return Promise.resolve(new Response('unavailable', { status: 503 }));
+        }
+      },
+    });
+    const connectionId = 'connection-transient-0001';
+    const connection = harness.stub(`live:app:connection:${connectionId}`);
+    const message = { streamId: 'app', connectionId, owner: 'user:1', limits: LIMITS };
+    const response = await connection.fetch(jsonRequest('/connect', message));
+    const reader = response.body!.getReader();
+    await readFrame(reader);
+    try {
+      await connection.fetch(
+        jsonRequest('/control', {
+          ...message,
+          operations: [{ kind: 'subscribe', id: 'card', topic: 'post:12' }],
+        }),
+      );
+      const topicName = `live:app:topic:${await topicDigest('app', 'post:12')}`;
+      failing = true;
+      vi.useFakeTimers();
+      const operation =
+        path === '/check'
+          ? harness.alarm(topicName)
+          : harness.stub(topicName).fetch(
+              jsonRequest('/publish', {
+                streamId: 'app',
+                topic: 'post:12',
+                topicKey: await topicDigest('app', 'post:12'),
+                data: 'missed',
+                limits: LIMITS,
+              }),
+            );
+      await vi.advanceTimersByTimeAsync(1_501);
+      await operation;
+      vi.useRealTimers();
+      expect(await harness.subscriberCount(topicName)).toBe(1);
+      failing = false;
+      await harness.publish('app', 'post:12', { title: 'Recovered' });
+      expect(parseData(await readFrame(reader))).toMatchObject({ data: { title: 'Recovered' } });
+    } finally {
+      vi.useRealTimers();
+      await reader.cancel();
+    }
+  });
+
   it('fans out publish deliveries six at a time and prunes missing connections', async () => {
     const pending: Array<(response: Response) => void> = [];
     let calls = 0;
@@ -553,6 +616,45 @@ describe('live Durable Object runtime', () => {
 
     await firstReader.cancel().catch(() => {});
     await secondReader.cancel();
+  });
+
+  it('reconnects while the previous connection has an unread write', async () => {
+    const harness = createHarness();
+    const connectionId = 'connection-stalled-0001';
+    const connection = harness.stub(`live:app:connection:${connectionId}`);
+    const message = { streamId: 'app', connectionId, owner: 'user:1', limits: LIMITS };
+    const first = await connection.fetch(jsonRequest('/connect', message));
+    const second = await connection.fetch(jsonRequest('/connect', message));
+    const reader = second.body!.getReader();
+    try {
+      expect(await readFrame(reader)).toBe(': connected');
+      await expect(first.text()).rejects.toThrow();
+    } finally {
+      await reader.cancel();
+    }
+  });
+
+  it('disconnects an overflowing queue without waiting for the reader', async () => {
+    const harness = createHarness();
+    const connectionId = 'connection-overflow-0001';
+    const connection = harness.stub(`live:app:connection:${connectionId}`);
+    const limits = { ...LIMITS, maxQueuedEventsPerConnection: 1 };
+    const message = { streamId: 'app', connectionId, owner: 'user:1', limits };
+    const response = await connection.fetch(jsonRequest('/connect', message));
+    await connection.fetch(
+      jsonRequest('/control', {
+        ...message,
+        operations: [{ kind: 'subscribe', id: 'card', topic: 'post:12' }],
+      }),
+    );
+    await harness.publish('app', 'post:12', 'first');
+    await harness.publish('app', 'post:12', 'overflow');
+    await expect(response.text()).rejects.toThrow();
+    expect(
+      (await connection.fetch(jsonRequest('/control', { ...message, operations: [] }))).status,
+    ).toBe(404);
+    const topicName = `live:app:topic:${await topicDigest('app', 'post:12')}`;
+    expect(await harness.subscriberCount(topicName)).toBe(0);
   });
 });
 

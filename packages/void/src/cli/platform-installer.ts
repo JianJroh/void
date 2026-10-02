@@ -27,6 +27,7 @@ import {
   readCloudflareTriggerConfig,
   stabilizeCloudflareVersionTriggers,
   type CloudflareCommandResult,
+  type CloudflareOperation,
   type CloudflareCommandRunner,
   type CloudflareTriggerConfig,
 } from '@void/deploy-cloudflare';
@@ -35,17 +36,19 @@ import {
   createPlatformInstallationManifest,
   createPlatformResourceOwnershipMarker,
   createPlatformWorkerConfigs,
+  normalizeApplicationDomain,
   parsePlatformInstallationManifest,
   parsePlatformResourceOwnershipMarker,
   PLATFORM_DISABLED_KEY,
   PLATFORM_DISABLED_VALUE,
+  PLATFORM_HEALTH_HOSTNAME_LABEL,
   PLATFORM_R2_OWNERSHIP_MARKER_KEY,
   PLATFORM_REMOTE_INSTALLATION_MANIFEST_KEY,
-  PLATFORM_SANDBOX_DRAIN_KEY,
   recordInstallationResource,
   recordInstallationStep,
   setInstallationDesiredState,
   setInstallationEndpoints,
+  platformDashboardUrl,
   transitionInstallation,
   type InstallationResource,
   type PlatformInstallationManifest,
@@ -114,7 +117,14 @@ import {
   trackedPlatformWorkerTraffic,
 } from './platform-traffic.ts';
 import { platformWorkerLiveTriggersMatch } from './platform-trigger-proof.ts';
-import { resolveWranglerArgv } from './preset.ts';
+import {
+  fencePlatformProjectZeroTrustConnection,
+  liftPlatformProjectZeroTrustFenceConnection,
+  lockPlatformProjectZeroTrustConnection,
+  readPlatformProjectZeroTrustStateConnection,
+  type PlatformProjectZeroTrustState,
+} from './platform-zero-trust-uninstall.ts';
+import { resolveCloudflareOperationArgv } from './preset.ts';
 import { createDefaultRunWrangler, resolvePinnedApiBaseUrl } from './provision.ts';
 
 export const REMOTE_INSTALLATION_MANIFEST_KEY: string = PLATFORM_REMOTE_INSTALLATION_MANIFEST_KEY;
@@ -197,6 +207,14 @@ export type PlatformDatabaseLifecycleLock = (() => Promise<void>) & {
   prepareSandboxDrain?: (
     requiredAdmissionProtocol?: 0 | 2 | 3,
   ) => Promise<PlatformSandboxDrainPreparation>;
+  /** Project Zero Trust state that decides whether uninstall may start. */
+  readProjectZeroTrust?: () => Promise<PlatformProjectZeroTrustState>;
+  /** Block Zero Trust writers in the API until the returned release runs. */
+  lockProjectZeroTrust?: () => Promise<() => Promise<void>>;
+  /** Make API Zero Trust writers refuse until the fence is lifted. */
+  fenceProjectZeroTrust?: () => Promise<void>;
+  /** Let API Zero Trust writers run again; called before traffic is enabled. */
+  liftProjectZeroTrustFence?: () => Promise<void>;
   requiredSafetyProtocols?: Readonly<{ sandboxDrain: 0 | 1 | 2 | 3 }>;
   verifyDatabase?: (
     runtimeDirectory: string,
@@ -238,7 +256,6 @@ export type PlatformDatabaseState = Readonly<{
 export type PlatformSandboxDrainPreparation = Readonly<{
   admissionProtocol: 0 | 2 | 3;
   generation: string;
-  mirrorValue: string;
   state: 'complete' | 'pending';
 }>;
 
@@ -363,6 +380,7 @@ export type PlatformInstallerDependencies = Readonly<{
   bootstrapEmail?: typeof bootstrapPlatformSharedEmail;
   verifyHealth?: typeof verifyPlatformHealth;
   verifySandboxDrain?: (apiUrl: string, healthProbeToken: string) => Promise<boolean>;
+  verifyDeploymentExecutionDrain?: typeof verifyPlatformDeploymentExecutionDrain;
   verifyWorkerCutover?: (
     manifest: PlatformInstallationManifest,
     generation: number,
@@ -1263,14 +1281,18 @@ export async function installPlatform(
   }
   const now = dependencies.now ?? (() => new Date().toISOString());
   const cloudflareApiBaseUrl = dependencies.client.apiBaseUrl ?? resolvePinnedApiBaseUrl();
-  const runPinnedPlatformWrangler: typeof runPlatformWrangler = (args, accountId, cwd, capture) =>
-    runPlatformWranglerAtApiBase(args, accountId, cwd, capture, cloudflareApiBaseUrl);
-  const runParallelPinnedPlatformWrangler: typeof runPlatformWrangler = (
-    args,
+  const runPinnedPlatformWrangler: typeof runPlatformWrangler = (
+    operation,
     accountId,
     cwd,
     capture,
-  ) => runPlatformWranglerAtApiBase(args, accountId, cwd, capture, cloudflareApiBaseUrl, true);
+  ) => runPlatformWranglerAtApiBase(operation, accountId, cwd, capture, cloudflareApiBaseUrl);
+  const runParallelPinnedPlatformWrangler: typeof runPlatformWrangler = (
+    operation,
+    accountId,
+    cwd,
+    capture,
+  ) => runPlatformWranglerAtApiBase(operation, accountId, cwd, capture, cloudflareApiBaseUrl, true);
   const resolvedRuntime = dependencies.runtime ?? resolvePlatformRuntime();
   const runtimeDirectory = resolvedRuntime.directory;
   const runtime = resolvedRuntime.manifest;
@@ -1584,6 +1606,25 @@ export async function installPlatform(
       manifest = transitionInstallation(manifest, 'provisioning', now());
       writeInstallationManifest(manifest);
     }
+    if (
+      runtime.deploymentExecution !== 1 &&
+      (manifest.deploymentExecution === 1 ||
+        dependencies.databaseRollbackSource?.manifest.deploymentExecution === 1)
+    ) {
+      // Admission takes a shared row lock on this authoritative checkpoint in the
+      // transaction that creates its deployment job. This update closes admission
+      // before the probe counts jobs, and before a Queue consumer can be removed.
+      if (!releaseDatabaseLock.checkpoint) {
+        throw new Error('platform: The database lifecycle lock cannot fence deployment admission.');
+      }
+      await releaseDatabaseLock.checkpoint(manifest);
+      dependencies.onProgress?.('Verifying durable deployment operations have drained');
+      await (dependencies.verifyDeploymentExecutionDrain ?? verifyPlatformDeploymentExecutionDrain)(
+        plan.apiUrl,
+        createPlatformHealthProbeToken(manifest.ownershipNonce),
+        manifest.id,
+      );
+    }
 
     if (dependencies.prepareAuthentication) {
       dependencies.onProgress?.('Preparing platform authentication');
@@ -1660,6 +1701,7 @@ export async function installPlatform(
         client: dependencies.client,
         manifest,
         plan,
+        dashboardUrl: platformDashboardUrl(plan.deployment),
         protection,
         checkpoint: secretCheckpoint(secrets, workerSecretUpdateIntent),
       });
@@ -1806,21 +1848,6 @@ export async function installPlatform(
         'platform: The database did not arm the Sandbox admission protocol required by this runtime.',
       );
     }
-    const sandboxDrainRoutingKvId = requireId(
-      Object.fromEntries(manifest.resources.map((resource) => [resource.key, resource.id])),
-      'routing-kv',
-    );
-    const writeSandboxDrainMirror = async (preparation: PlatformSandboxDrainPreparation) => {
-      await dependencies.client.putKvValue(
-        plan.account.id,
-        sandboxDrainRoutingKvId,
-        PLATFORM_SANDBOX_DRAIN_KEY,
-        preparation.mirrorValue,
-      );
-    };
-    if (sandboxDrainPreparation) {
-      await writeSandboxDrainMirror(sandboxDrainPreparation);
-    }
     const sandboxDrainState = sandboxDrainPreparation?.state ?? 'complete';
     if (
       targetSandboxDrainProtocol >= 1 &&
@@ -1932,6 +1959,7 @@ export async function installPlatform(
       accountId: plan.account.id,
       apiUrl: plan.apiUrl,
       deployment: plan.deployment,
+      deploymentExecution: runtime.deploymentExecution,
       healthProbeToken: createPlatformHealthProbeToken(manifest.ownershipNonce),
       installationId: manifest.id,
       ownershipNonce: manifest.ownershipNonce,
@@ -2310,7 +2338,11 @@ export async function installPlatform(
 
     manifest = setInstallationEndpoints(
       manifest,
-      { apiUrl: plan.apiUrl, dashboardUrl: null, proxyUrl: plan.proxyUrl },
+      {
+        apiUrl: plan.apiUrl,
+        dashboardUrl: platformDashboardUrl(plan.deployment),
+        proxyUrl: plan.proxyUrl,
+      },
       now(),
     );
     if (preserveDisabled) {
@@ -2334,6 +2366,7 @@ export async function installPlatform(
       manifest = {
         ...manifest,
         deployment: plan.deployment,
+        deploymentExecution: runtime.deploymentExecution,
         platformVersion: version,
         runtime: runtimeProvenance,
         updatedAt: now(),
@@ -2489,7 +2522,6 @@ export async function installPlatform(
           'platform: Sandbox drain completion changed while it was being verified. Traffic remains disabled.',
         );
       }
-      await writeSandboxDrainMirror(completedDrain);
     }
     if (requiresStagedCommit) {
       if (!authenticationCutoverCommitted) {
@@ -2711,6 +2743,9 @@ export async function installPlatform(
         createPlatformHealthProbeToken(manifest.ownershipNonce),
       );
     }
+    // A failed uninstall, or one whose database is reused, leaves its record
+    // behind. Remove it before traffic opens so Zero Trust writers run again.
+    await releaseDatabaseLock.liftProjectZeroTrustFence?.();
     if (dependencies.client.deleteKvValue) {
       await dependencies.client.deleteKvValue(
         plan.account.id,
@@ -2753,6 +2788,7 @@ export async function installPlatform(
     manifest = {
       ...manifest,
       deployment: plan.deployment,
+      deploymentExecution: runtime.deploymentExecution,
       platformVersion: version,
       runtime: runtimeProvenance,
       safetyProtocols: runtime.safetyProtocols ?? { sandboxDrain: 0 },
@@ -3608,6 +3644,26 @@ export async function readPlatformDatabaseLifecycleManifest(
   }
 }
 
+/** Read project Zero Trust state for a plan, which holds no lifecycle lock. */
+export async function readPlatformProjectZeroTrustState(
+  databaseUrl: string,
+  installationId: string,
+  ownershipNonce: string,
+): Promise<PlatformProjectZeroTrustState> {
+  if (!databaseUrl) {
+    throw new Error('the installation database URL is not recorded on this machine');
+  }
+  const { Pool } = await import('pg');
+  const pool = new Pool({ connectionString: platformDatabaseClientUrl(databaseUrl), max: 1 });
+  try {
+    // Throws unless the database is claimed by this installation.
+    await readPlatformDatabaseLifecycleManifestConnection(pool, installationId, ownershipNonce);
+    return await readPlatformProjectZeroTrustStateConnection(pool);
+  } finally {
+    await pool.end();
+  }
+}
+
 type DatabaseClaimConnection = Readonly<{
   query: <Row extends Record<string, unknown> = Record<string, unknown>>(
     sql: string,
@@ -3897,6 +3953,10 @@ export async function acquirePlatformDatabaseLifecycleLockConnection(
         }
       : null;
   };
+  release.readProjectZeroTrust = () => readPlatformProjectZeroTrustStateConnection(client);
+  release.lockProjectZeroTrust = () => lockPlatformProjectZeroTrustConnection(client);
+  release.fenceProjectZeroTrust = () => fencePlatformProjectZeroTrustConnection(client);
+  release.liftProjectZeroTrustFence = () => liftPlatformProjectZeroTrustFenceConnection(client);
   release.requiredSafetyProtocols = await readRequiredPlatformSafetyProtocols(client);
   release.checkpoint = async (manifest) => {
     if (released) {
@@ -4016,14 +4076,6 @@ export async function preparePlatformSandboxDrainConnection(
     return {
       admissionProtocol: row.admission_protocol,
       generation: row.generation,
-      mirrorValue: JSON.stringify({
-        version: 1,
-        generation: row.generation,
-        state: row.state,
-        startedAt: row.started_at,
-        updatedAt: row.updated_at,
-        ...(row.completed_at ? { completedAt: row.completed_at } : {}),
-      }),
       state: row.state === 'complete' ? 'complete' : 'pending',
     };
   };
@@ -4329,13 +4381,14 @@ function platformWorkerUploaderHash(): string | null {
     return cachedPlatformUploaderHash;
   }
   try {
-    const launcher = resolveWranglerArgv(process.cwd())[1];
+    const launcher = resolveCloudflareOperationArgv(process.cwd())[1];
     if (!launcher) {
       return (cachedPlatformUploaderHash = null);
     }
     const digest = createHash('sha256');
     digest.update('platform-uploader:v1\0');
     digest.update(process.version);
+    digest.update(readFileSync(launcher));
     digest.update(readFileSync(resolve(dirname(launcher), '..', '..', 'package.json')));
     const cfDirectory = dirname(fileURLToPath(import.meta.resolve('cf/package.json')));
     digest.update(readFileSync(join(cfDirectory, 'package.json')));
@@ -4489,9 +4542,9 @@ function platformWorkerApiReadRunner(
   fallback: typeof runPlatformWrangler,
 ): typeof runPlatformWrangler {
   const base = `/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}`;
-  return async (args, account, cwd, capture) => {
+  return async (operation, account, cwd, capture) => {
     try {
-      if (args[0] === 'deployments' && (args[1] === 'status' || args[1] === 'list')) {
+      if (operation.type === 'deployments.status' || operation.type === 'deployments.list') {
         const response = await readCloudflare(`${base}/deployments`);
         const deployments =
           response && typeof response === 'object' && !Array.isArray(response)
@@ -4503,20 +4556,23 @@ function platformWorkerApiReadRunner(
           );
         }
         return {
-          status: args[1] === 'status' && deployments.length === 0 ? 1 : 0,
+          status: operation.type === 'deployments.status' && deployments.length === 0 ? 1 : 0,
           stderr: '',
-          stdout: JSON.stringify(args[1] === 'status' ? deployments[0] : deployments),
+          stdout: '',
+          data: operation.type === 'deployments.status' ? deployments[0] : deployments,
         };
       }
-      if (args[0] === 'versions' && args[1] === 'view' && args[2]) {
-        const version = await readCloudflare(`${base}/versions/${encodeURIComponent(args[2])}`);
-        return { status: 0, stderr: '', stdout: JSON.stringify(version) };
+      if (operation.type === 'versions.view') {
+        const version = await readCloudflare(
+          `${base}/versions/${encodeURIComponent(operation.versionId)}`,
+        );
+        return { status: 0, stderr: '', stdout: '', data: version };
       }
     } catch {
-      // An API read error is not evidence of ownership or deployment lineage.
-      // Run the established cf command for the same check.
+      // A failed read is not evidence of ownership or deployment lineage.
+      // Keep the same provider check through the scoped operation runner.
     }
-    return fallback(args, account, cwd, capture);
+    return fallback(operation, account, cwd, capture);
   };
 }
 
@@ -4778,30 +4834,24 @@ export async function deployPlatformWorker(
       };
       writeFileSync(configPath, `${JSON.stringify(uploadConfig, null, 2)}\n`, { mode: 0o600 });
     }
-    const argv = [
-      ...(options.workerExisted ? ['versions', 'upload'] : ['deploy']),
-      '--config',
+    const operation: CloudflareOperation = {
+      type: options.workerExisted ? 'versions.upload' : 'worker.deploy',
       configPath,
-      '--strict',
-      '--experimental-provision=false',
-      '--experimental-auto-create=false',
-      ...(!options.workerExisted ? ['--autoconfig=false'] : []),
-      '--message',
-      encodeCloudflareVersionMessage([], nextTriggers, uploadedContentHash ?? undefined),
-    ];
+      message: encodeCloudflareVersionMessage([], nextTriggers, uploadedContentHash ?? undefined),
+    };
     if (secrets) {
       const secretsPath = join(directory, 'secrets.json');
       writeFileSync(secretsPath, JSON.stringify(secrets), { mode: 0o600 });
-      argv.push('--secrets-file', secretsPath);
+      operation.secretsFilePath = secretsPath;
     }
     const releaseUploadSlot = await options.acquireUploadSlot?.();
     let uploaded: CloudflareCommandResult;
     let uploadError: unknown;
     try {
       uploaded = options.workerExisted
-        ? await options.runner(argv, accountId, directory, true)
+        ? await options.runner(operation, accountId, directory, true)
         : await runPlatformWranglerForConditionalCreate(
-            argv,
+            operation,
             accountId,
             directory,
             true,
@@ -4818,9 +4868,8 @@ export async function deployPlatformWorker(
     } finally {
       releaseUploadSlot?.(uploadError);
     }
-    uploadedVersionId = parseUploadedPlatformWorkerVersion(
-      `${uploaded.stdout}\n${uploaded.stderr}`,
-    );
+    const uploadData = uploaded.data as { versionId?: unknown } | undefined;
+    uploadedVersionId = typeof uploadData?.versionId === 'string' ? uploadData.versionId : null;
     if (!options.workerExisted) {
       activatedVersionId = uploadedVersionId;
     }
@@ -4849,16 +4898,12 @@ export async function deployPlatformWorker(
       }
       activatedVersionId = uploadedVersionId;
       const activated = await options.runner(
-        [
-          'versions',
-          'deploy',
-          `${uploadedVersionId}@100`,
-          '--config',
+        {
+          type: 'versions.deploy',
           configPath,
-          '--message',
-          `Void platform activation ${uploadedVersionId}`,
-          '--yes',
-        ],
+          versions: [{ versionId: uploadedVersionId, percentage: 100 }],
+          message: `Void platform activation ${uploadedVersionId}`,
+        },
         accountId,
         directory,
         true,
@@ -5199,22 +5244,22 @@ function platformWorkerCommandRunner(
   cwd: string,
   runner: typeof runPlatformWrangler,
 ): CloudflareCommandRunner {
-  return (args, options) => runner(args, accountId, cwd, options.capture);
+  return (operation, options) => runner(operation, accountId, cwd, options.capture);
 }
 
 export async function runPlatformWrangler(
-  args: ReadonlyArray<string>,
+  operation: CloudflareOperation,
   accountId: string,
   cwd: string,
   capture: boolean,
 ): Promise<CloudflareCommandResult> {
-  return runPlatformWranglerAtApiBase(args, accountId, cwd, capture);
+  return runPlatformWranglerAtApiBase(operation, accountId, cwd, capture);
 }
 
 const PLATFORM_WRANGLER_TIMEOUT_MS = 10 * 60 * 1000;
 
 async function runPlatformWranglerAtApiBase(
-  args: ReadonlyArray<string>,
+  operation: CloudflareOperation,
   accountId: string,
   cwd: string,
   capture: boolean,
@@ -5223,23 +5268,18 @@ async function runPlatformWranglerAtApiBase(
 ): Promise<CloudflareCommandResult> {
   const startedAt = performance.now();
   const runner = createDefaultRunWrangler(process.cwd(), {
-    launcher: resolveWranglerArgv(process.cwd()),
+    launcher: resolveCloudflareOperationArgv(process.cwd()),
     parallelWorkerUpload,
     timeoutMs: PLATFORM_WRANGLER_TIMEOUT_MS,
   });
-  const result = await runner([...args], {
+  const result = await runner(operation, {
     accountId,
     apiBaseUrl,
-    captureJson: capture,
     cwd,
   });
   if (process.env.VOID_PLATFORM_TIMINGS === '1') {
-    const operation =
-      args[0] === 'versions' || args[0] === 'deployments'
-        ? `${args[0]} ${args[1] ?? ''}`
-        : (args[0] ?? 'unknown');
     process.stderr.write(
-      `[platform timing] wrangler ${operation} ${(performance.now() - startedAt).toFixed(0)} ms\n`,
+      `[platform timing] Cloudflare ${operation.type} ${(performance.now() - startedAt).toFixed(0)} ms\n`,
     );
   }
   const stdout = result.stdout || '';
@@ -5254,11 +5294,7 @@ async function runPlatformWranglerAtApiBase(
       process.stderr.write(stderr);
     }
   }
-  return {
-    status: result.status,
-    stderr,
-    stdout,
-  };
+  return { ...result, stderr, stdout };
 }
 
 type ConditionalWorkerCreateState = {
@@ -5486,7 +5522,7 @@ export async function withConditionalPlatformWorkerCreate<T>(
 }
 
 async function runPlatformWranglerForConditionalCreate(
-  args: ReadonlyArray<string>,
+  operation: CloudflareOperation,
   accountId: string,
   cwd: string,
   capture: boolean,
@@ -5496,7 +5532,7 @@ async function runPlatformWranglerForConditionalCreate(
   return withConditionalPlatformWorkerCreate(
     accountId,
     workerName,
-    (apiBaseUrl) => runPlatformWranglerAtApiBase(args, accountId, cwd, capture, apiBaseUrl),
+    (apiBaseUrl) => runPlatformWranglerAtApiBase(operation, accountId, cwd, capture, apiBaseUrl),
     upstreamApiBaseUrl,
   );
 }
@@ -5508,7 +5544,7 @@ async function readActivePlatformWorkerVersion(
   runner: typeof runPlatformWrangler = runPlatformWrangler,
 ): Promise<string | null> {
   const result = await runner(
-    ['deployments', 'status', '--config', configPath, '--name', workerName, '--json'],
+    { type: 'deployments.status', configPath, workerName },
     accountId,
     process.cwd(),
     true,
@@ -5516,12 +5552,7 @@ async function readActivePlatformWorkerVersion(
   if (result.status !== 0) {
     assertCleanPlatformWrangler(result, `read active version for ${workerName}`);
   }
-  let value: unknown;
-  try {
-    value = JSON.parse(result.stdout);
-  } catch {
-    throw new Error(`platform: Wrangler returned malformed deployment status for ${workerName}.`);
-  }
+  const value = result.data;
   if (
     !value ||
     typeof value !== 'object' ||
@@ -5556,7 +5587,7 @@ export async function readPlatformWorkerDeployments(
   runner: typeof runPlatformWrangler = runPlatformWrangler,
 ): Promise<ReadonlyArray<PlatformWorkerDeployment>> {
   const result = await runner(
-    ['deployments', 'list', '--config', configPath, '--name', workerName, '--json'],
+    { type: 'deployments.list', configPath, workerName },
     accountId,
     process.cwd(),
     true,
@@ -5564,12 +5595,7 @@ export async function readPlatformWorkerDeployments(
   if (result.status !== 0) {
     assertCleanPlatformWrangler(result, `read deployment lineage for ${workerName}`);
   }
-  let value: unknown;
-  try {
-    value = JSON.parse(result.stdout);
-  } catch {
-    throw new Error(`platform: Wrangler returned malformed deployment history for ${workerName}.`);
-  }
+  const value = result.data;
   if (!Array.isArray(value)) {
     throw new Error(`platform: Wrangler returned malformed deployment history for ${workerName}.`);
   }
@@ -5677,16 +5703,15 @@ export async function restorePlatformWorkerDeployment(input: {
     );
   }
   const restored = await input.runner(
-    [
-      'versions',
-      'deploy',
-      ...restorationVersions.map((version) => `${version.versionId}@${version.percentage}`),
-      '--config',
-      input.configPath,
-      '--message',
-      `Void platform restoration ${input.restoration.id}`,
-      '--yes',
-    ],
+    {
+      type: 'versions.deploy',
+      configPath: input.configPath,
+      versions: restorationVersions.map((version) => ({
+        versionId: version.versionId,
+        percentage: version.percentage,
+      })),
+      message: `Void platform restoration ${input.restoration.id}`,
+    },
     input.accountId,
     input.directory,
     true,
@@ -5847,18 +5872,13 @@ async function readPlatformWorkerVersionSnapshot(
   validateCurrentVersion?: () => Promise<void>,
 ): Promise<Awaited<ReturnType<typeof readActivePlatformWorkerSnapshot>>> {
   const result = await runner(
-    ['versions', 'view', versionId, '--config', configPath, '--name', workerName, '--json'],
+    { type: 'versions.view', versionId, configPath, workerName },
     accountId,
     process.cwd(),
     true,
   );
   assertCleanPlatformWrangler(result, `read rollback metadata for ${workerName}`);
-  let value: unknown;
-  try {
-    value = JSON.parse(result.stdout);
-  } catch {
-    throw new Error(`platform: Wrangler returned malformed version metadata for ${workerName}.`);
-  }
+  const value = result.data;
   if (!value || typeof value !== 'object') {
     throw new Error(`platform: Wrangler returned malformed version metadata for ${workerName}.`);
   }
@@ -5928,12 +5948,8 @@ export function withoutCompletedPlatformWorkerMigrations(
   return result;
 }
 
-function parseUploadedPlatformWorkerVersion(output: string): string | null {
-  return /(?:Worker|Current) Version ID:\s*([0-9a-f]{8}-[0-9a-f-]{27})/i.exec(output)?.[1] ?? null;
-}
-
 function assertCleanPlatformWrangler(result: CloudflareCommandResult, operation: string): void {
-  if (result.status !== 0) {
+  if (result.status !== 0 || result.signal || result.error) {
     throw new Error(
       `platform: Wrangler failed to ${operation} (${result.stderr.trim() || `exit ${result.status}`}).`,
     );
@@ -6185,13 +6201,11 @@ function parseWorkerCutoverSnapshot(value: string): PlatformWorkerCutoverSnapsho
   }
 }
 
-function interruptedWorkerCutover(
-  manifest: PlatformInstallationManifest,
-): InterruptedWorkerCutover | null {
+function workerCutoverGenerations(manifest: PlatformInstallationManifest) {
   const generations = new Map<
     number,
     {
-      resolved: boolean;
+      resolution: 'committed' | 'restored' | null;
       staged: Map<
         PlatformWorkerKey,
         {
@@ -6209,11 +6223,11 @@ function interruptedWorkerCutover(
     if (resolution) {
       const generation = Number(resolution[1]);
       const entry = generations.get(generation) ?? {
-        resolved: false,
+        resolution: null,
         staged: new Map(),
         unsafeTraffic: new Set(),
       };
-      entry.resolved = true;
+      entry.resolution = resolution[2] as 'committed' | 'restored';
       generations.set(generation, entry);
       continue;
     }
@@ -6222,7 +6236,7 @@ function interruptedWorkerCutover(
     if (unsafeTraffic) {
       const generation = Number(unsafeTraffic[1]);
       const entry = generations.get(generation) ?? {
-        resolved: false,
+        resolution: null,
         staged: new Map(),
         unsafeTraffic: new Set(),
       };
@@ -6242,15 +6256,21 @@ function interruptedWorkerCutover(
       throw new Error(`platform: Invalid Worker cutover checkpoint ${step.key}.`);
     }
     const entry = generations.get(generation) ?? {
-      resolved: false,
+      resolution: null,
       staged: new Map(),
       unsafeTraffic: new Set(),
     };
     entry.staged.set(staged[2] as PlatformWorkerKey, snapshot);
     generations.set(generation, entry);
   }
-  const unresolved = [...generations.entries()]
-    .filter(([, entry]) => !entry.resolved && entry.staged.size > 0)
+  return generations;
+}
+
+function interruptedWorkerCutover(
+  manifest: PlatformInstallationManifest,
+): InterruptedWorkerCutover | null {
+  const unresolved = [...workerCutoverGenerations(manifest).entries()]
+    .filter(([, entry]) => entry.resolution === null && entry.staged.size > 0)
     .sort(([left], [right]) => right - left)[0];
   return unresolved
     ? {
@@ -6275,8 +6295,10 @@ export async function verifyPlatformWorkerCutoverVersions(
     'dispatch',
   ],
 ): Promise<void> {
-  const cutover = interruptedWorkerCutover(manifest);
-  if (cutover?.generation !== generation || cutover.staged.size !== workerKeys.length) {
+  // Shared email setup commits the retained Worker set before its provider
+  // mutations. Final verification must still inspect that exact generation.
+  const cutover = workerCutoverGenerations(manifest).get(generation);
+  if (!cutover || cutover.resolution === 'restored' || cutover.staged.size !== workerKeys.length) {
     throw new Error(
       `platform: Worker cutover generation ${generation} is missing a complete immutable-version checkpoint.`,
     );
@@ -6456,7 +6478,9 @@ export async function verifyPlatformHealth(
       redirect: 'manual',
       signal: AbortSignal.timeout(30_000),
     });
-  const dispatchUrl = dispatchOrigin ?? `https://test.${applicationBaseDomain}`;
+  // Project Zero Trust leaves only this application-domain hostname outside Access.
+  const dispatchUrl =
+    dispatchOrigin ?? `https://${PLATFORM_HEALTH_HOSTNAME_LABEL}.${applicationBaseDomain}`;
   const [health, discovery, proxy, dispatch, emailGateway] = await Promise.all([
     request(`${apiUrl}/health`),
     request(`${apiUrl}/.well-known/void-platform`),
@@ -6586,13 +6610,13 @@ export async function verifyPlatformSandboxDrain(
   return status.state === 'complete';
 }
 
-export async function bootstrapPlatformSharedEmail(
+export async function verifyPlatformDeploymentExecutionDrain(
   apiUrl: string,
   healthProbeToken: string,
+  installationId: string,
   fetcher: typeof fetch = fetch,
-): Promise<string> {
-  const response = await fetcher(`${apiUrl}/internal/platform/email-bootstrap`, {
-    method: 'POST',
+): Promise<void> {
+  const response = await fetcher(`${apiUrl}/__void/platform/deployment-execution`, {
     headers: {
       'X-Void-Platform-Probe': healthProbeToken,
       ...cfAccessHeaders(process.env, apiUrl),
@@ -6600,36 +6624,191 @@ export async function bootstrapPlatformSharedEmail(
     signal: AbortSignal.timeout(30_000),
     redirect: 'manual',
   });
+  if (!response.ok) {
+    throw new Error(
+      `platform: Deployment execution drain probe failed (HTTP ${response.status}). Keep the current runtime until its durable deployment operations have drained.`,
+    );
+  }
   let value: unknown;
   try {
     value = await response.json();
   } catch {
-    throw new Error(
-      `platform: Shared email bootstrap failed at ${apiUrl} (HTTP ${response.status}). Traffic remains disabled.`,
-    );
+    throw new Error('platform: Deployment execution drain probe returned an invalid document.');
   }
   const status =
-    value && typeof value === 'object' && !Array.isArray(value)
+    value !== null && typeof value === 'object' && !Array.isArray(value)
       ? (value as Record<string, unknown>)
       : null;
+  if (
+    status?.protocolVersion !== 1 ||
+    status.installationId !== installationId ||
+    typeof status.admissionClosed !== 'boolean' ||
+    !Number.isSafeInteger(status.pendingDeployments) ||
+    Number(status.pendingDeployments) < 0
+  ) {
+    throw new Error('platform: Deployment execution drain probe returned an invalid document.');
+  }
+  if (!status.admissionClosed || status.pendingDeployments !== 0) {
+    throw new Error(
+      'platform: Durable deployment operations are still admitted or unfinished. Keep the current runtime and retry this command after they finish.',
+    );
+  }
+}
+
+export async function bootstrapPlatformSharedEmail(
+  apiUrl: string,
+  healthProbeToken: string,
+  fetcher: typeof fetch = fetch,
+): Promise<string> {
+  // One bootstrap request drives several durable PostgreSQL/provider steps.
+  // A timeout does not cancel its recorded operation; replay the same endpoint
+  // so its idempotency key and step leases reconcile rather than repeat writes.
+  const deadline = Date.now() + 5 * 60_000;
+  let operationId: string | null = null;
+  const timedOut = () =>
+    new Error(
+      `platform: Shared email bootstrap did not finish within five minutes at ${apiUrl}.${operationId ? ` Operation ${operationId} remains incomplete.` : ''} Traffic remains disabled. Retry the installation's repair or resume command to reconcile the existing email operation.`,
+    );
+  const waitForProgress = async () => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw timedOut();
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(1_000, remaining)));
+  };
+  let response: Response;
+  let value: unknown;
+  let status: Record<string, unknown> | null;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw timedOut();
+    }
+    const signal = AbortSignal.timeout(Math.min(120_000, remaining));
+    try {
+      response = await fetcher(`${apiUrl}/internal/platform/email-bootstrap`, {
+        method: 'POST',
+        headers: {
+          'X-Void-Platform-Probe': healthProbeToken,
+          ...cfAccessHeaders(process.env, apiUrl),
+        },
+        signal,
+        redirect: 'manual',
+      });
+    } catch (error) {
+      if (signal.aborted || (error instanceof Error && error.name === 'TimeoutError')) {
+        await waitForProgress();
+        continue;
+      }
+      throw new Error(
+        `platform: Shared email bootstrap request failed at ${apiUrl}. Traffic remains disabled. Retry the installation's repair or resume command to reconcile the existing email operation.`,
+      );
+    }
+    try {
+      value = await response.json();
+    } catch (error) {
+      if (signal.aborted || (error instanceof Error && error.name === 'TimeoutError')) {
+        await waitForProgress();
+        continue;
+      }
+      throw new Error(
+        `platform: Shared email bootstrap failed at ${apiUrl} (HTTP ${response.status}). Traffic remains disabled.`,
+      );
+    }
+    status =
+      value && typeof value === 'object' && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : null;
+    const observedOperationId =
+      typeof status?.operationId === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(status.operationId)
+        ? status.operationId
+        : null;
+    if (status?.version === 1 && observedOperationId) {
+      if (operationId && operationId !== observedOperationId) {
+        throw new Error(
+          'platform: Shared email bootstrap operation identity changed while waiting. Traffic remains disabled. Inspect the installation before retrying.',
+        );
+      }
+      operationId = observedOperationId;
+    }
+    if (
+      [200, 202, 503].includes(response.status) &&
+      status?.version === 1 &&
+      status.state === 'incomplete' &&
+      observedOperationId &&
+      (status.operationStatus === 'pending' || status.operationStatus === 'running') &&
+      status.failureCode == null
+    ) {
+      await waitForProgress();
+      continue;
+    }
+    break;
+  }
   if (
     !response.ok ||
     status?.version !== 1 ||
     status.state !== 'ready' ||
-    typeof status.operationId !== 'string' ||
-    status.operationId.length === 0
+    operationId === null ||
+    status.operationId !== operationId ||
+    (status.operationStatus != null && status.operationStatus !== 'completed') ||
+    status.failureCode != null
   ) {
-    const detail =
-      status && typeof status.operationId === 'string'
-        ? ` Operation ${status.operationId}: ${typeof status.operationStatus === 'string' ? status.operationStatus : 'incomplete'}.`
-        : status && typeof status.operationStatus === 'string'
-          ? ` Operation status: ${status.operationStatus}.`
-          : '';
+    const code = (value: unknown) =>
+      typeof value === 'string' && /^[a-z][a-z0-9_-]{0,63}$/.test(value) ? value : null;
+    const operationStatus = code(status?.operationStatus);
+    const operationId =
+      typeof status?.operationId === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(status.operationId)
+        ? status.operationId
+        : null;
+    const details = operationId
+      ? [`Operation ${operationId}: ${operationStatus ?? 'incomplete'}.`]
+      : operationStatus
+        ? [`Operation status: ${operationStatus}.`]
+        : [];
+    const currentStep = code(status?.currentStep);
+    const failureCode = code(status?.failureCode);
+    if (currentStep) {
+      details.push(`Step: ${currentStep}.`);
+    }
+    if (failureCode) {
+      details.push(`Failure: ${failureCode}.`);
+    }
+    let domain: string | null = null;
+    if (typeof status?.domain === 'string') {
+      try {
+        domain = normalizeApplicationDomain(status.domain);
+      } catch {
+        // Provider bodies are not diagnostic authority; show only a valid domain.
+      }
+    }
+    const inboundStatus = code(status?.inboundStatus);
+    if (domain) {
+      details.push(`Domain: ${domain}${inboundStatus ? ` (inbound: ${inboundStatus})` : ''}.`);
+    }
+    const mxDetail = domain
+      ? `MX records for ${domain} do not route mail to Cloudflare Email Routing`
+      : null;
+    const safeDetails = [
+      ...(domain
+        ? [mxDetail, `enabled explicit Cloudflare email rules conflict with ${domain}`]
+        : []),
+      'zone catch-all does not point to this ingress',
+      'another enabled catch-all owns this zone',
+    ];
+    if (typeof status?.failureDetail === 'string' && safeDetails.includes(status.failureDetail)) {
+      details.push(`${status.failureDetail}.`);
+      if (currentStep === 'inbound_probe' && status.failureDetail === mxDetail) {
+        details.push(
+          `Enable Email Routing for ${domain} in the Cloudflare dashboard, then resume this installation.`,
+        );
+      }
+    }
+    const detail = details.length ? ` ${details.join(' ')}` : '';
     throw new Error(
       `platform: Shared email bootstrap did not reach inbound readiness at ${apiUrl} (HTTP ${response.status}).${detail} Traffic remains disabled.`,
     );
   }
-  return status.operationId;
+  return operationId;
 }
 
 export function createPlatformHealthProbeToken(ownershipNonce: string): string {

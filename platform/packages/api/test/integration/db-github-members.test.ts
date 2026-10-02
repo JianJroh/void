@@ -2,14 +2,9 @@ import { eq, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vite-plus/test';
 import { MEMBERSHIP_TTL_SECONDS } from '../../src/constants.ts';
 import {
-  clearGitHubInstallationOwnerForUser,
-  deleteGitHubInstallationMember,
   deleteGitHubInstallationMembers,
   deleteGitHubInstallationMembersByGithubAccount,
   getGitHubAccountIdForUser,
-  getGitHubInstallation,
-  getGitHubInstallationMembers,
-  getGitHubInstallationMembersByUser,
   getDbNowMs,
   getGitHubInstallationsByAccount,
   getInstallationRevocationAt,
@@ -26,7 +21,14 @@ import {
   githubInstallationRevocations,
   githubInstallations,
 } from '../../src/schema.ts';
-import { clearTables, createTestUser, setupEnv, teardownEnv, type TestEnv } from './helpers.ts';
+import {
+  getTestGitHubInstallationMembers,
+  clearTables,
+  createTestUser,
+  setupEnv,
+  teardownEnv,
+  type TestEnv,
+} from './helpers.ts';
 
 let env: TestEnv;
 
@@ -38,16 +40,7 @@ afterAll(async () => {
   await teardownEnv();
 });
 
-// `github_installation_members` FKs users (cascade) but `github_installations`
-// does not, so clear both BEFORE `clearTables` deletes users/projects.
-async function clearMemberTables(db: Db): Promise<void> {
-  await db.delete(githubInstallationMembers);
-  await db.delete(githubInstallationRevocations);
-  await db.delete(githubInstallations);
-}
-
 beforeEach(async () => {
-  await clearMemberTables(env.db);
   await clearTables(env.db);
 });
 
@@ -118,7 +111,7 @@ describe('github_installation_members', () => {
       new Date(first.expires_at).getTime(),
     );
 
-    const all = await getGitHubInstallationMembers(env.db, '100');
+    const all = await getTestGitHubInstallationMembers(env.db, '100');
     expect(all).toHaveLength(1);
   });
 
@@ -164,42 +157,7 @@ describe('github_installation_members', () => {
     expect(await hasActiveInstallationMembership(env.db, '200', user.id)).toBe(false);
   });
 
-  it('getGitHubInstallationMembersByUser scopes to the user across two installs', async () => {
-    const alice = await createTestUser(env.db, 'alice');
-    const bob = await createTestUser(env.db, 'bob', 'google', 'google-bob');
-    await seedInstall(env.db, '100');
-    await seedInstall(env.db, '200');
-
-    await upsertGitHubInstallationMember(env.db, {
-      installationId: '100',
-      userId: alice.id,
-      githubAccountId: null,
-      ttlSeconds: MEMBERSHIP_TTL_SECONDS,
-    });
-    await upsertGitHubInstallationMember(env.db, {
-      installationId: '200',
-      userId: alice.id,
-      githubAccountId: null,
-      ttlSeconds: MEMBERSHIP_TTL_SECONDS,
-    });
-    await upsertGitHubInstallationMember(env.db, {
-      installationId: '100',
-      userId: bob.id,
-      githubAccountId: null,
-      ttlSeconds: MEMBERSHIP_TTL_SECONDS,
-    });
-
-    const aliceRows = await getGitHubInstallationMembersByUser(env.db, alice.id);
-    expect(aliceRows).toHaveLength(2);
-    expect(aliceRows.every((r) => r.user_id === alice.id)).toBe(true);
-    expect(new Set(aliceRows.map((r) => r.installation_id))).toEqual(new Set(['100', '200']));
-
-    const bobRows = await getGitHubInstallationMembersByUser(env.db, bob.id);
-    expect(bobRows).toHaveLength(1);
-    expect(bobRows[0]!.installation_id).toBe('100');
-  });
-
-  it('getGitHubInstallationMembers scopes to one install', async () => {
+  it('getTestGitHubInstallationMembers scopes to one install', async () => {
     const alice = await createTestUser(env.db, 'alice');
     const bob = await createTestUser(env.db, 'bob', 'google', 'google-bob');
     await seedInstall(env.db, '100');
@@ -224,31 +182,10 @@ describe('github_installation_members', () => {
       ttlSeconds: MEMBERSHIP_TTL_SECONDS,
     });
 
-    const install100 = await getGitHubInstallationMembers(env.db, '100');
+    const install100 = await getTestGitHubInstallationMembers(env.db, '100');
     expect(install100).toHaveLength(2);
     expect(install100.every((r) => r.installation_id === '100')).toBe(true);
     expect(new Set(install100.map((r) => r.user_id))).toEqual(new Set([alice.id, bob.id]));
-  });
-
-  it('deleteGitHubInstallationMember removes one and is a silent no-op when absent', async () => {
-    const user = await createTestUser(env.db);
-    await seedInstall(env.db, '100');
-
-    await upsertGitHubInstallationMember(env.db, {
-      installationId: '100',
-      userId: user.id,
-      githubAccountId: null,
-      ttlSeconds: MEMBERSHIP_TTL_SECONDS,
-    });
-    expect(await hasActiveInstallationMembership(env.db, '100', user.id)).toBe(true);
-
-    await deleteGitHubInstallationMember(env.db, '100', user.id);
-    expect(await hasActiveInstallationMembership(env.db, '100', user.id)).toBe(false);
-
-    // No-op on an absent row (must not throw).
-    await deleteGitHubInstallationMember(env.db, '100', user.id);
-    await deleteGitHubInstallationMember(env.db, '999', user.id);
-    expect(await getGitHubInstallationMembers(env.db, '100')).toHaveLength(0);
   });
 
   it('deleteGitHubInstallationMembers bulk-deletes for (installIds, user) and no-ops on empty ids', async () => {
@@ -276,11 +213,19 @@ describe('github_installation_members', () => {
 
     // Empty ids: no-op (alice's rows all intact).
     await deleteGitHubInstallationMembers(env.db, [], alice.id);
-    expect(await getGitHubInstallationMembersByUser(env.db, alice.id)).toHaveLength(3);
+    expect(
+      await env.db
+        .select()
+        .from(githubInstallationMembers)
+        .where(eq(githubInstallationMembers.user_id, alice.id)),
+    ).toHaveLength(3);
 
     // Delete two of alice's three installs.
     await deleteGitHubInstallationMembers(env.db, ['100', '200'], alice.id);
-    const aliceLeft = await getGitHubInstallationMembersByUser(env.db, alice.id);
+    const aliceLeft = await env.db
+      .select()
+      .from(githubInstallationMembers)
+      .where(eq(githubInstallationMembers.user_id, alice.id));
     expect(aliceLeft).toHaveLength(1);
     expect(aliceLeft[0]!.installation_id).toBe('300');
 
@@ -360,21 +305,21 @@ describe('github_installation_members', () => {
 
     // Empty id list → no-op (never emits `WHERE ... IN ()`); nothing deleted.
     await deleteGitHubInstallationMembersByGithubAccount(env.db, [], 'X');
-    expect(await getGitHubInstallationMembers(env.db, '100')).toHaveLength(3);
+    expect(await getTestGitHubInstallationMembers(env.db, '100')).toHaveLength(3);
 
     // Scope to [100,200]: deletes ALL X-keyed rows on those installs (alice@100,
     // alice@200, bob@100), keyed by the github id regardless of bearer.
     await deleteGitHubInstallationMembersByGithubAccount(env.db, ['100', '200'], 'X');
 
     // Install 100: only Carol's Z-keyed row survives.
-    const m100 = await getGitHubInstallationMembers(env.db, '100');
+    const m100 = await getTestGitHubInstallationMembers(env.db, '100');
     expect(m100).toHaveLength(1);
     expect(m100[0]!.user_id).toBe(carol.id);
     expect(m100[0]!.github_account_id).toBe('Z');
     // Install 200: alice's X-keyed row is gone.
-    expect(await getGitHubInstallationMembers(env.db, '200')).toHaveLength(0);
+    expect(await getTestGitHubInstallationMembers(env.db, '200')).toHaveLength(0);
     // Install 300: bob's NULL-proof row was out of scope AND not X-keyed → survives.
-    const m300 = await getGitHubInstallationMembers(env.db, '300');
+    const m300 = await getTestGitHubInstallationMembers(env.db, '300');
     expect(m300).toHaveLength(1);
     expect(m300[0]!.user_id).toBe(bob.id);
   });
@@ -392,17 +337,16 @@ describe('github_installation_members', () => {
   });
 });
 
-// Seed an installation with an explicit account (id + type) and optional owner.
+// Seed an unowned installation with an explicit account (id + type).
 async function seedInstallForAccount(
   db: Db,
   installationId: string,
   accountId: string,
   accountType: 'User' | 'Organization',
-  userId: string | null = null,
 ): Promise<void> {
   await upsertGitHubInstallation(db, {
     installationId,
-    userId,
+    userId: null,
     accountLogin: `acct-${installationId}`,
     accountId,
     accountType,
@@ -411,7 +355,7 @@ async function seedInstallForAccount(
   });
 }
 
-describe('github_installations account queries + guarded owner clear', () => {
+describe('github_installations account queries', () => {
   it('getGitHubInstallationsByAccount scopes by BOTH account_id and account_type', async () => {
     // Two ORG1 org installs, one ORG2 org install, one ORG1 *User* install.
     await seedInstallForAccount(env.db, '100', 'ORG1', 'Organization');
@@ -435,47 +379,6 @@ describe('github_installations account queries + guarded owner clear', () => {
     expect(await getGitHubInstallationsByAccount(env.db, 'ORG_NONE', 'Organization')).toEqual([]);
     // Right account, wrong type → still empty (type filter bites).
     expect(await getGitHubInstallationsByAccount(env.db, 'ORG1', 'User')).toEqual([]);
-  });
-
-  it('clearGitHubInstallationOwnerForUser clears only caller-owned installs in the id list', async () => {
-    const alice = await createTestUser(env.db, 'alice');
-    const bob = await createTestUser(env.db, 'bob', 'google', 'google-bob');
-
-    // alice owns 100, 200, 400; bob owns 300. All under ORG1 for realism.
-    await seedInstallForAccount(env.db, '100', 'ORG1', 'Organization', alice.id);
-    await seedInstallForAccount(env.db, '200', 'ORG1', 'Organization', alice.id);
-    await seedInstallForAccount(env.db, '300', 'ORG1', 'Organization', bob.id);
-    await seedInstallForAccount(env.db, '400', 'ORG1', 'Organization', alice.id);
-
-    // Clear over [100, 200, 300] as alice: 300 is bob's (guard), 400 not listed.
-    const cleared = await clearGitHubInstallationOwnerForUser(
-      env.db,
-      ['100', '200', '300'],
-      alice.id,
-    );
-
-    // Driver-count correctness: return value equals the rows actually cleared
-    // (exactly 100 & 200). Reading the wrong rowCount/affectedRows field would
-    // surface as 0/undefined here under the PGlite test driver.
-    expect(cleared).toBe(2);
-
-    expect((await getGitHubInstallation(env.db, '100'))!.user_id).toBeNull();
-    expect((await getGitHubInstallation(env.db, '200'))!.user_id).toBeNull();
-    // 300 owned by bob — guard (`user_id = alice`) held, not clobbered.
-    expect((await getGitHubInstallation(env.db, '300'))!.user_id).toBe(bob.id);
-    // 400 owned by alice but not in the id list — untouched.
-    expect((await getGitHubInstallation(env.db, '400'))!.user_id).toBe(alice.id);
-  });
-
-  it('clearGitHubInstallationOwnerForUser no-ops (returns 0) on an empty id list', async () => {
-    const alice = await createTestUser(env.db, 'alice');
-    await seedInstallForAccount(env.db, '100', 'ORG1', 'Organization', alice.id);
-
-    const cleared = await clearGitHubInstallationOwnerForUser(env.db, [], alice.id);
-
-    expect(cleared).toBe(0);
-    // No install altered.
-    expect((await getGitHubInstallation(env.db, '100'))!.user_id).toBe(alice.id);
   });
 });
 

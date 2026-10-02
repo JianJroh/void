@@ -84,9 +84,24 @@ function isPagesRequest(c: CloudContext): boolean {
 function pageResponseHeaders(c: CloudContext, headers: Record<string, string>): Headers {
   const out = new Headers(c.res.headers);
   for (const [key, value] of Object.entries(headers)) {
-    out.set(key, value);
+    if (key.toLowerCase() === 'vary') {
+      appendVary(out, value);
+    } else {
+      out.set(key, value);
+    }
   }
   return out;
+}
+
+function appendVary(headers: Headers, name: string): void {
+  const existing =
+    headers
+      .get('Vary')
+      ?.split(',')
+      .map((value) => value.trim().toLowerCase()) ?? [];
+  if (!existing.includes('*') && !existing.includes(name.toLowerCase())) {
+    headers.append('Vary', name);
+  }
 }
 
 function escapeHtmlAttr(value: string): string {
@@ -474,7 +489,9 @@ export async function handlePageGet(
     }
     // Stream NDJSON: first line is PageObject, subsequent lines are deferred groups
     c.header('X-VoidPages', 'true');
-    c.header('Vary', 'X-VoidPages');
+    const headers = new Headers(c.res.headers);
+    appendVary(headers, 'X-VoidPages');
+    c.header('Vary', headers.get('Vary')!);
     return streamDeferredResponse(
       JSON.stringify(pageObj) + '\n',
       deferredMap,
@@ -509,7 +526,29 @@ export async function handlePageGet(
   );
 }
 
-/** Handle POST/PUT/DELETE page request — run mutation, then re-run GET or redirect */
+function isSameOriginAction(request: Request): boolean {
+  const origin = new URL(request.url).origin;
+  const suppliedOrigin = request.headers.get('Origin');
+  if (suppliedOrigin !== null) {
+    return suppliedOrigin === origin;
+  }
+  const site = request.headers.get('Sec-Fetch-Site');
+  if (site && site !== 'same-origin' && site !== 'none') {
+    return false;
+  }
+  const referer = request.headers.get('Referer');
+  if (referer !== null) {
+    try {
+      return new URL(referer).origin === origin;
+    } catch {
+      return false;
+    }
+  }
+  // Non-browser clients may omit browser-controlled origin metadata entirely.
+  return true;
+}
+
+/** Handle POST/PUT/PATCH/DELETE page request — run mutation, then re-run GET or redirect */
 export async function handlePageMutation(
   mutationHandler: PageHandler,
   getHandler: PageHandler,
@@ -521,6 +560,9 @@ export async function handlePageMutation(
   configHead?: HeadConfig,
   options?: PageRenderOptions,
 ): Promise<Response> {
+  if (!isSameOriginAction(c.req.raw)) {
+    return new Response('Cross-origin page actions are not allowed.', { status: 403 });
+  }
   const renderMode = options?.renderMode ?? 'server';
   const shared = (c.get('shared') as Record<string, unknown> | undefined) ?? {};
   const middlewareHead = c.get('headDefaults') as HeadDescriptor | undefined;

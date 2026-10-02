@@ -4,24 +4,27 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { PlatformInstallationManifest } from '@void/platform';
+import type { CloudflareOperation } from '@void/deploy-cloudflare';
+import { PLATFORM_DISABLED_KEY, type PlatformInstallationManifest } from '@void/platform';
 import { afterEach, beforeEach, expect, it, vi } from 'vite-plus/test';
 import { hyperdriveOriginFromConnectionString } from '../../src/cli/platform-cloudflare.ts';
 import {
   createPlatformInstallationSecrets,
   installPlatform,
+  verifyPlatformWorkerCutoverVersions,
+  type PlatformInstallerDependencies,
 } from '../../src/cli/platform-installer.ts';
 import { createPlatformInstallPlan } from '../../src/cli/platform-plan.ts';
 import { listInstallationManifests } from '../../src/cli/platform-registry.ts';
 import type { RunWrangler } from '../../src/cli/provision.ts';
 
 // Runs the real Worker deploy, cutover checkpoint, and pre-traffic verification
-// against a stateful in-memory Cloudflare account. Only the Wrangler process is
+// against a stateful in-memory Cloudflare account. Only the provider process is
 // replaced; the guarded create still goes through the conditional-create proxy.
 const wrangler = vi.hoisted(() => ({ run: null as RunWrangler | null }));
 vi.mock('../../src/cli/provision.ts', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/cli/provision.ts')>()),
-  createDefaultRunWrangler: () => (args: Array<string>, opts: Parameters<RunWrangler>[1]) =>
+  createDefaultRunWrangler: () => (args: CloudflareOperation, opts: Parameters<RunWrangler>[1]) =>
     wrangler.run!(args, opts),
 }));
 
@@ -84,30 +87,27 @@ async function createFakeCloudflare() {
   const kv = new Map<string, string>();
   const r2 = new Map<string, string>();
   const named = new Map<string, Map<string, string>>();
-  const commands: Array<{ args: Array<string>; worker: string | null }> = [];
+  const commands: Array<{ args: CloudflareOperation; worker: string | null }> = [];
   let clock = Date.parse('2026-10-01T00:00:00.000Z');
   let failBlockedCreate: string | null = null;
   let failUpload: string | null = null;
 
-  const flag = (args: Array<string>, ...names: Array<string>) => {
-    const index = args.findIndex((arg) => names.includes(arg));
-    return index === -1 ? undefined : args[index + 1];
+  const configOf = (operation: CloudflareOperation): Record<string, unknown> | null => {
+    return operation.configPath ? JSON.parse(readFileSync(operation.configPath, 'utf8')) : null;
   };
-  const configOf = (args: Array<string>): Record<string, unknown> | null => {
-    const path = flag(args, '--config', '-c');
-    return path ? (JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>) : null;
-  };
-  const workerOf = (args: Array<string>) =>
-    flag(args, '--name') ?? (configOf(args)?.name as string | undefined) ?? null;
-  const ok = (stdout = '') => ({ status: 0, stderr: '', stdout });
+  const workerOf = (operation: CloudflareOperation) =>
+    ('workerName' in operation ? operation.workerName : undefined) ??
+    (configOf(operation)?.name as string | undefined) ??
+    null;
+  const ok = (data?: unknown) => ({ status: 0, stderr: '', stdout: '', data });
   const failed = (stderr: string) => ({ status: 1, stderr, stdout: '' });
-  const storeVersion = (name: string, args: Array<string>): FakeVersion => {
-    const config = configOf(args)!;
+  const storeVersion = (name: string, operation: CloudflareOperation): FakeVersion => {
+    const config = configOf(operation)!;
     const vars = (config.vars ?? {}) as Record<string, string>;
     const migrations = Array.isArray(config.migrations) ? config.migrations : [];
     const tag = (migrations.at(-1) as { tag?: string } | undefined)?.tag;
     const version: FakeVersion = {
-      annotations: { 'workers/message': flag(args, '--message') ?? '' },
+      annotations: { 'workers/message': 'message' in operation ? (operation.message ?? '') : '' },
       id: randomUUID(),
       resources: {
         bindings: [
@@ -136,8 +136,7 @@ async function createFakeCloudflare() {
   wrangler.run = async (args, opts) => {
     const worker = workerOf(args);
     commands.push({ args, worker });
-    const command = `${args[0]} ${args[1] ?? ''}`.trim();
-    if (args[0] === 'deploy') {
+    if (args.type === 'worker.deploy') {
       const base = `${opts.apiBaseUrl}/accounts/${opts.accountId}/workers/scripts/${worker}`;
       if (failBlockedCreate === worker) {
         failBlockedCreate = null;
@@ -150,45 +149,44 @@ async function createFakeCloudflare() {
       }
       const version = storeVersion(worker!, args);
       activate(worker!, version.id);
-      return ok(`Uploaded ${worker}\nCurrent Version ID: ${version.id}`);
+      return ok({ versionId: version.id });
     }
-    if (command === 'versions upload') {
+    if (args.type === 'versions.upload') {
       if (failUpload === worker) {
         failUpload = null;
         return failed('upload failed');
       }
       const version = storeVersion(worker!, args);
-      return ok(`Worker Version ID: ${version.id}`);
+      return ok({ versionId: version.id });
     }
-    if (command === 'versions deploy') {
-      const targets = args.slice(2).filter((arg) => /@\d+$/.test(arg));
+    if (args.type === 'versions.deploy') {
       const entry = workers.get(worker!)!;
       entry.deployments.unshift({
         created_on: new Date((clock += 1000)).toISOString(),
         id: randomUUID(),
-        versions: targets.map((target) => {
-          const [versionId, percentage] = target.split('@');
-          return { percentage: Number(percentage), version_id: versionId! };
-        }),
+        versions: args.versions.map((target) => ({
+          percentage: target.percentage,
+          version_id: target.versionId,
+        })),
       });
       return ok();
     }
-    if (command === 'deployments list') {
+    if (args.type === 'deployments.list') {
       const entry = workers.get(worker!);
-      return entry ? ok(JSON.stringify(entry.deployments)) : failed('Worker not found');
+      return entry ? ok(entry.deployments) : failed('Worker not found');
     }
-    if (command === 'deployments status') {
+    if (args.type === 'deployments.status') {
       const latest = workers.get(worker!)?.deployments[0];
-      return latest ? ok(JSON.stringify({ versions: latest.versions })) : failed('not found');
+      return latest ? ok({ versions: latest.versions }) : failed('not found');
     }
-    if (command === 'versions view') {
-      const version = workers.get(worker!)?.versions.get(args[2]!);
-      return version ? ok(JSON.stringify(version)) : failed('version not found');
+    if (args.type === 'versions.view') {
+      const version = workers.get(worker!)?.versions.get(args.versionId);
+      return version ? ok(version) : failed('version not found');
     }
-    if (command === 'triggers deploy') {
+    if (args.type === 'triggers.deploy') {
       return ok();
     }
-    throw new Error(`Unexpected Wrangler command: ${args.join(' ')}`);
+    throw new Error(`Unexpected Cloudflare operation: ${args.type}`);
   };
 
   const create =
@@ -297,17 +295,25 @@ async function createFakeCloudflare() {
     },
     kv,
     planningClient,
+    replaceActiveVersion: (name: string) => {
+      const worker = workers.get(name)!;
+      const active = worker.versions.get(worker.deployments[0]!.versions[0]!.version_id)!;
+      const replacement = { ...structuredClone(active), id: randomUUID() };
+      worker.versions.set(replacement.id, replacement);
+      activate(name, replacement.id);
+    },
   };
 }
 
 const DATABASE_URL = 'postgres://user:password@db.example.com/testing';
 
-function installationSecrets() {
+function installationSecrets(sharedEmail = false) {
   return createPlatformInstallationSecrets({
     bootstrapGitHubId: '583231',
     bootstrapGitHubLogin: 'octocat',
     cloudflareApiToken: 'test-token',
     databaseUrl: DATABASE_URL,
+    emailEnabled: sharedEmail,
     githubClientId: 'id',
     githubClientSecret: 'secret',
     jwtSecret: TEST_PLATFORM_JWT_SECRET,
@@ -320,6 +326,7 @@ function installationSecrets() {
 function planInstallation(
   cloud: Awaited<ReturnType<typeof createFakeCloudflare>>,
   existing: PlatformInstallationManifest | null,
+  sharedEmail = false,
 ) {
   return createPlatformInstallPlan(
     cloud.planningClient,
@@ -329,6 +336,9 @@ function planInstallation(
       controlPlaneDomain: '',
       dedicatedZone: false,
       displayName: 'Testing',
+      ...(sharedEmail
+        ? { emailSenderDomain: 'mail.example.com', emailSharedZoneId: 'email-zone' }
+        : {}),
       installationSlug: 'testing',
       workersDev: true,
       zoneName: '',
@@ -340,22 +350,18 @@ function planInstallation(
 async function runInstall(
   cloud: Awaited<ReturnType<typeof createFakeCloudflare>>,
   existing: PlatformInstallationManifest | null,
+  options: {
+    sharedEmail?: boolean;
+    bootstrapEmail?: PlatformInstallerDependencies['bootstrapEmail'];
+  } = {},
 ) {
-  const plan = await planInstallation(cloud, existing);
-  return installPlatform(plan, installationSecrets(), existing, {
+  const plan = await planInstallation(cloud, existing, options.sharedEmail);
+  return installPlatform(plan, installationSecrets(options.sharedEmail), existing, {
     acquireDatabaseLifecycleLock: async () =>
       Object.assign(async () => {}, {
         prepareSandboxDrain: async () => ({
           admissionProtocol: 3 as const,
           generation: 'generation-1',
-          mirrorValue: JSON.stringify({
-            completedAt: '2026-10-01T00:00:00.000Z',
-            generation: 'generation-1',
-            startedAt: '2026-10-01T00:00:00.000Z',
-            state: 'complete',
-            updatedAt: '2026-10-01T00:00:00.000Z',
-            version: 1,
-          }),
           state: 'complete' as const,
         }),
       }),
@@ -364,6 +370,7 @@ async function runInstall(
     migrateDatabase: async () => {},
     revalidateBeforeWorkerDeploy: async () => {},
     verifyHealth: async () => {},
+    ...(options.bootstrapEmail ? { bootstrapEmail: options.bootstrapEmail } : {}),
   });
 }
 
@@ -399,9 +406,9 @@ it('stages a fresh immutable version of every Worker before enabling a fresh ins
   expect(
     cloud.commands
       .filter((command) => command.worker === tail)
-      .map((command) => command.args.slice(0, 2).join(' '))
-      .filter((command) => command.startsWith('deploy ') || command === 'versions upload'),
-  ).toEqual(['deploy --config', 'versions upload']);
+      .map((command) => command.args.type)
+      .filter((command) => command === 'worker.deploy' || command === 'versions.upload'),
+  ).toEqual(['worker.deploy', 'versions.upload']);
 });
 
 it('enables traffic when resuming after the first Worker create was refused', async () => {
@@ -444,4 +451,84 @@ it('retries a restored enabling generation with every Worker restaged', async ()
   expect(stagedKeys(retried.manifest, 3)).not.toContain('tail');
   expect(stagedKeys(retried.manifest, 4)).toEqual([...WORKER_KEYS].sort());
   expect(workerStepKeys(retried.manifest)).toContain('worker-cutover:4:committed');
+});
+
+it('rechecks the committed immutable versions after shared email routing is prepared', async () => {
+  const cloud = await createFakeCloudflare();
+  const bootstrapEmail = vi.fn(async () => {
+    expect(workerStepKeys(currentManifest())).toContain('worker-cutover:2:committed');
+    return 'email-operation';
+  });
+
+  const result = await runInstall(cloud, null, { sharedEmail: true, bootstrapEmail });
+
+  expect(result.manifest.status).toBe('installed');
+  expect(bootstrapEmail).toHaveBeenCalledOnce();
+  expect(stagedKeys(result.manifest, 2)).toEqual([...WORKER_KEYS].sort());
+  const routing = result.manifest.resources.find((resource) => resource.key === 'routing-kv')!;
+  expect(cloud.kv.has(`${routing.id}/${PLATFORM_DISABLED_KEY}`)).toBe(false);
+});
+
+it('rejects a concurrent version replacement after shared email commits the Worker generation', async () => {
+  const cloud = await createFakeCloudflare();
+  const plan = await planInstallation(cloud, null, true);
+  const bootstrapEmail = async () => {
+    cloud.replaceActiveVersion(plan.deployment.resources.apiWorker);
+    return 'email-operation';
+  };
+
+  await expect(runInstall(cloud, null, { sharedEmail: true, bootstrapEmail })).rejects.toThrow(
+    'changed concurrently from staged version',
+  );
+
+  const failed = currentManifest();
+  expect(failed.status).toBe('failed');
+  expect(workerStepKeys(failed)).toContain('worker-cutover:2:committed');
+  expect(workerStepKeys(failed)).not.toContain('worker-cutover:2:restored');
+  const routing = failed.resources.find((resource) => resource.key === 'routing-kv')!;
+  expect(cloud.kv.has(`${routing.id}/${PLATFORM_DISABLED_KEY}`)).toBe(true);
+});
+
+it('resumes a shared email failure with a fresh verified immutable generation', async () => {
+  const cloud = await createFakeCloudflare();
+  const bootstrapEmail = vi
+    .fn()
+    .mockRejectedValueOnce(new Error('mail unavailable'))
+    .mockResolvedValue('email-operation');
+  await expect(runInstall(cloud, null, { sharedEmail: true, bootstrapEmail })).rejects.toThrow(
+    'mail unavailable',
+  );
+  const failed = currentManifest();
+  expect(workerStepKeys(failed)).toContain('worker-cutover:2:committed');
+
+  const result = await runInstall(cloud, failed, { sharedEmail: true, bootstrapEmail });
+
+  expect(result.manifest.status).toBe('installed');
+  expect(bootstrapEmail).toHaveBeenCalledTimes(2);
+  expect(stagedKeys(result.manifest, 4)).toEqual([...WORKER_KEYS].sort());
+  expect(workerStepKeys(result.manifest)).toContain('worker-cutover:4:committed');
+});
+
+it('does not use a restored generation as authority to enable traffic', async () => {
+  const cloud = await createFakeCloudflare();
+  const result = await runInstall(cloud, null);
+  const restored = {
+    ...result.manifest,
+    steps: result.manifest.steps.map((step) =>
+      step.key === 'worker-cutover:2:committed'
+        ? { ...step, key: 'worker-cutover:2:restored', resultHash: 'restored' }
+        : step,
+    ),
+  };
+  const runner = vi.fn();
+  await expect(
+    verifyPlatformWorkerCutoverVersions(
+      restored,
+      2,
+      {} as Parameters<typeof verifyPlatformWorkerCutoverVersions>[2],
+      'account',
+      runner,
+    ),
+  ).rejects.toThrow('missing a complete immutable-version checkpoint');
+  expect(runner).not.toHaveBeenCalled();
 });

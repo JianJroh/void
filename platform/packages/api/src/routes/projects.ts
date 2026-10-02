@@ -1,3 +1,6 @@
+import { tokenizeSql } from '@void/deploy-core';
+import type { ProjectZeroTrustRouting } from '@void/edge';
+import { PLATFORM_HEALTH_HOSTNAME_LABEL } from '@void/platform';
 import { sql as drizzleSql } from 'drizzle-orm';
 import { Hono, type Context } from 'hono';
 import { deployTokenTtlSecondsForBuildMinutes, signPrerenderToken } from '../auth/deploy-token.ts';
@@ -33,6 +36,7 @@ import {
   deleteRollbackLease,
   updateRollbackLeaseState,
   cancelDeployment,
+  getPendingDeploymentOperation,
   setActiveDeployment,
   updateProjectType,
   appendAppliedMigrations,
@@ -54,8 +58,10 @@ import { type ApiEnv, isDevBypass } from '../env.ts';
 import { validateSubmittedExecutionPlans } from '../migrations/execution-plan.ts';
 import { ensureTrackingTable, queryD1, runRemoteMigrations } from '../migrations/remote-runner.ts';
 import { getProjectDeploymentWorkerName, getProjectQueueName } from '../naming.ts';
+import { resolvePlan, resolvePlanLimits } from '../plans.ts';
 import { PROJECT_PERMISSION_MESSAGES } from '../project-access.ts';
 import { encryptProjectSecret, decryptProjectSecret } from '../project-secrets.ts';
+import { ProjectRequiresNormalizationError, requireNormalizedProject } from '../project-state.ts';
 import {
   CloudflareApiError,
   InvalidHyperdriveConnectionStringError,
@@ -81,9 +87,15 @@ import {
   computeDispatchLimits,
   resolveRoutingUndo,
 } from '../routing.ts';
-import { tokenizeSql } from '../sql/tokenize.ts';
-import { getPlanLimits } from '../tiers.ts';
 import type { Build, DeployManifest, Project, ProjectRole, User } from '../types.ts';
+import { zeroTrustNotReadyMessage } from '../zero-trust/errors.ts';
+import { initializeNewProjectZeroTrust } from '../zero-trust/project.ts';
+import {
+  resolveProjectZeroTrustRouting,
+  resolveProjectZeroTrustRoutingForPublication,
+  withProjectZeroTrustRouting,
+} from '../zero-trust/routing.ts';
+import { publicProjectZeroTrustState } from '../zero-trust/state.ts';
 import { rollbackCfDestination } from './email.ts';
 import { requireProjectRouteCapability } from './project-access.ts';
 import { getRequestsDataset, queryProjectRequestOverview } from './usage.ts';
@@ -91,7 +103,8 @@ import { getRequestsDataset, queryProjectRequestOverview } from './usage.ts';
 /**
  * Slugs no project may claim. Two overlapping reasons:
  *
- *  - hostname collisions on `*.void.app` (`www`, `api`, `dash`, `cname`, …);
+ *  - hostname collisions on `*.void.app` (`www`, `api`, `dash`, `cname`, …),
+ *    including the hostname dispatch keeps for platform health probes;
  *  - EMAIL sender identity: `EMAIL_RESERVED_SLUGS` (`../reserved-slugs.ts`).
  *    A project's outbound `from` is `<slug>[+tag]@<EMAIL_SENDER_DOMAIN>`,
  *    so owning a slug owns that mailbox, and a user registering `noreply`
@@ -102,6 +115,7 @@ import { getRequestsDataset, queryProjectRequestOverview } from './usage.ts';
  */
 export const RESERVED_SLUGS = new Set([
   ...EMAIL_RESERVED_SLUGS,
+  PLATFORM_HEALTH_HOSTNAME_LABEL,
   'admin',
   'api',
   'app',
@@ -710,11 +724,11 @@ const app = new Hono<ApiEnv>()
       return context.json({ error: 'this name is reserved' }, 400);
     }
 
-    // Short slugs (5 chars or fewer) are reserved for paid plans
+    // Preserve short-slug eligibility when an administrator copies or renames a plan.
     if (body.slug.length <= 5) {
-      if (context.get('user').plan === 'free') {
+      if (!(await resolvePlan(context.get('db'), context.get('user').plan)).allowShortSlugs) {
         return context.json(
-          { error: 'short slugs (5 characters or fewer) require a paid plan' },
+          { error: 'the selected plan does not permit short slugs (5 characters or fewer)' },
           403,
         );
       }
@@ -729,6 +743,18 @@ const app = new Hono<ApiEnv>()
     const userId = context.get('user').id;
     try {
       const project = await createProject(context.get('db'), userId, body.slug);
+      let zeroTrust: Awaited<ReturnType<typeof initializeNewProjectZeroTrust>> = null;
+      let zeroTrustWarning: string | undefined;
+      try {
+        zeroTrust = await initializeNewProjectZeroTrust(context.env, context.get('db'), project.id);
+      } catch (error) {
+        zeroTrustWarning =
+          'Project created, but its Zero Trust protection is not set up yet, so deploys will wait. Void retries within an hour. To retry now, a project owner or admin can run `void project zero-trust reconcile`; if that reports the platform is not ready, ask a platform administrator.';
+        console.error('[zero-trust] new project initialization failed', {
+          projectId: project.id,
+          error,
+        });
+      }
       // Pre-seed the owner's own address as a destination so mail to
       // themselves works from the first deploy. CF sends them a verification
       // link; the row stays `pending` until they click it.
@@ -768,9 +794,24 @@ const app = new Hono<ApiEnv>()
         // which has not run yet. The CLI prints this so the verification
         // email that may follow is explained; `void email destinations`
         // shows the outcome.
-        return context.json({ ...project, owner_email_destination: { address } }, 201);
+        return context.json(
+          {
+            ...project,
+            owner_email_destination: { address },
+            ...(zeroTrust ? { zero_trust: publicProjectZeroTrustState(zeroTrust) } : {}),
+            ...(zeroTrustWarning ? { warnings: [zeroTrustWarning] } : {}),
+          },
+          201,
+        );
       }
-      return context.json(projectWithUrl(project, context.env), 201);
+      return context.json(
+        {
+          ...projectWithUrl(project, context.env),
+          ...(zeroTrust ? { zero_trust: publicProjectZeroTrustState(zeroTrust) } : {}),
+          ...(zeroTrustWarning ? { warnings: [zeroTrustWarning] } : {}),
+        },
+        201,
+      );
     } catch (err) {
       // Unique constraint violation — slug was taken between check and insert
       if (
@@ -812,8 +853,23 @@ const app = new Hono<ApiEnv>()
     const user = context.get('user');
     const deployBuild = context.get('deployBuild');
     const deployCredential = context.get('deployCredential');
-    const signToken = (buildId?: string) =>
-      signPrerenderToken(
+    const signToken = (buildId?: string) => {
+      const maximumTtl = deployTokenTtlSecondsForBuildMinutes(0);
+      const expiry = context.get('deployTokenExpiresAt');
+      const ttlSeconds =
+        buildId && expiry !== undefined
+          ? Math.min(maximumTtl, Math.floor(expiry - Date.now() / 1000))
+          : maximumTtl;
+      if (ttlSeconds <= 0) {
+        return context.json(
+          {
+            error: 'deploy token expired before prerendering',
+            message: 'Start a new build to obtain a valid deployment credential.',
+          },
+          401,
+        );
+      }
+      return signPrerenderToken(
         {
           projectId: project.id,
           userId: user.id,
@@ -823,17 +879,13 @@ const app = new Hono<ApiEnv>()
         },
         context.env.JWT_SECRET,
         {
-          // A manual CLI prerender can legitimately run longer than five
-          // minutes because path discovery and rendering are sequential. It
-          // has no build row whose plan timeout can size the token, so give it
-          // the same bounded 65-minute ceiling as an unlimited build. This
-          // remains a proxy-only, single-project credential and avoids
-          // restoring the caller's broad platform token inside Miniflare.
-          ttlSeconds: deployTokenTtlSecondsForBuildMinutes(
-            buildId ? getPlanLimits(access.owner.plan).buildTimeoutMinutes : 0,
-          ),
+          // Managed builds retain the deadline admitted by their scoped token,
+          // even if their account's plan changes while they are running. Manual
+          // prerenders use the existing bounded 65-minute ceiling.
+          ttlSeconds,
         },
       );
+    };
 
     let token: string;
     if (deployBuild) {
@@ -882,7 +934,11 @@ const app = new Hono<ApiEnv>()
       }
       token = minted;
     } else {
-      token = await signToken();
+      const minted = await signToken();
+      if (minted instanceof Response) {
+        return minted;
+      }
+      token = minted;
     }
     return context.json({ token });
   })
@@ -1010,7 +1066,7 @@ const app = new Hono<ApiEnv>()
     // we restore KV, cron, and queue state from the callback's undo log.
     let rollbackLeaseId: string | undefined;
     const rollbackOwnerId = crypto.randomUUID();
-    const externalUndo: Array<() => Promise<void>> = [];
+    const externalUndo: Array<(zeroTrust: ProjectZeroTrustRouting | null) => Promise<void>> = [];
     const routingValuesWritten = new Map<string, string | null>();
     let externalCompensated = false;
     let rollbackCommitted = false;
@@ -1062,6 +1118,18 @@ const app = new Hono<ApiEnv>()
         const lockedProject = lockedAccess.project;
         if (lockedProject.status === 'deleting') {
           throw new RollbackError(409, 'project is being deleted');
+        }
+        try {
+          await requireNormalizedProject(txDb, lockedProject);
+        } catch (error) {
+          if (error instanceof ProjectRequiresNormalizationError) {
+            throw new RollbackError(409, error.code, undefined, error.message);
+          }
+          throw error;
+        }
+        const pendingOperation = await getPendingDeploymentOperation(txDb, projectId);
+        if (pendingOperation) {
+          throw new RollbackError(409, `deploy in progress: ${pendingOperation.id}`);
         }
         const activeDeploy = await getActiveDeployment(txDb, projectId);
         if (activeDeploy) {
@@ -1223,6 +1291,10 @@ const app = new Hono<ApiEnv>()
           if (lockedProject.status === 'deleting') {
             throw new RollbackError(409, 'project is being deleted');
           }
+          const pendingOperation = await getPendingDeploymentOperation(txDb, projectId);
+          if (pendingOperation) {
+            throw new RollbackError(409, `deploy in progress: ${pendingOperation.id}`);
+          }
           const activeDeploy = await getActiveDeployment(txDb, projectId);
           let ownsRollbackLease = false;
           if (activeDeploy && activeDeploy.id === rollbackLeaseId && activeDeploy.manifest) {
@@ -1301,7 +1373,7 @@ const app = new Hono<ApiEnv>()
             ? JSON.parse(target.manifest)
             : null;
           const dispatchLimits = computeDispatchLimits(
-            getPlanLimits(lockedAccess.owner.plan),
+            await resolvePlanLimits(tx, lockedAccess.owner.plan),
             manifest?.limits,
           );
           // Rollback external-write pass depends only on authoritative
@@ -1313,6 +1385,14 @@ const app = new Hono<ApiEnv>()
           const workerName = getProjectDeploymentWorkerName(lockedProject.slug, target.id);
           const existingRouting = await context.env.ROUTING.get(lockedProject.slug);
           const existingEntry = existingRouting ? JSON.parse(existingRouting) : null;
+          const zeroTrust = await resolveProjectZeroTrustRouting(txDb, projectId).catch(
+            (error: unknown) => {
+              const message = zeroTrustNotReadyMessage(error);
+              throw message
+                ? new RollbackError(409, 'zero trust not ready', undefined, message)
+                : error;
+            },
+          );
           const targetType =
             manifest?.type ??
             (manifest?.framework
@@ -1354,6 +1434,7 @@ const app = new Hono<ApiEnv>()
               assetConfig,
               manifest,
               suspended: existingEntry?.suspended,
+              zeroTrust,
             });
           } else {
             routingJson = buildRoutingJson({
@@ -1367,6 +1448,7 @@ const app = new Hono<ApiEnv>()
               hasCrons: !!manifest?.schedules?.length,
               assetManifestId: targetHasAssets ? target.id : undefined,
               assetConfig: targetHasAssets ? manifest?.assetConfig : undefined,
+              zeroTrust,
             });
           }
 
@@ -1382,7 +1464,7 @@ const app = new Hono<ApiEnv>()
             }
             const previous = await context.env.ROUTING.get(key);
             snapshottedRoutingKeys.add(key);
-            externalUndo.push(async () => {
+            externalUndo.push(async (currentZeroTrust) => {
               if (!routingValuesWritten.has(key)) {
                 return;
               }
@@ -1397,7 +1479,12 @@ const app = new Hono<ApiEnv>()
               if (undo.value === null) {
                 await context.env.ROUTING.delete(key);
               } else {
-                await context.env.ROUTING.put(key, undo.value);
+                await context.env.ROUTING.put(
+                  key,
+                  key === lockedProject.slug || key.startsWith('domain:')
+                    ? withProjectZeroTrustRouting(undo.value, currentZeroTrust, lockedProject.id)
+                    : undo.value,
+                );
               }
             });
           };
@@ -1598,7 +1685,7 @@ const app = new Hono<ApiEnv>()
             const compensationErrors: Array<unknown> = [];
             for (const undo of externalUndo.reverse()) {
               try {
-                await undo();
+                await undo(zeroTrust);
               } catch (compensationError) {
                 compensationErrors.push(compensationError);
               }
@@ -1698,9 +1785,10 @@ const app = new Hono<ApiEnv>()
               if (!stillOwnsLease) {
                 return;
               }
+              const zeroTrust = await resolveProjectZeroTrustRoutingForPublication(txDb, projectId);
               for (const undo of [...externalUndo].reverse()) {
                 try {
-                  await undo();
+                  await undo(zeroTrust);
                 } catch (compensationError) {
                   compensationErrors.push(compensationError);
                 }
@@ -1717,7 +1805,11 @@ const app = new Hono<ApiEnv>()
               // database status update was interrupted.
               let restoredProjectRouting: string | null = null;
               try {
-                restoredProjectRouting = await context.env.ROUTING.get(project.slug);
+                const rawRouting = await context.env.ROUTING.get(project.slug);
+                restoredProjectRouting =
+                  rawRouting === null
+                    ? null
+                    : withProjectZeroTrustRouting(rawRouting, zeroTrust, projectId);
               } catch (compensationError) {
                 compensationErrors.push(compensationError);
               }
@@ -2843,6 +2935,7 @@ const app = new Hono<ApiEnv>()
         lastSeq: 0,
         status: build.status,
         terminal,
+        logsComplete: terminal,
         external: build.logs_url ?? null,
       });
     }
@@ -2855,12 +2948,16 @@ const app = new Hono<ApiEnv>()
       lastSeq: number;
       status?: string;
       terminal?: boolean;
+      logsComplete?: boolean | null;
     };
+    // Claiming a container build durably sets started_at. Only a terminal row
+    // that was never claimed can prove completion without a producer marker.
+    const logsComplete = body.logsComplete ?? (terminal && build.started_at === null ? true : null);
     // The DO holds the authoritative live status. A completion path sets the DO
     // terminal FIRST, then does the Postgres CAS write — so if that PG write
     // throws, the PG `build.status` row can lag ACTIVE until the stale reaper.
-    // OR the two terminal signals (terminal is never resurrected) so a `--follow`
-    // client stops promptly instead of polling through that window.
+    // OR the two terminal signals (terminal is never resurrected) so a follower
+    // can finish once the DO also confirms its final log drain.
     const doTerminal = body.terminal === true;
     if (doTerminal && !terminal) {
       // Snapshot was non-terminal but the DO is terminal. Two cases:
@@ -2875,6 +2972,7 @@ const app = new Hono<ApiEnv>()
           lastSeq: body.lastSeq,
           status: fresh.status,
           terminal: true,
+          logsComplete,
           external: null,
         });
       }
@@ -2883,6 +2981,7 @@ const app = new Hono<ApiEnv>()
         lastSeq: body.lastSeq,
         status: body.status ?? build.status,
         terminal: true,
+        logsComplete,
         external: null,
       });
     }
@@ -2891,6 +2990,7 @@ const app = new Hono<ApiEnv>()
       lastSeq: body.lastSeq,
       status: build.status,
       terminal,
+      logsComplete,
       external: null,
     });
   })

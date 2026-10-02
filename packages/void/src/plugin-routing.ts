@@ -3,15 +3,18 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, relative } from 'pathslash';
 import { normalizePath, type Plugin } from 'vite';
+import { analyzeApplicationSync, type ApplicationAnalysis } from './application-analysis.ts';
+import { completeApplicationAnalysis } from './application-routing.ts';
 import {
   hasApiRoutes,
   hasDocumentRoutes,
   resolveAssetRoutingPolicy,
   type AssetRoutingPolicy,
 } from './asset-routing.ts';
-import { findVoidAuthConfig, loadVoidAuthConfig } from './auth/config.ts';
+import { loadVoidAuthConfig } from './auth/config.ts';
 import { generateVoidAuthDatabaseModule, generateVoidAuthDrizzleSchema } from './auth/drizzle.ts';
 import { lintDestinationSplats, lintDuplicateSources, mergeRoutingRules } from './cli/headers.ts';
+import { stampClientAssetCachePolicy } from './client-asset-manifest.ts';
 import { findEnvFileForPaths } from './codegen/env-types.ts';
 import { generateQueueTypes } from './codegen/queue-types.ts';
 import { generateRouteTypes } from './codegen/route-types.ts';
@@ -32,7 +35,7 @@ import {
   type PagesCompileOptions,
 } from './router/compile.ts';
 import type { RouteEnvironment } from './router/parse-filename.ts';
-import { scanRoutes, type ScanResult } from './router/scan.ts';
+import type { ScanResult } from './router/scan.ts';
 import type { VoidAuthRuntimeOptions } from './runtime/better-auth-shared.ts';
 import { loadLocalEnv } from './shared/env.ts';
 import {
@@ -67,7 +70,12 @@ const LOAD_ID_FILTER =
  * - Watches for file changes and triggers HMR
  */
 type RoutingPluginOptions = {
+  getApplicationAnalysis?: (
+    environment: RouteEnvironment,
+    refresh?: boolean,
+  ) => ApplicationAnalysis;
   isAuthEnabled: () => boolean;
+  getVersionMetadataBinding?: () => string | undefined;
   devTriggerToken?: string;
   headConfig?: import('./pages/head.ts').HeadConfig;
   output?: 'server' | 'static';
@@ -94,7 +102,12 @@ type RoutingPluginOptions = {
   sandboxClassName?: string;
   sandboxInstanceType?: string;
   live?: { bindingName: string; className: string };
-  durableObjects?: Array<{ bindingName: string; className: string; filePath: string }>;
+  durableObjects?: Array<{
+    bindingName: string;
+    className: string;
+    filePath: string;
+    name?: string;
+  }>;
   /** Data-preserving exports for removed WebSocket Durable Object routes. */
   websocketTombstones?: Array<string>;
   onDevAssetRoutingPolicyChange?: (policy: AssetRoutingPolicy) => boolean;
@@ -153,9 +166,17 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
     writeFileIfChanged(join(outDir, 'queues.d.ts'), dts);
   }
 
-  async function rescan() {
-    scan = await scanRoutes(root, { output: options.output, paths, environment: routeEnvironment });
-    authConfigPath = findVoidAuthConfig(root, paths);
+  async function rescan(refresh = false) {
+    let analysis = options.getApplicationAnalysis?.(routeEnvironment, refresh);
+    if (!analysis) {
+      const config = readConfig(root);
+      analysis = analyzeApplicationSync(root, {
+        config: { ...config, output: options.output ?? config.output },
+        environment: routeEnvironment,
+      });
+    }
+    scan = (await completeApplicationAnalysis(analysis)).scan;
+    authConfigPath = analysis.authConfigPath;
     const entries = validateSsrEntries(root, paths);
     ssr = entries
       ? {
@@ -207,8 +228,6 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
   }
   const compileOptions: CompileOptions = {
     honoPath: resolveFile('hono'),
-    responsePath: resolveFile('#self/response'),
-    handlerPath: resolveFile('#self/handler'),
     runtimeEnvPath: resolveFile('#self/_env'),
     runtimeEmailPath: resolveFile('#self/email'),
     emailDir,
@@ -370,8 +389,6 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
     return {
       pagesDir,
       pagesDirRelative: relative(root, pagesDir).replaceAll('\\', '/'),
-      protocolPath: resolveFile('#self/pages-protocol'),
-      headPath: resolveFile('#self/pages-head'),
       clientEntryId: 'virtual:void-pages-client',
       islandClientEntryId: hasIslandPages ? 'virtual:void-islands-client' : undefined,
       mdClientEntryId,
@@ -444,6 +461,7 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
     writeFileIfChanged(
       join(outDir, 'entry.ts'),
       compileWorkerEntry({
+        versionMetadataBinding: options.getVersionMetadataBinding?.(),
         remote,
         webSocketClasses: options.websocketTombstones,
         runtimeEnvPath: compileOptions.runtimeEnvPath,
@@ -470,6 +488,7 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
       resolvedConfig = config;
       authClientPath = resolveAuthClientPath(config);
       compileOptions.dev = config.command === 'serve';
+      compileOptions.assetsDir = config.build.assetsDir;
       compileOptions.reactRefresh = config.plugins.some(
         (plugin) =>
           plugin.name === 'vite:react-babel' ||
@@ -514,18 +533,36 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
       }
 
       const entries = validateSsrEntries(root, paths);
-      if (!entries || env.command !== 'build') {
+      if (env.command !== 'build') {
         return;
       }
 
       return {
         build: {
-          manifest: true,
-          rollupOptions: {
-            input: entries.client.absolutePath,
-          },
+          manifest: entries ? true : (_.build?.manifest ?? true),
+          ...(entries
+            ? {
+                rollupOptions: {
+                  input: entries.client.absolutePath,
+                },
+              }
+            : {}),
         },
       };
+    },
+
+    generateBundle: {
+      order: 'post',
+      handler(_output, bundle) {
+        const manifest = this.environment.config.build.manifest;
+        if (this.environment.name === 'client' && manifest) {
+          stampClientAssetCachePolicy(
+            bundle,
+            typeof manifest === 'string' ? manifest : '.vite/manifest.json',
+            compileOptions.headerRules,
+          );
+        }
+      },
     },
 
     async buildStart() {
@@ -600,6 +637,7 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
         writeFileIfChanged(
           join(outDir, 'entry.ts'),
           compileWorkerEntry({
+            versionMetadataBinding: options.getVersionMetadataBinding?.(),
             hasQueues: scan!.queues.length > 0,
             remote,
             assetsDir: resolvedConfig?.build.assetsDir,
@@ -725,7 +763,7 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
         // Re-scan and invalidate the virtual module in ALL environments.
         // The route table virtual module lives in the workerd environment,
         // not the client — so we must iterate all environments.
-        await rescan();
+        await rescan(true);
         resolveAuthCompileOptions();
         const shouldRestartForAssetRouting =
           event !== 'change' &&
@@ -747,6 +785,7 @@ export function routingPlugin(root: string, options: RoutingPluginOptions): Plug
           writeFileIfChanged(
             join(outDir, 'entry.ts'),
             compileWorkerEntry({
+              versionMetadataBinding: options.getVersionMetadataBinding?.(),
               hasQueues: scan!.queues.length > 0,
               remote,
               assetsDir: resolvedConfig?.build.assetsDir,

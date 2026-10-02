@@ -1,7 +1,14 @@
 import { join } from 'node:path';
 import spawn from 'cross-spawn';
 import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
-import { getPort, waitForServer, killChild } from '../../../../test/integration-helpers.ts';
+import {
+  createIsolatedPlayground,
+  getPort,
+  waitForServer,
+  killChild,
+  collectServerOutput,
+  type IsolatedPlayground,
+} from '../../../../test/integration-helpers.ts';
 
 const ROOT = join(import.meta.dirname, '..', '..', '..', '..');
 const PLAYGROUND = 'playground/vinext-app';
@@ -10,47 +17,38 @@ let DEV_BASE: string;
 
 describe('playground/vinext-app dev', () => {
   let child: ReturnType<typeof spawn>;
-  let stderr = '';
+  let serverOutput = () => '';
+  let playground: IsolatedPlayground;
 
   beforeAll(async () => {
+    playground = createIsolatedPlayground(ROOT, PLAYGROUND);
     DEV_PORT = await getPort();
     DEV_BASE = `http://127.0.0.1:${DEV_PORT}`;
 
-    child = spawn(
-      'vp',
-      [
-        'run',
-        '--filter',
-        `./${PLAYGROUND}`,
-        'dev',
-        '--host',
-        '127.0.0.1',
-        '--port',
-        String(DEV_PORT),
-      ],
-      {
-        cwd: ROOT,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          VOID_INSPECTOR_PORT: 'false',
-        },
+    child = spawn('vp', ['dev', '--host', '127.0.0.1', '--port', String(DEV_PORT)], {
+      cwd: playground.root,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        VOID_INSPECTOR_PORT: 'false',
       },
-    );
-
-    child.stderr!.on('data', (chunk: Buffer) => {
-      stderr += String(chunk);
     });
 
-    await waitForServer(DEV_BASE, 30_000);
+    serverOutput = collectServerOutput(child);
+
+    await waitForServer(DEV_BASE, 30_000, {
+      isAlive: () => child.exitCode === null && child.signalCode === null,
+      diagnostics: serverOutput,
+    });
   });
 
   afterAll(async () => {
     if (child) {
       await killChild(child);
     }
-    if (stderr.includes('error when starting dev server')) {
-      throw new Error(stderr);
+    playground?.cleanup();
+    if (serverOutput().includes('error when starting dev server')) {
+      throw new Error(serverOutput());
     }
   });
 

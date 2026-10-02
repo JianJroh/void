@@ -1,17 +1,28 @@
-import { execFile } from 'node:child_process';
+import childProcess, { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { syncBuiltinESMExports } from 'node:module';
 import { connect, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Duplex } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { getWorkerConfigPath } from '@cloudflare/build-output-utils';
-import { afterEach, expect, it } from 'vite-plus/test';
+import {
+  getWorkerConfigPath,
+  readBuildOutput,
+  writeContainerConfig,
+} from '@cloudflare/build-output-utils';
+import { OutputContainerSchema } from '@cloudflare/config';
+import { afterEach, expect, it, vi } from 'vite-plus/test';
 import {
   activateCloudflareVersion,
   deployCloudflareVersionTriggers,
+  encodeCloudflareVersionMessage,
 } from '../../../deploy-cloudflare/src/version.ts';
+import {
+  operationFixture,
+  operationFixtureRequest,
+} from '../../../deploy-cloudflare/test/operation-fixture.ts';
 import { prepareCfBuildOutput } from '../../src/cli/cf-build-output.ts';
 import { uploadPinnedCloudflareVersion } from '../../src/cli/cf-version-api.ts';
 import {
@@ -27,6 +38,8 @@ const pinnedCfVersion = JSON.parse(
   readFileSync(fileURLToPath(import.meta.resolve('cf/package.json')), 'utf8'),
 ).version as string;
 afterEach(() => {
+  vi.restoreAllMocks();
+  syncBuiltinESMExports();
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
@@ -86,7 +99,7 @@ it('preserves real cf provider codes so a missing Worker can reach its first upl
     });
     const missing = JSON.parse(stdout);
     expect(missing.status).toBe(1);
-    expect(missing.stderr).toContain('[code: 10007]');
+    expect(missing.errorCode).toBe(10007);
     expect(requests).toEqual([
       '/client/v4/accounts/test-account/workers/scripts/missing-worker/deployments',
     ]);
@@ -96,16 +109,71 @@ it('preserves real cf provider codes so a missing Worker can reach its first upl
       message: 'review',
       verifyUploader: () => true,
       verifyInheritedSecrets: true,
-      runWrangler: (args) => {
+      runWrangler: operationFixture((args) => {
         operations.push(args.slice(0, 2).join(' '));
         return args[1] === 'upload'
           ? { status: 1, stdout: '', stderr: 'Test stopped before uploading.' }
           : missing;
-      },
+      }),
     });
     expect(result).toMatchObject({ ok: false, reason: 'upload-failed' });
     expect(operations).toEqual(['deployments status', 'versions list', 'versions upload']);
   } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+it('classifies the pinned prebuilt uploader’s missing-Worker diagnostic', async () => {
+  const prepared = await output();
+  const requests: Array<string> = [];
+  const server = createServer((request, response) => {
+    requests.push(request.url ?? '');
+    request.resume();
+    response.writeHead(404, { 'Content-Type': 'application/json' });
+    response.end(
+      JSON.stringify({
+        success: false,
+        errors: [{ code: 10007, message: 'The given script does not exist.' }],
+        result: null,
+      }),
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const apiBaseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/client/v4`;
+    const command = createCfCommand({
+      accountId: 'account-id',
+      apiBaseUrl,
+      verifyUploader: () => true,
+      env: () => ({
+        PATH: process.env.PATH,
+        SYSTEMROOT: process.env.SYSTEMROOT,
+        WINDIR: process.env.WINDIR,
+        TMP: process.env.TMP,
+        TEMP: process.env.TEMP,
+        CI: 'true',
+        CLOUDFLARE_API_TOKEN: 'synthetic-token',
+        CLOUDFLARE_ACCOUNT_ID: 'account-id',
+        CLOUDFLARE_API_BASE_URL: apiBaseUrl,
+      }),
+    });
+    const result = await command(['workers', 'versions', 'create', '--prebuilt'], {
+      cwd: prepared.directory,
+      capture: true,
+    });
+    expect(result, result.stdout + result.stderr).toMatchObject({
+      status: 1,
+      failure: 'not-found',
+      signal: null,
+      error: null,
+    });
+    // cf deliberately omits the API code from this local error.
+    expect(result.errorCode).toBeUndefined();
+    expect(requests).toEqual(['/client/v4/accounts/account-id/workers/services/void-test']);
+  } finally {
+    prepared.dispose();
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
     );
@@ -170,6 +238,82 @@ it('captures a version list larger than Node’s default child-process buffer', 
     );
   }
 });
+
+it.runIf(process.platform !== 'win32')(
+  'bounds a Container command by terminating its actual child and descendant before returning',
+  async () => {
+    const originalSpawn = childProcess.spawn;
+    let group: number | undefined;
+    const spawn = vi.spyOn(childProcess, 'spawn').mockImplementation((_file, args, options) => {
+      expect(args!.slice(1)).toEqual(['containers', 'push', '--tag', 'fixture:local']);
+      expect(options).toMatchObject({ detached: true });
+      const child = originalSpawn(
+        process.execPath,
+        [
+          '-e',
+          `
+      const {spawn}=require('node:child_process');
+      const descendant=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});
+      console.log(JSON.stringify({pid:process.pid,descendant:descendant.pid}));
+      setInterval(()=>{},1000);
+    `,
+        ],
+        options,
+      );
+      group = child.pid;
+      return child;
+    });
+    syncBuiltinESMExports();
+    try {
+      const command = createCfCommand({
+        accountId: 'account-id',
+        apiBaseUrl: 'http://127.0.0.1:1',
+        env: () => ({ PATH: process.env.PATH }),
+        verifyUploader: () => true,
+      });
+      const started = Date.now();
+      const result = await command(['containers', 'push', '--tag', 'fixture:local'], {
+        cwd: tmpdir(),
+        capture: true,
+        timeoutMs: 500,
+        maxOutputBytes: 1024,
+      });
+      expect(result).toMatchObject({
+        status: 1,
+        signal: 'SIGKILL',
+        error: 'Cloudflare command timed out.',
+      });
+      expect(Date.now() - started).toBeLessThan(5_000);
+      const identity = JSON.parse(result.stdout.trim()) as { pid: number; descendant: number };
+      expect(identity.pid).toBe(group);
+      for (const pid of [identity.pid, identity.descendant]) {
+        const deadline = Date.now() + 2_000;
+        for (;;) {
+          try {
+            process.kill(pid, 0);
+          } catch (cause) {
+            expect((cause as NodeJS.ErrnoException).code).toBe('ESRCH');
+            break;
+          }
+          if (Date.now() >= deadline) {
+            throw new Error('Container command descendant survived termination.');
+          }
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      }
+    } finally {
+      spawn.mockRestore();
+      syncBuiltinESMExports();
+      if (group) {
+        try {
+          process.kill(-group, 'SIGKILL');
+        } catch {
+          /* Already terminated. */
+        }
+      }
+    }
+  },
+);
 
 it('treats a verified empty deployment list as missing but rejects malformed status', async () => {
   const prepared = await output();
@@ -243,9 +387,56 @@ async function verifyPinnedUpload(atomic: boolean): Promise<void> {
   const prepared = await output(
     {
       secrets: { required: ['AUTH_SECRET'] },
+      version_metadata: { binding: 'APP_VERSION' },
       keep_secrets: true,
       keep_vars: true,
       assets: { directory: '../client', binding: 'ASSETS', not_found_handling: 'none' },
+      queues: { producers: [{ binding: 'JOBS', queue: 'jobs', delivery_delay: 7 }] },
+      ai: { binding: 'AI' },
+      hyperdrive: [{ binding: 'POSTGRES', id: 'a'.repeat(32) }],
+      services: [
+        {
+          binding: 'SERVICE',
+          service: 'utility-worker',
+          entrypoint: 'Rpc',
+          props: { enabled: true },
+        },
+      ],
+      send_email: [
+        {
+          name: 'MAIL',
+          allowed_destination_addresses: ['fixture@example.test'],
+          allowed_sender_addresses: ['sender@example.test'],
+        },
+      ],
+      analytics_engine_datasets: [{ binding: 'METRICS', dataset: 'metrics' }],
+      vectorize: [{ binding: 'VECTORS', index_name: 'vectors' }],
+      browser: { binding: 'BROWSER' },
+      images: { binding: 'IMAGES' },
+      dispatch_namespaces: [
+        {
+          binding: 'DISPATCH',
+          namespace: 'dispatch',
+          outbound: { service: 'outbound-worker', parameters: ['tenant'] },
+        },
+      ],
+      workflows: [
+        {
+          name: 'local-workflow',
+          binding: 'LOCAL_WORKFLOW',
+          class_name: 'LocalJob',
+          limits: { steps: 7 },
+          concurrency: { limit: 2 },
+          schedules: ['0 * * * *'],
+          default_retention: { success_retention: '1 day', error_retention: '3 days' },
+        },
+        {
+          name: 'external-workflow',
+          binding: 'WORKFLOW',
+          class_name: 'ExternalJob',
+          script_name: 'external-worker',
+        },
+      ],
     },
     true,
   );
@@ -265,6 +456,20 @@ async function verifyPinnedUpload(atomic: boolean): Promise<void> {
     ).toBe(true);
     const worker = JSON.parse(readFileSync(getWorkerConfigPath(prepared.directory), 'utf8'));
     expect(worker.env.AUTH_SECRET).toEqual({ type: 'secret' });
+    worker.exports = {
+      ...worker.exports,
+      ExportOnlyJob: { type: 'workflow', name: 'export-only-workflow', limits: { steps: 3 } },
+      Rpc: { type: 'worker', cache: { enabled: false } },
+      Departed: { type: 'durable-object', state: 'transferred', transferredTo: 'target-worker' },
+      Arriving: {
+        type: 'durable-object',
+        state: 'expecting-transfer',
+        storage: 'sqlite',
+        transferFrom: 'source-worker',
+      },
+    };
+    writeFileSync(getWorkerConfigPath(prepared.directory), JSON.stringify(worker));
+    const originalWorkerConfig = readFileSync(getWorkerConfigPath(prepared.directory), 'utf8');
     expect(prepared.activeSecrets).toEqual({
       versionId: activeVersionId,
       bindings: [
@@ -297,16 +502,22 @@ async function verifyPinnedUpload(atomic: boolean): Promise<void> {
           ? ++uploadedBatches === 5
             ? { jwt: 'completion-token' }
             : {}
-          : request.method === 'GET'
+          : path.includes('/workflows/')
             ? {
-                id: activeVersionId,
-                bindings: [
-                  { name: 'AUTH_SECRET', type: 'secret_text' },
-                  { name: 'KEY', type: 'secret_key' },
-                  { name: 'DASHBOARD_VAR', type: 'plain_text' },
-                ],
+                name: path.endsWith('/local-workflow') ? 'local-workflow' : 'export-only-workflow',
+                script_name: 'void-test',
+                class_name: path.endsWith('/local-workflow') ? 'LocalJob' : 'ExportOnlyJob',
               }
-            : { id: '22222222-2222-4222-8222-222222222222', urls: [] };
+            : request.method === 'GET'
+              ? {
+                  id: activeVersionId,
+                  bindings: [
+                    { name: 'AUTH_SECRET', type: 'secret_text' },
+                    { name: 'KEY', type: 'secret_key' },
+                    { name: 'DASHBOARD_VAR', type: 'plain_text' },
+                  ],
+                }
+              : { id: '22222222-2222-4222-8222-222222222222', urls: [] };
       response.end(
         JSON.stringify({
           success: true,
@@ -337,14 +548,78 @@ async function verifyPinnedUpload(atomic: boolean): Promise<void> {
           { name: 'AUTH_SECRET', type: 'inherit', version_id: activeVersionId },
           { name: 'KEY', type: 'inherit', version_id: activeVersionId },
           { name: 'DASHBOARD_VAR', type: 'inherit', version_id: activeVersionId },
+          { name: 'APP_VERSION', type: 'version_metadata' },
+          { name: 'JOBS', type: 'queue', queue_name: 'jobs', delivery_delay: 7 },
+          { name: 'AI', type: 'ai' },
+          { name: 'POSTGRES', type: 'hyperdrive', id: 'a'.repeat(32) },
+          {
+            name: 'SERVICE',
+            type: 'service',
+            service: 'utility-worker',
+            entrypoint: 'Rpc',
+            props: { enabled: true },
+          },
+          {
+            name: 'MAIL',
+            type: 'send_email',
+            allowed_destination_addresses: ['fixture@example.test'],
+            allowed_sender_addresses: ['sender@example.test'],
+          },
+          { name: 'METRICS', type: 'analytics_engine', dataset: 'metrics' },
+          { name: 'VECTORS', type: 'vectorize', index_name: 'vectors' },
+          { name: 'BROWSER', type: 'browser' },
+          { name: 'IMAGES', type: 'images' },
+          {
+            name: 'DISPATCH',
+            type: 'dispatch_namespace',
+            namespace: 'dispatch',
+            outbound: { worker: { service: 'outbound-worker' }, params: [{ name: 'tenant' }] },
+          },
+          {
+            name: 'WORKFLOW',
+            type: 'workflow',
+            workflow_name: 'external-workflow',
+            script_name: 'external-worker',
+          },
+          {
+            name: 'LOCAL_WORKFLOW',
+            type: 'workflow',
+            workflow_name: 'local-workflow',
+            class_name: 'LocalJob',
+          },
         ]),
       );
       expect(body.modules).toEqual([expect.objectContaining({ name: 'index.js' })]);
+      expect(body.exports).toEqual({
+        LocalJob: { type: 'workflow', name: 'local-workflow' },
+        ExportOnlyJob: { type: 'workflow', name: 'export-only-workflow' },
+        Rpc: { type: 'worker', cache: { enabled: false } },
+        Departed: { type: 'durable-object', state: 'transferred', transferred_to: 'target-worker' },
+        Arriving: {
+          type: 'durable-object',
+          state: 'expecting-transfer',
+          storage: 'sqlite',
+          transfer_from: 'source-worker',
+        },
+      });
+      expect(readFileSync(getWorkerConfigPath(prepared.directory), 'utf8')).toBe(
+        originalWorkerConfig,
+      );
+      expect(worker.exports.LocalJob).toEqual({
+        type: 'workflow',
+        name: 'local-workflow',
+        limits: { steps: 7 },
+        concurrency: { limit: 2 },
+        schedules: ['0 * * * *'],
+        defaultRetention: { successRetention: '1 day', errorRetention: '3 days' },
+      });
       expect(body.assets).toEqual({
         jwt: 'completion-token',
         config: { not_found_handling: 'none' },
       });
       expect(body.bindings).toContainEqual({ name: 'ASSETS', type: 'assets' });
+      expect(body.containers).toBeUndefined();
+      expect(requests.some(({ url }) => url.includes('/containers/'))).toBe(false);
       const session = requests.find(({ url }) => url.endsWith('/assets-upload-session'));
       const manifest = JSON.parse(session!.body).manifest as Record<string, { hash: string }>;
       expect(Object.keys(manifest)).toEqual(
@@ -389,6 +664,862 @@ it('uploads live secrets and multiple asset batches when the latest upload is in
 
 it('uploads live secrets and multiple asset batches for atomic publication', () =>
   verifyPinnedUpload(true));
+
+it.each(['missing name', 'duplicate name', 'external collision', 'class collision'] as const)(
+  'rejects an invalid local Workflow declaration before any provider request: %s',
+  async (mode) => {
+    const prepared = await output({ secrets: { required: ['AUTH_SECRET'] } });
+    try {
+      await pinActiveWorkerSecrets({
+        output: prepared,
+        activeVersionId: '11111111-1111-4111-8111-111111111111',
+        bindings: [{ name: 'AUTH_SECRET', type: 'secret_text' }],
+        requiredNames: ['AUTH_SECRET'],
+      });
+      const path = getWorkerConfigPath(prepared.directory);
+      const worker = JSON.parse(readFileSync(path, 'utf8'));
+      worker.exports = { Job: { type: 'workflow', name: mode === 'missing name' ? '' : 'jobs' } };
+      if (mode === 'duplicate name') {
+        worker.exports.OtherJob = { type: 'workflow', name: 'jobs' };
+      }
+      if (mode === 'external collision' || mode === 'class collision') {
+        worker.env.JOB = {
+          type: 'workflow',
+          name: 'jobs',
+          worker: mode === 'external collision' ? 'foreign-worker' : 'void-test',
+          exportName: mode === 'external collision' ? 'Job' : 'OtherJob',
+        };
+      }
+      writeFileSync(path, JSON.stringify(worker));
+      const fetch = vi.spyOn(globalThis, 'fetch');
+      await expect(
+        uploadPinnedCloudflareVersion({
+          output: prepared,
+          accountId: 'account-id',
+          apiBaseUrl: 'http://127.0.0.1:1',
+          workerName: 'void-test',
+          token: 'synthetic-token',
+          atomic: true,
+          verifyUploader: () => true,
+        }),
+      ).rejects.toThrow(
+        mode === 'missing name'
+          ? 'Workflow export Job name'
+          : mode === 'duplicate name'
+            ? 'multiple local exports'
+            : 'conflicts with its local export',
+      );
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      prepared.dispose();
+    }
+  },
+);
+
+it.each(['missing', 'owned', 'foreign', 'malformed', 'unrelated 404'] as const)(
+  'checks local Workflow ownership before uploading assets or a version: %s',
+  async (mode) => {
+    const prepared = await output({
+      secrets: { required: ['AUTH_SECRET'] },
+      assets: { directory: '../client', binding: 'ASSETS' },
+      workflows: [{ name: 'jobs', binding: 'JOB', class_name: 'Job' }],
+    });
+    await pinActiveWorkerSecrets({
+      output: prepared,
+      activeVersionId: '11111111-1111-4111-8111-111111111111',
+      bindings: [{ name: 'AUTH_SECRET', type: 'secret_text' }],
+      requiredNames: ['AUTH_SECRET'],
+    });
+    const requests: Array<{ method: string; path: string }> = [];
+    const server = createServer((request, response) => {
+      request.resume();
+      const path = request.url ?? '';
+      requests.push({ method: request.method ?? '', path });
+      const missing =
+        path.endsWith('/workflows/jobs') && ['missing', 'unrelated 404'].includes(mode);
+      response.writeHead(missing ? 404 : 200, { 'Content-Type': 'application/json' });
+      response.end(
+        JSON.stringify({
+          success: !missing,
+          errors: missing ? [{ code: mode === 'missing' ? 10200 : 10000 }] : [],
+          result: path.endsWith('/workflows/jobs')
+            ? {
+                name: mode === 'malformed' ? 'another-workflow' : 'jobs',
+                script_name: mode === 'foreign' ? 'foreign-worker' : 'void-test',
+                class_name: 'PreviousJob',
+              }
+            : path.endsWith('/assets-upload-session')
+              ? { jwt: 'asset-completion', buckets: [] }
+              : request.method === 'GET'
+                ? {
+                    id: '11111111-1111-4111-8111-111111111111',
+                    bindings: [{ name: 'AUTH_SECRET', type: 'secret_text' }],
+                  }
+                : { id: '22222222-2222-4222-8222-222222222222', urls: [] },
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const upload = uploadPinnedCloudflareVersion({
+        output: prepared,
+        accountId: 'account-id',
+        apiBaseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/client/v4`,
+        workerName: 'void-test',
+        token: 'synthetic-token',
+        atomic: true,
+        verifyUploader: () => true,
+      });
+      if (mode === 'missing' || mode === 'owned') {
+        await expect(upload).resolves.toMatchObject({ id: '22222222-2222-4222-8222-222222222222' });
+        expect(requests.map(({ method }) => method)).toEqual(['GET', 'GET', 'POST', 'POST']);
+      } else {
+        await expect(upload).rejects.toThrow(
+          mode === 'unrelated 404'
+            ? 'Cloudflare version upload failed'
+            : 'not owned by this Worker',
+        );
+        expect(requests.map(({ method }) => method)).toEqual(['GET', 'GET']);
+      }
+      expect(requests[1]?.path).toBe('/client/v4/accounts/account-id/workflows/jobs');
+    } finally {
+      prepared.dispose();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  },
+);
+
+it.each([
+  'unsafe binding',
+  'unknown export',
+  'scheduler Container',
+  'explicit secret collision',
+] as const)(
+  'refuses unsupported pinned output before provider or image mutations: %s',
+  async (mode) => {
+    const prepared = await output({ secrets: { required: ['AUTH_SECRET'] } });
+    try {
+      expect(
+        await pinActiveWorkerSecrets({
+          output: prepared,
+          activeVersionId: '11111111-1111-4111-8111-111111111111',
+          bindings: [{ name: 'AUTH_SECRET', type: 'secret_text' }],
+          requiredNames: ['AUTH_SECRET'],
+        }),
+      ).toBe(true);
+      const workerPath = getWorkerConfigPath(prepared.directory);
+      const worker = JSON.parse(readFileSync(workerPath, 'utf8'));
+      if (mode === 'unsafe binding') {
+        worker.env.BAD = { type: 'unsafe:unknown_product', value: 'unapproved' };
+      }
+      if (mode === 'unknown export') {
+        worker.exports = { Job: { type: 'unapproved', name: 'jobs' } };
+      }
+      if (mode === 'explicit secret collision') {
+        worker.env.AUTH_SECRET = { type: 'ai' };
+      }
+      writeFileSync(workerPath, JSON.stringify(worker));
+      if (mode === 'scheduler Container') {
+        await writeContainerConfig({
+          root: prepared.directory,
+          directoryName: 'scheduler',
+          config: OutputContainerSchema.parse({
+            name: 'scheduler',
+            image: { reference: 'example.test/image:tag' },
+          }),
+        });
+      }
+      const secretsFilePath =
+        mode === 'explicit secret collision' ? join(roots.at(-1)!, 'secrets.json') : undefined;
+      if (secretsFilePath) {
+        writeFileSync(secretsFilePath, JSON.stringify({ AUTH_SECRET: 'private-secret' }));
+      }
+      const fetch = vi.spyOn(globalThis, 'fetch');
+      const runCf = vi.fn();
+      await expect(
+        uploadPinnedCloudflareVersion({
+          output: prepared,
+          accountId: 'account-id',
+          apiBaseUrl: 'http://127.0.0.1:1',
+          workerName: 'void-test',
+          token: 'synthetic-token',
+          atomic: true,
+          verifyUploader: () => true,
+          secretsFilePath,
+          runCf,
+        }),
+      ).rejects.toThrow(
+        mode === 'unknown export'
+          ? 'invalid Worker config'
+          : mode === 'scheduler Container'
+            ? 'Scheduler-managed'
+            : mode === 'explicit secret collision'
+              ? 'invalid explicit value or binding'
+              : 'binding BAD',
+      );
+      expect(fetch).not.toHaveBeenCalled();
+      expect(runCf).not.toHaveBeenCalled();
+    } finally {
+      prepared.dispose();
+    }
+  },
+);
+
+it('refuses a new imageless Container before version publication', async () => {
+  const prepared = await containerOutput();
+  try {
+    const built = await readBuildOutput(prepared.directory);
+    await writeContainerConfig({
+      root: prepared.directory,
+      directoryName: 'sandbox',
+      config: OutputContainerSchema.parse({ ...built.containers[0].config, images: {} }),
+    });
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      Response.json({
+        success: true,
+        result: {
+          id: activePinnedVersion,
+          bindings: [{ name: 'AUTH_SECRET', type: 'secret_text' }],
+        },
+      }),
+    );
+    const runCf = vi.fn();
+    await expect(
+      uploadPinnedCloudflareVersion({
+        output: prepared,
+        accountId: 'account-id',
+        apiBaseUrl: 'http://127.0.0.1:1',
+        workerName: 'void-test',
+        token: 'synthetic-token',
+        atomic: true,
+        verifyUploader: () => true,
+        runCf,
+      }),
+    ).rejects.toThrow('no images and no verified existing namespace application');
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls[0][1]?.method).toBe('GET');
+    expect(runCf).not.toHaveBeenCalled();
+  } finally {
+    prepared.dispose();
+  }
+});
+
+it('bounds pending Container image preparation before uploading a Worker version', async () => {
+  const prepared = await containerOutput();
+  try {
+    let pending = false;
+    vi.spyOn(Date, 'now').mockImplementation(() => (pending ? 900_001 : 0));
+    const requests: Array<string> = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+      requests.push(String(url));
+      if (String(url).endsWith('/image-preparations')) {
+        pending = true;
+        return Response.json({
+          success: true,
+          result: { image: containerImage, status: 'pending' },
+        });
+      }
+      return Response.json({
+        success: true,
+        result: {
+          id: activePinnedVersion,
+          bindings: [{ name: 'AUTH_SECRET', type: 'secret_text' }],
+        },
+      });
+    });
+    await expect(
+      uploadPinnedCloudflareVersion({
+        output: prepared,
+        accountId: 'account-id',
+        apiBaseUrl: 'http://127.0.0.1:1',
+        workerName: 'void-test',
+        token: 'synthetic-token',
+        atomic: true,
+        verifyUploader: () => true,
+      }),
+    ).rejects.toThrow('image preparation timed out');
+    expect(requests).toHaveLength(2);
+    expect(requests.at(-1)).toContain('/image-preparations');
+  } finally {
+    prepared.dispose();
+  }
+});
+
+const activePinnedVersion = '11111111-1111-4111-8111-111111111111';
+const uploadedPinnedVersion = '22222222-2222-4222-8222-222222222222';
+const containerNamespace = 'c'.repeat(32);
+const containerImage = `registry.cloudflare.com/account-id/sandbox@sha256:${'d'.repeat(64)}`;
+
+async function containerOutput() {
+  const prepared = await output({
+    secrets: { required: ['AUTH_SECRET'] },
+    durable_objects: { bindings: [{ name: 'SANDBOX', class_name: 'Sandbox' }] },
+    migrations: [
+      { tag: 'history', new_sqlite_classes: ['OldRoom', 'Removed'] },
+      {
+        tag: 'current',
+        new_sqlite_classes: ['Sandbox'],
+        renamed_classes: [{ from: 'OldRoom', to: 'Room' }],
+        deleted_classes: ['Removed'],
+      },
+    ],
+    containers: [
+      {
+        name: 'sandbox',
+        class_name: 'Sandbox',
+        scheduling_policy: 'durable_object',
+        images: { default: { image: containerImage } },
+      },
+    ],
+  });
+  expect(
+    await pinActiveWorkerSecrets({
+      output: prepared,
+      activeVersionId: activePinnedVersion,
+      bindings: [{ name: 'AUTH_SECRET', type: 'secret_text' }],
+      requiredNames: ['AUTH_SECRET'],
+    }),
+  ).toBe(true);
+  return prepared;
+}
+
+async function verifyContainerUpload(
+  mode:
+    | 'create'
+    | 'existing'
+    | 'pending'
+    | 'image-error'
+    | 'foreign'
+    | 'lost-readback'
+    | 'local'
+    | 'lost-image-metadata'
+    | 'foreign-namespace'
+    | 'settings-change'
+    | 'keys-change'
+    | 'omitted-defaults'
+    | 'readiness-failure'
+    | 'key-order',
+) {
+  const prepared = await containerOutput();
+  const built = await readBuildOutput(prepared.directory);
+  const existing = [
+    'existing',
+    'foreign',
+    'lost-readback',
+    'settings-change',
+    'keys-change',
+    'omitted-defaults',
+    'readiness-failure',
+    'key-order',
+  ].includes(mode);
+  const expectedImages =
+    mode === 'key-order'
+      ? { first: containerImage, second: containerImage }
+      : { default: containerImage };
+  await writeContainerConfig({
+    root: prepared.directory,
+    directoryName: 'sandbox',
+    config: OutputContainerSchema.parse({
+      ...built.containers[0].config,
+      observability: { logs: { enabled: true } },
+      ...(mode === 'keys-change'
+        ? { authorizedKeys: [{ name: 'new-key', publicKey: 'ssh-ed25519 new' }] }
+        : {}),
+      ...(mode === 'omitted-defaults'
+        ? {
+            observability: { logs: { enabled: false } },
+            ssh: { enabled: false, port: 22 },
+            authorizedKeys: [],
+            unsafe: { configuration: { experimental_flags: [] } },
+          }
+        : {}),
+      ...(mode === 'key-order'
+        ? {
+            ssh: { enabled: true, port: 2222 },
+            unsafe: { configuration: { experimental_flags: ['fixture-b', 'fixture-a'] } },
+            images: { first: { reference: containerImage }, second: { reference: containerImage } },
+          }
+        : {}),
+      ...(mode === 'local'
+        ? { images: { default: { localReference: 'void-sandbox-build:fixture' } } }
+        : {}),
+    }),
+  });
+  const requests: Array<{ method: string; url: string; body: Record<string, unknown> }> = [];
+  let application: Record<string, unknown> | undefined = existing
+    ? {
+        id: containerNamespace,
+        name: mode === 'foreign' ? 'foreign-app' : 'sandbox',
+        scheduling_policy: 'durable_object',
+        durable_objects: { namespace_id: containerNamespace },
+        ...(mode === 'omitted-defaults'
+          ? {}
+          : { observability: { logs: { enabled: mode !== 'settings-change' } } }),
+        ...(mode === 'keys-change'
+          ? {
+              configuration: {
+                authorized_keys: [{ name: 'old-key', public_key: 'ssh-ed25519 old' }],
+              },
+            }
+          : {}),
+        ...(mode === 'key-order'
+          ? {
+              configuration: {
+                wrangler_ssh: { port: 2222, enabled: true },
+                authorized_keys: [],
+                experimental_flags: ['fixture-a', 'fixture-b'],
+              },
+            }
+          : {}),
+      }
+    : undefined;
+  let imageAttempts = 0;
+  let versionVisibleAttempts = 0;
+  let applicationReads = 0;
+  const originalApplication = structuredClone(application);
+  const server = createServer(async (request, response) => {
+    const chunks: Array<Buffer> = [];
+    for await (const chunk of request) {
+      chunks.push(Buffer.from(chunk));
+    }
+    const text = Buffer.concat(chunks).toString('utf8');
+    const row = { method: request.method!, url: request.url!, body: text ? JSON.parse(text) : {} };
+    requests.push(row);
+    let status = 200;
+    let result: unknown;
+    let code = 0;
+    const binding = {
+      name: 'SANDBOX',
+      type: 'durable_object_namespace',
+      class_name: 'Sandbox',
+      namespace_id: containerNamespace,
+    };
+    if (row.url.endsWith(`/versions/${activePinnedVersion}`)) {
+      result = {
+        id: activePinnedVersion,
+        bindings: [
+          { name: 'AUTH_SECRET', type: 'secret_text' },
+          ...(existing ? [{ ...binding, script_name: 'void-test' }] : []),
+        ],
+      };
+    } else if (row.url.endsWith('/image-preparations')) {
+      result = {
+        image: row.body.image,
+        status:
+          mode === 'image-error'
+            ? 'error'
+            : mode === 'pending' && ++imageAttempts === 1
+              ? 'pending'
+              : 'ready',
+      };
+    } else if (row.method === 'POST' && row.url.includes('/workers/workers/void-test/versions')) {
+      result = {
+        id: uploadedPinnedVersion,
+        urls: ['https://22222222-void-test.account.workers.dev'],
+      };
+    } else if (row.url.endsWith(`/scripts/void-test/versions/${uploadedPinnedVersion}`)) {
+      if (mode === 'pending' && ++versionVisibleAttempts === 1) {
+        status = 404;
+        code = 100146;
+      } else {
+        result = {
+          id: uploadedPinnedVersion,
+          resources: {
+            bindings:
+              mode === 'foreign-namespace'
+                ? [{ ...binding, script_name: 'foreign-worker' }]
+                : [binding],
+            script_runtime: {
+              containers:
+                mode === 'lost-image-metadata'
+                  ? [{ class_name: 'Sandbox' }]
+                  : [
+                      {
+                        name: 'sandbox',
+                        class_name: 'Sandbox',
+                        images:
+                          mode === 'key-order'
+                            ? { second: containerImage, first: containerImage }
+                            : expectedImages,
+                      },
+                    ],
+            },
+          },
+        };
+      }
+    } else if (row.url.endsWith(`/applications/${containerNamespace}`)) {
+      if (!application) {
+        status = 404;
+      } else if (row.method === 'PATCH') {
+        application = { ...application, ...row.body };
+        result = application;
+      } else {
+        result =
+          mode === 'lost-readback' && ++applicationReads > 1
+            ? { ...application, durable_objects: { namespace_id: 'f'.repeat(32) } }
+            : application;
+      }
+    } else if (row.url.endsWith('/applications') && row.method === 'POST') {
+      application = { ...row.body, id: containerNamespace };
+      result = application;
+    } else {
+      status = 500;
+    }
+    response.writeHead(status, { 'Content-Type': 'application/json' });
+    response.end(
+      JSON.stringify({
+        success: status === 200,
+        result: result ?? null,
+        errors: status === 200 ? [] : [{ code, message: 'private-provider-detail' }],
+      }),
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const runCf = vi.fn(() => ({
+    status: 0,
+    stdout: 'Pushed image: registry.cloudflare.com/account-id/sandbox:fixture\n',
+    stderr: '',
+  }));
+  const inspect =
+    mode === 'local'
+      ? vi
+          .spyOn(childProcess, 'execFile')
+          .mockImplementation((_file, _args, _options, callback) => {
+            (callback as (error: null, stdout: string, stderr: string) => void)(
+              null,
+              JSON.stringify([containerImage]),
+              '',
+            );
+            return {} as ReturnType<typeof execFile>;
+          })
+      : undefined;
+  syncBuiltinESMExports();
+  try {
+    const changedSettings = mode === 'settings-change' || mode === 'keys-change';
+    if (changedSettings || mode === 'readiness-failure') {
+      const commands: Array<Array<string>> = [];
+      const configPath = join(roots.at(-1)!, 'dist/ssr/wrangler.json');
+      const runner = createCfVersionRunner({
+        output: prepared,
+        workerName: 'void-test',
+        verifyResources: async () => ({ status: 0, stdout: '', stderr: '' }),
+        runCf: (args) => {
+          commands.push(args);
+          if (args.slice(0, 3).join(' ') === 'workers deployments list') {
+            return {
+              status: 0,
+              stdout: JSON.stringify({
+                deployments: [{ versions: [{ version_id: activePinnedVersion, percentage: 100 }] }],
+              }),
+              stderr: '',
+            };
+          }
+          expect(args.slice(0, 3)).toEqual(['workers', 'versions', 'get']);
+          return {
+            status: 0,
+            stdout: JSON.stringify({ id: activePinnedVersion, bindings: [] }),
+            stderr: '',
+          };
+        },
+        pinnedUpload: {
+          accountId: 'account-id',
+          apiBaseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/client/v4`,
+          getToken: async () => 'synthetic-token',
+          verifyUploader: () => true,
+        },
+      });
+      const readiness = vi.fn(async () => Response.json({ ready: false }, { status: 503 }));
+      const result = await activateCloudflareVersion({
+        runWrangler: runner,
+        workerName: 'void-test',
+        configPath,
+        verifyUploader: () => true,
+        message: 'Verify Container candidate isolation.',
+        readinessAttempts: 1,
+        fetch: readiness,
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        reason: changedSettings ? 'upload-failed' : 'readiness-failed',
+      });
+      expect(readiness).toHaveBeenCalledTimes(changedSettings ? 0 : 1);
+      expect(requests.filter((row) => row.method === 'PATCH')).toEqual([]);
+      expect(application).toEqual(originalApplication);
+      expect(
+        commands.some((args) => args.slice(0, 3).join(' ') === 'workers deployments create'),
+      ).toBe(false);
+      if (changedSettings) {
+        expect(result).toHaveProperty(
+          'diagnostic',
+          expect.stringContaining('settings differ from the live application'),
+        );
+        expect(requests.every((row) => row.method === 'GET')).toBe(true);
+      }
+      return;
+    }
+    const upload = uploadPinnedCloudflareVersion({
+      output: prepared,
+      accountId: 'account-id',
+      apiBaseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/client/v4`,
+      workerName: 'void-test',
+      token: 'synthetic-token',
+      atomic: true,
+      verifyUploader: () => true,
+      runCf,
+    });
+    if (mode === 'image-error' || mode === 'foreign') {
+      await expect(upload).rejects.toThrow(
+        mode === 'image-error' ? 'image preparation failed' : 'application identity',
+      );
+      expect(
+        requests.some(
+          (row) => row.method === 'POST' && row.url.includes('/workers/workers/void-test/versions'),
+        ),
+      ).toBe(false);
+    } else if (['lost-readback', 'lost-image-metadata', 'foreign-namespace'].includes(mode)) {
+      await expect(upload).rejects.toThrow(
+        `version ${uploadedPinnedVersion} was uploaded and may already be published`,
+      );
+      expect(requests.filter((row) => row.method === 'PATCH')).toHaveLength(0);
+      if (mode !== 'lost-readback') {
+        expect(requests.some((row) => row.url.includes('/applications'))).toBe(false);
+      }
+    } else {
+      expect((await upload).id).toBe(uploadedPinnedVersion);
+      const post = requests.find(
+        (row) => row.method === 'POST' && row.url.includes('/workers/workers/void-test/versions'),
+      )!;
+      expect(post.body.bindings).toContainEqual({
+        name: 'AUTH_SECRET',
+        type: 'inherit',
+        version_id: activePinnedVersion,
+      });
+      expect(post.body.bindings).toContainEqual({
+        name: 'SANDBOX',
+        type: 'durable_object_namespace',
+        class_name: 'Sandbox',
+      });
+      expect(post.body.containers).toEqual([
+        { name: 'sandbox', class_name: 'Sandbox', images: expectedImages },
+      ]);
+      expect(post.body.exports).toEqual({
+        OldRoom: { type: 'durable-object', state: 'renamed', renamed_to: 'Room' },
+        Room: { type: 'durable-object', storage: 'sqlite', state: 'created' },
+        Removed: { type: 'durable-object', state: 'deleted' },
+        Sandbox: {
+          type: 'durable-object',
+          storage: 'sqlite',
+          state: 'created',
+          container: 'sandbox',
+        },
+      });
+      expect(requests.findIndex((row) => row.url.endsWith('/image-preparations'))).toBeLessThan(
+        requests.indexOf(post),
+      );
+      const creates = requests.filter(
+        (row) => row.method === 'POST' && row.url.endsWith('/applications'),
+      );
+      expect(creates).toHaveLength(existing ? 0 : 1);
+      if (!existing) {
+        expect(creates[0].body).toEqual({
+          name: 'sandbox',
+          scheduling_policy: 'durable_object',
+          durable_objects: { namespace_id: containerNamespace },
+          observability: { logs: { enabled: true } },
+        });
+      } else {
+        expect(requests.filter((row) => row.method === 'PATCH')).toHaveLength(0);
+      }
+      expect(requests.at(-1)?.method).toBe('GET');
+      if (mode === 'pending') {
+        expect(imageAttempts).toBe(2);
+        expect(versionVisibleAttempts).toBe(2);
+      }
+      if (mode === 'local') {
+        expect(runCf).toHaveBeenCalledWith(
+          ['containers', 'push', '--tag', 'void-sandbox-build:fixture'],
+          expect.objectContaining({
+            cwd: prepared.directory,
+            capture: true,
+            timeoutMs: expect.any(Number),
+            maxOutputBytes: 16 * 1024 * 1024,
+          }),
+        );
+        expect(inspect).toHaveBeenCalledWith(
+          expect.any(String),
+          [
+            'image',
+            'inspect',
+            '--format',
+            '{{json .RepoDigests}}',
+            'registry.cloudflare.com/account-id/sandbox:fixture',
+          ],
+          expect.objectContaining({ timeout: expect.any(Number) }),
+          expect.any(Function),
+        );
+      } else {
+        expect(runCf).not.toHaveBeenCalled();
+      }
+    }
+  } finally {
+    inspect?.mockRestore();
+    syncBuiltinESMExports();
+    prepared.dispose();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+}
+
+it.each([
+  'create',
+  'existing',
+  'pending',
+  'image-error',
+  'foreign',
+  'lost-readback',
+  'local',
+  'lost-image-metadata',
+  'foreign-namespace',
+  'settings-change',
+  'keys-change',
+  'omitted-defaults',
+  'readiness-failure',
+  'key-order',
+] as const)('preserves pinned Sandbox image and application lifecycle: %s', verifyContainerUpload);
+
+it.each([false, true])(
+  'publishes the intended custom domain before pinned-secret bootstrap readiness (atomic=%s)',
+  async (atomic) => {
+    const current = '11111111-1111-4111-8111-111111111111';
+    const next = '22222222-2222-4222-8222-222222222222';
+    const domain = 'app.example.com';
+    const triggerConfig = {
+      workers_dev: false,
+      preview_urls: false,
+      routes: [{ pattern: domain, custom_domain: true }],
+      crons: [],
+      queueConsumers: [],
+      workflows: [],
+    };
+    const prepared = await output({
+      workers_dev: false,
+      preview_urls: false,
+      routes: triggerConfig.routes,
+      secrets: { required: ['AUTH_SECRET'] },
+    });
+    const events: Array<string> = [];
+    let active = current;
+    let published = false;
+    const server = createServer(async (request, response) => {
+      request.resume();
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      const upload = request.method === 'POST';
+      if (upload && request.url?.endsWith('?deploy=true')) {
+        active = next;
+        events.push('activate');
+      }
+      response.end(
+        JSON.stringify({
+          success: true,
+          errors: [],
+          result: upload
+            ? { id: next, urls: [] }
+            : { id: current, bindings: [{ name: 'AUTH_SECRET', type: 'secret_text' }] },
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const pinActiveSecrets = createActiveSecretPinner({
+        output: prepared,
+        handoffPending: false,
+        requiredNames: ['AUTH_SECRET'],
+      })!;
+      // A secret-only first Worker can already require version-pinned inheritance.
+      await pinActiveSecrets(current, [{ name: 'AUTH_SECRET', type: 'secret_text' }]);
+      const runCf = async (args: Array<string>, options: { cwd: string }) => {
+        if (args.slice(0, 3).join(' ') === 'workers deployments list') {
+          return {
+            status: 0,
+            stderr: '',
+            stdout: JSON.stringify({
+              deployments: [{ versions: [{ version_id: active, percentage: 100 }] }],
+            }),
+          };
+        }
+        if (args.slice(0, 3).join(' ') === 'workers versions get') {
+          return {
+            status: 0,
+            stderr: '',
+            stdout: JSON.stringify({
+              id: args[3],
+              bindings: [{ name: 'AUTH_SECRET', type: 'secret_text' }],
+            }),
+          };
+        }
+        expect(args).toEqual(['workers', 'triggers', 'deploy', '--prebuilt']);
+        const config = JSON.parse(readFileSync(getWorkerConfigPath(options.cwd), 'utf8'));
+        expect(active).toBe(next);
+        expect(config.domains).toEqual([domain]);
+        expect(config.workersDev).toBe(false);
+        expect(config.previewUrls).toBe(false);
+        expect(config.env).toEqual({ AUTH_SECRET: { type: 'secret' } });
+        published = true;
+        events.push('publish-domain');
+        return { status: 0, stdout: '', stderr: '' };
+      };
+      const runner = createCfVersionRunner({
+        output: prepared,
+        workerName: 'void-test',
+        runCf,
+        verifyResources: createCfResourceVerifier({
+          configPath: join(roots.at(-1)!, 'dist/ssr/wrangler.json'),
+          runCf,
+          runWrangler: () => {
+            throw new Error('An app without paid bindings must not probe paid services.');
+          },
+          verifyCompatibilityRunner: () => true,
+        }),
+        pinnedUpload: {
+          accountId: 'account-id',
+          apiBaseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/client/v4`,
+          getToken: async () => 'synthetic-token',
+          verifyUploader: () => true,
+        },
+      });
+      const result = await activateCloudflareVersion({
+        runWrangler: runner,
+        workerName: 'void-test',
+        configPath: join(roots.at(-1)!, 'dist/ssr/wrangler.json'),
+        verifyUploader: () => true,
+        pinActiveSecrets,
+        atomic,
+        allowFirstDeploymentBootstrap: true,
+        readinessAttempts: 1,
+        message: encodeCloudflareVersionMessage([], triggerConfig),
+        fetch: async (url) => {
+          expect(url).toBe(`https://${domain}/__void/ready`);
+          events.push('readiness');
+          return Response.json({ ready: published });
+        },
+      });
+      expect(result, JSON.stringify({ result, events })).toMatchObject({
+        ok: true,
+        versionId: next,
+        previewUrl: `https://${domain}`,
+      });
+      expect(events).toEqual(['activate', 'publish-domain', 'readiness']);
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+      await prepared.dispose();
+    }
+  },
+);
 
 it('does not pin active secrets during an existing-Worker handoff', async () => {
   const prepared = await output();
@@ -452,6 +1583,81 @@ it('captures noninteractive cf output when Void owns the terminal', async () => 
   const result = await command(['--version'], { cwd: root, capture: false });
   expect(result.status, result.stderr).toBe(0);
   expect(result.stdout).toContain(pinnedCfVersion);
+});
+
+it.each([
+  { diagnostic: 'synthetic provider failure [10007]', args: ['--version'] },
+  {
+    diagnostic: 'You cannot upload a new version of a Worker that does not yet exist.',
+    args: ['workers', 'versions', 'create', '--prebuilt'],
+  },
+])(
+  'does not classify buffered diagnostics from a terminated real cf process ($diagnostic)',
+  async ({ diagnostic, args }) => {
+    const root = mkdtempSync(join(tmpdir(), 'void-cf-interrupted-command-'));
+    roots.push(root);
+    const preload = join(root, 'interrupt.cjs');
+    writeFileSync(
+      preload,
+      `process.stderr.write(${JSON.stringify(diagnostic + '\n')});\n` +
+        `setInterval(() => {}, 1 << 30);\n`,
+    );
+    const command = createCfCommand({
+      accountId: 'test-account',
+      apiBaseUrl: 'https://api.cloudflare.com/client/v4',
+      verifyUploader: () => true,
+      env: () => ({
+        PATH: process.env.PATH,
+        NODE_OPTIONS: `--require ${JSON.stringify(preload)}`,
+        CI: 'true',
+      }),
+    });
+    const spawn = childProcess.spawn;
+    // Windows does not report a signal when a process kills itself. Terminate
+    // the real child from its parent after the diagnostic is buffered instead.
+    const spawnSpy = vi.spyOn(childProcess, 'spawn').mockImplementation((...args) => {
+      const child = spawn(...args);
+      child.stderr?.once('data', () => child.kill('SIGTERM'));
+      return child;
+    });
+    syncBuiltinESMExports();
+    let result: Awaited<ReturnType<typeof command>>;
+    try {
+      result = await command(args, { cwd: root, capture: true });
+    } finally {
+      spawnSpy.mockRestore();
+      syncBuiltinESMExports();
+    }
+    expect(result.status).toBe(1);
+    expect(result.signal).toBe('SIGTERM');
+    expect(result.stderr).toContain(diagnostic);
+    expect(result.errorCode).toBeUndefined();
+    expect(result.errors).toBeUndefined();
+    expect(result.failure).toBeUndefined();
+  },
+);
+
+it('preserves interruption provenance before interpreting an empty cf deployment list', async () => {
+  const prepared = await output();
+  try {
+    const run = createCfVersionRunner({
+      output: prepared,
+      workerName: 'site',
+      runCf: async () => ({
+        status: 0,
+        signal: 'SIGTERM',
+        stdout: '',
+        stderr: '',
+        data: { deployments: [] },
+      }),
+      verifyResources: async () => ({ status: 0, stdout: '', stderr: '' }),
+    });
+    const result = await run({ type: 'deployments.status', workerName: 'site' }, { capture: true });
+    expect(result.signal).toBe('SIGTERM');
+    expect(result.errorCode).toBeUndefined();
+  } finally {
+    prepared.dispose();
+  }
 });
 
 it('uses the configured HTTP proxy for direct cf activation reads', async () => {
@@ -593,17 +1799,22 @@ it('preserves activation metadata and sorts cf version history for the existing 
       },
     });
     const common = ['-c', 'generated.json', '--env=', '--name', 'void-test'];
-    const deployment = await runner(['deployments', 'status', ...common, '--json'], {
-      capture: true,
-    });
-    expect(JSON.parse(deployment.stdout)).toEqual({
+    const deployment = await runner(
+      operationFixtureRequest(['deployments', 'status', ...common, '--json']),
+      {
+        capture: true,
+      },
+    );
+    expect(deployment.data).toEqual({
       versions: [{ version_id: 'one', percentage: 100 }],
     });
-    const versions = await runner(['versions', 'list', ...common, '--json'], { capture: true });
-    expect(JSON.parse(versions.stdout).map((item: { id: string }) => item.id)).toEqual([
-      'one',
-      'two',
-    ]);
+    const versions = await runner(
+      operationFixtureRequest(['versions', 'list', ...common, '--json']),
+      { capture: true },
+    );
+    expect((versions.data as Array<{ id: string }>).map((item: { id: string }) => item.id)).toEqual(
+      ['one', 'two'],
+    );
     expect(calls.at(-1)).toEqual([
       'workers',
       'versions',
@@ -616,7 +1827,7 @@ it('preserves activation metadata and sorts cf version history for the existing 
       '1',
     ]);
     await runner(
-      [
+      operationFixtureRequest([
         'versions',
         'upload',
         ...common,
@@ -625,7 +1836,7 @@ it('preserves activation metadata and sorts cf version history for the existing 
         '--preview-alias',
         'void-ready',
         '--strict',
-      ],
+      ]),
       { capture: true },
     );
     expect(calls.at(-1)).toEqual([
@@ -639,7 +1850,7 @@ it('preserves activation metadata and sorts cf version history for the existing 
       'void-ready',
     ]);
     await runner(
-      [
+      operationFixtureRequest([
         'versions',
         'deploy',
         '00000000-0000-0000-0000-000000000001@100',
@@ -647,7 +1858,7 @@ it('preserves activation metadata and sorts cf version history for the existing 
         '--message',
         'void:metadata',
         '--yes',
-      ],
+      ]),
       { capture: false },
     );
     const deployArgs = calls.at(-1)!;
@@ -687,10 +1898,13 @@ it.each(['newest-first', 'oldest-first'] as const)(
           };
         },
       });
-      const result = await runner(['versions', 'list', '--name', 'void-test'], { capture: true });
-      expect(JSON.parse(result.stdout).map((item: { number: number }) => item.number)).toEqual(
-        Array.from({ length: 10 }, (_, index) => index + 16),
+      const result = await runner(
+        operationFixtureRequest(['versions', 'list', '--name', 'void-test']),
+        { capture: true },
       );
+      expect(
+        (result.data as Array<{ number: number }>).map((item: { number: number }) => item.number),
+      ).toEqual(Array.from({ length: 10 }, (_, index) => index + 16));
       expect(pages).toEqual(order === 'newest-first' ? [1, 2] : [1, 2, 3]);
     } finally {
       prepared.dispose();
@@ -724,7 +1938,15 @@ it('applies the immutable trigger snapshot through a private cf output copy', as
       },
     });
     const result = await runner(
-      ['triggers', 'deploy', '-c', triggerConfig, '--env=', '--name', 'void-test'],
+      operationFixtureRequest([
+        'triggers',
+        'deploy',
+        '-c',
+        triggerConfig,
+        '--env=',
+        '--name',
+        'void-test',
+      ]),
       { capture: false },
     );
     expect(result.status).toBe(0);
@@ -808,6 +2030,196 @@ it.each(['restore', 'remove'] as const)(
   },
 );
 
+it('applies all local Workflow settings through the real pinned cf trigger transport', async () => {
+  const workflow = {
+    binding: 'JOB',
+    name: 'void-job',
+    class_name: 'Job',
+    limits: { steps: 7 },
+    concurrency: { limit: 2 },
+    schedules: ['0 * * * *'],
+    default_retention: { success_retention: '1 day', error_retention: '3 days' },
+  };
+  const prepared = await output({ workers_dev: false, preview_urls: false, workflows: [workflow] });
+  const original = readFileSync(getWorkerConfigPath(prepared.directory), 'utf8');
+  const requests: Array<{ method: string; path: string; body: unknown }> = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Array<Buffer> = [];
+    for await (const chunk of request) {
+      chunks.push(Buffer.from(chunk));
+    }
+    const body = Buffer.concat(chunks).toString('utf8');
+    requests.push({
+      method: request.method ?? '',
+      path: request.url ?? '',
+      body: body ? JSON.parse(body) : undefined,
+    });
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(
+      JSON.stringify({
+        success: true,
+        errors: [],
+        result: request.url?.endsWith('/workers/subdomain')
+          ? { subdomain: 'fixture' }
+          : { subdomain: { enabled: false, previews_enabled: false } },
+      }),
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const apiBaseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/client/v4`;
+    const command = createCfCommand({
+      accountId: 'account-id',
+      apiBaseUrl,
+      verifyUploader: () => true,
+      env: () => ({
+        PATH: process.env.PATH,
+        SYSTEMROOT: process.env.SYSTEMROOT,
+        WINDIR: process.env.WINDIR,
+        TMP: process.env.TMP,
+        TEMP: process.env.TEMP,
+        CI: 'true',
+        CLOUDFLARE_API_TOKEN: 'synthetic-token',
+        CLOUDFLARE_ACCOUNT_ID: 'account-id',
+        CLOUDFLARE_API_BASE_URL: apiBaseUrl,
+      }),
+    });
+    const runner = createCfVersionRunner({
+      output: prepared,
+      workerName: 'void-test',
+      runCf: command,
+      verifyResources: async () => ({ status: 0, stdout: '', stderr: '' }),
+    });
+    const result = await deployCloudflareVersionTriggers({
+      workerName: 'void-test',
+      configPath: join(roots.at(-1)!, 'dist', 'ssr', 'wrangler.json'),
+      runWrangler: runner,
+      triggerConfig: {
+        workers_dev: false,
+        preview_urls: false,
+        routes: [],
+        crons: [],
+        queueConsumers: [],
+        workflows: [workflow],
+      },
+    });
+    expect(result, result.stdout + result.stderr).toMatchObject({ status: 0 });
+    expect(requests.filter(({ path }) => path.includes('/workflows/'))).toEqual([
+      {
+        method: 'PUT',
+        path: '/client/v4/accounts/account-id/workflows/void-job',
+        body: {
+          script_name: 'void-test',
+          class_name: 'Job',
+          limits: { steps: 7 },
+          concurrency: { limit: 2 },
+          schedules: [{ cron: '0 * * * *' }],
+          default_retention: { success_retention: '1 day', error_retention: '3 days' },
+        },
+      },
+    ]);
+    expect(requests.some(({ path }) => path.includes('/versions'))).toBe(false);
+    expect(readFileSync(getWorkerConfigPath(prepared.directory), 'utf8')).toBe(original);
+  } finally {
+    prepared.dispose();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+it.each([
+  {
+    rows: [{ type: 'worker', script_name: 'void-test', consumer_id: 'owned-id' }],
+    status: 0,
+    remove: true,
+  },
+  { rows: [{ script: 'void-test', consumer_id: 'owned-id' }], status: 0, remove: true },
+  {
+    rows: [
+      { type: 'worker', script_name: 'void-test', script: 'foreign', consumer_id: 'owned-id' },
+    ],
+    status: 1,
+    remove: false,
+  },
+  {
+    rows: [{ type: 'worker', script_name: null, script: 'void-test', consumer_id: 'owned-id' }],
+    status: 1,
+    remove: false,
+  },
+  {
+    rows: [{ type: 'worker', script_name: '', consumer_id: 'owned-id' }],
+    status: 1,
+    remove: false,
+  },
+  {
+    rows: [{ type: 'worker', script_name: 'void-test', consumer_id: '' }],
+    status: 1,
+    remove: false,
+  },
+  {
+    rows: [{ type: 'http_pull', script_name: 'void-test', consumer_id: 'owned-id' }],
+    status: 1,
+    remove: false,
+  },
+  { rows: [{ type: 'worker', consumer_id: 'owned-id' }], status: 1, remove: false },
+  {
+    rows: [
+      { type: 'worker', script_name: 'void-test', consumer_id: 'one' },
+      { type: 'worker', script_name: 'void-test', consumer_id: 'two' },
+    ],
+    status: 1,
+    remove: false,
+  },
+  {
+    rows: [
+      { type: 'worker', script_name: 'foreign', consumer_id: 'foreign-id' },
+      { type: 'http_pull', consumer_id: 'pull-id' },
+    ],
+    status: 0,
+    remove: false,
+  },
+])(
+  'removes only an unambiguous Queue consumer Worker identity: $rows',
+  async ({ rows, status, remove }) => {
+    const prepared = await output();
+    const calls: Array<Array<string>> = [];
+    try {
+      const runner = createCfVersionRunner({
+        output: prepared,
+        workerName: 'void-test',
+        verifyResources: async () => ({ status: 0, stdout: '', stderr: '' }),
+        runCf: (args) => {
+          calls.push(args);
+          return {
+            status: 0,
+            stdout: JSON.stringify(
+              args[1] === 'list'
+                ? [{ queue_name: 'jobs', queue_id: 'queue-id' }]
+                : args[2] === 'list'
+                  ? rows
+                  : {},
+            ),
+            stderr: '',
+          };
+        },
+      });
+      const result = await runner(
+        { type: 'queues.consumer.remove', queueName: 'jobs', workerName: 'void-test' },
+        { capture: true },
+      );
+      expect(result.status).toBe(status);
+      expect(calls.filter((args) => args[2] === 'delete')).toEqual(
+        remove
+          ? [['queues', 'consumers', 'delete', 'owned-id', '--queue-id', 'queue-id', '--force']]
+          : [],
+      );
+    } finally {
+      prepared.dispose();
+    }
+  },
+);
+
 it('uses cf for Queue triggers, consumer cleanup, and version binding reads', async () => {
   const prepared = await output();
   const triggerConfig = join(roots.at(-1)!, 'legacy-trigger.json');
@@ -833,7 +2245,9 @@ it('uses cf for Queue triggers, consumer cleanup, and version binding reads', as
         if (args[0] === 'queues' && args[1] === 'consumers' && args[2] === 'list') {
           return {
             status: 0,
-            stdout: JSON.stringify([{ script: 'void-test', consumer_id: 'consumer-id' }]),
+            stdout: JSON.stringify([
+              { type: 'worker', script_name: 'void-test', consumer_id: 'consumer-id' },
+            ]),
             stderr: '',
           };
         }
@@ -850,19 +2264,22 @@ it('uses cf for Queue triggers, consumer cleanup, and version binding reads', as
         return { status: 0, stdout: '', stderr: '' };
       },
     });
-    const invalid = await runner(['versions', 'deploy', 'invalid@100', '--name', 'void-test'], {
-      capture: true,
-    });
+    const invalid = await runner(
+      operationFixtureRequest(['versions', 'deploy', 'invalid@100', '--name', 'void-test']),
+      {
+        capture: true,
+      },
+    );
     expect(invalid.status).toBe(1);
     const triggerArgs = ['triggers', 'deploy', '-c', triggerConfig, '--name', 'void-test'];
-    expect((await runner(triggerArgs, { capture: false })).status).toBe(0);
+    expect((await runner(operationFixtureRequest(triggerArgs), { capture: false })).status).toBe(0);
     const removeArgs = ['queues', 'consumer', 'remove', 'jobs', 'void-test'];
-    expect((await runner(removeArgs, { capture: false })).status).toBe(0);
+    expect((await runner(operationFixtureRequest(removeArgs), { capture: false })).status).toBe(0);
     const viewArgs = ['versions', 'view', 'version-id', '--name', 'void-test'];
-    const version = await runner(viewArgs, { capture: true });
-    expect(JSON.parse(version.stdout).resources.bindings).toEqual([
-      { name: 'SECRET', type: 'secret_text' },
-    ]);
+    const version = await runner(operationFixtureRequest(viewArgs), { capture: true });
+    expect(
+      (version.data as { resources: { bindings: Array<unknown> } }).resources.bindings,
+    ).toEqual([{ name: 'SECRET', type: 'secret_text' }]);
     expect(calls).toContainEqual(['workers', 'triggers', 'deploy', '--prebuilt']);
     expect(calls).toContainEqual([
       'queues',
@@ -894,12 +2311,20 @@ it('accepts only the staged static assets directory already sealed into prebuilt
     });
     const common = ['--name', 'void-test', '--assets'];
     expect(
-      (await runner(['versions', 'upload', ...common, '/staged/assets'], { capture: true })).status,
+      (
+        await runner(operationFixtureRequest(['versions', 'upload', ...common, '/staged/assets']), {
+          capture: true,
+        })
+      ).status,
     ).toBe(0);
     expect(calls.at(-1)?.slice(0, 4)).toEqual(['workers', 'versions', 'create', '--prebuilt']);
-    expect((await runner(['deploy', ...common, '/wrong/assets'], { capture: true })).status).toBe(
-      1,
-    );
+    expect(
+      (
+        await runner(operationFixtureRequest(['deploy', ...common, '/wrong/assets']), {
+          capture: true,
+        })
+      ).status,
+    ).toBe(1);
     expect(calls).toHaveLength(1);
   } finally {
     prepared.dispose();
@@ -926,7 +2351,11 @@ it.each(['r2', 'queue'] as const)(
       configPath: join(roots.at(-1)!, 'dist', 'ssr', 'wrangler.json'),
       runCf,
       verifyCompatibilityRunner: () => true,
-      runWrangler: async () => ({ status: 1, stdout: '', stderr: 'Queue not found.' }),
+      runWrangler: operationFixture(async () => ({
+        status: 1,
+        stdout: '',
+        stderr: 'Queue not found.',
+      })),
     });
     try {
       const runner = createCfVersionRunner({
@@ -936,14 +2365,34 @@ it.each(['r2', 'queue'] as const)(
         verifyResources: verifier,
       });
       expect(
-        (await runner(['versions', 'upload', '--name', 'void-test'], { capture: true })).status,
-      ).toBe(1);
-      expect((await runner(['deploy', '--name', 'void-test'], { capture: true })).status).toBe(1);
-      expect(
         (
-          await runner(['triggers', 'deploy', '-c', triggerConfig, '--name', 'void-test'], {
+          await runner(operationFixtureRequest(['versions', 'upload', '--name', 'void-test']), {
             capture: true,
           })
+        ).status,
+      ).toBe(1);
+      expect(
+        (
+          await runner(operationFixtureRequest(['deploy', '--name', 'void-test']), {
+            capture: true,
+          })
+        ).status,
+      ).toBe(1);
+      expect(
+        (
+          await runner(
+            operationFixtureRequest([
+              'triggers',
+              'deploy',
+              '-c',
+              triggerConfig,
+              '--name',
+              'void-test',
+            ]),
+            {
+              capture: true,
+            },
+          )
         ).status,
       ).toBe(1);
       expect(cfCalls.every((args) => args[0] === 'r2' && args[1] === 'buckets')).toBe(true);
@@ -979,14 +2428,18 @@ it('uploads when existing R2 and Queue bindings are verified by exact identity',
         configPath: join(roots.at(-1)!, 'dist', 'ssr', 'wrangler.json'),
         runCf,
         verifyCompatibilityRunner: () => true,
-        runWrangler: async (args) => {
+        runWrangler: operationFixture(async (args) => {
           queueCalls.push(args);
           return { status: 0, stdout: 'Queue Name: jobs\n', stderr: '' };
-        },
+        }),
       }),
     });
     expect(
-      (await runner(['versions', 'upload', '--name', 'void-test'], { capture: true })).status,
+      (
+        await runner(operationFixtureRequest(['versions', 'upload', '--name', 'void-test']), {
+          capture: true,
+        })
+      ).status,
     ).toBe(0);
     expect(cfCalls).toEqual([
       ['r2', 'buckets', 'get', 'bucket', '--cf-r2-jurisdiction', 'eu'],
