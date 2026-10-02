@@ -49,9 +49,8 @@ const { frontmatter } = useData();
     </section>
 
     <HomePlatform />
+    <div class="wrapper border-stroke h-16 sm:h-30" aria-hidden="true"></div>
   </div>
-
-  <Spacer />
 
   <Footer
     :heading="frontmatter.footer_heading"

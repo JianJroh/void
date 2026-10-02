@@ -1,7 +1,7 @@
 <script setup>
 import { Icon } from '@iconify/vue';
 import { useData } from 'vitepress';
-import placeholderImage from './feature-placeholder.svg';
+import HomeFeatureVisual from './HomeFeatureVisual.vue';
 
 const { frontmatter } = useData();
 </script>
@@ -44,12 +44,7 @@ const { frontmatter } = useData();
       <div
         class="bg-slate border-t border-nickel md:border-t-0 min-h-[22rem] sm:min-h-[30rem] p-5 sm:p-10 flex items-center justify-center"
       >
-        <img
-          :src="feature.image || placeholderImage"
-          :alt="feature.imageAlt || ''"
-          class="w-full max-w-[32rem]"
-          loading="lazy"
-        />
+        <HomeFeatureVisual v-if="feature.visual" :kind="feature.visual" />
       </div>
     </section>
   </div>

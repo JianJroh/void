@@ -4,8 +4,8 @@ theme: dark
 
 hero:
   name: Void
-  text: Full-stack apps with Vite
-  tagline: Add server routes, data, and Cloudflare resources to your app. Deploy with one command.
+  text: Ship Vite Apps at Warp Speed
+  tagline: Void unifies build and deploy so apps go from local save to global production without glue code or configuration overhead.
   actions:
     - theme: brand
       text: Get Started
@@ -19,6 +19,7 @@ hero:
 
 features:
   - iconify: lucide:terminal
+    visual: deploy
     title: Deploy with One Command
     command: void deploy
     details: builds your app, provisions resources, applies migrations, and deploys it.
@@ -30,6 +31,7 @@ features:
       text: Deployment guide
       link: /guide/deployment
   - iconify: lucide:layers
+    visual: stack
     title: Full-Stack Features
     details: Use a database, KV, object storage, AI, authentication, queues, and cron jobs as your app needs them.
     highlights:
@@ -40,6 +42,7 @@ features:
       text: Explore app types
       link: /guide/app-types
   - iconify: lucide:blocks
+    visual: frameworks
     title: Choose Your Framework
     details: 'Scale your apps based on what you need: API-only, SPA + API, or full-stack.'
     highlights:
@@ -49,17 +52,6 @@ features:
     guide:
       text: Framework integrations
       link: /integrations/frameworks/overview
-  - iconify: lucide:bot
-    title: Work with Coding Agents
-    details: Void provides project instructions and skills to help coding agents build and deploy your app.
-    highlights:
-      - Project instructions from void init --agents
-      - Version-matched documentation
-      - Skills for building and migrating Void apps
-    guide:
-      text: Coding agents guide
-      link: /integrations/agents
-
 footer_heading: Build with Vite. Deploy with Void.
 footer_subheading: Server code, resources, and deployment in one workflow.
 ---
