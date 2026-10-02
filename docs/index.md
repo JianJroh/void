@@ -5,7 +5,7 @@ theme: dark
 hero:
   name: Void
   text: Ship Vite Apps at Warp Speed
-  tagline: Void unifies build and deploy so apps go from local save to global production without glue code or configuration overhead.
+  tagline: Void is an SDK, platform and CLI that unifies build and deploy so apps go from local save to global production.
   actions:
     - theme: brand
       text: Get Started

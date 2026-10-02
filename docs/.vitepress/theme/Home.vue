@@ -25,7 +25,8 @@ const { frontmatter } = useData();
     class="wrapper border-t border-nickel px-5 sm:px-10 h-70 sm:h-[22rem] flex flex-col justify-center gap-6 text-center items-center"
     aria-labelledby="features-heading"
   >
-    <h2 id="features-heading" class="text-white">Full-Stack Apps with Vite</h2>
+    <img src="/void-sdk.svg" alt="" aria-hidden="true" class="section-label" />
+    <h2 id="features-heading" class="text-white">Turn Vite Apps Full-Stack</h2>
     <p class="max-w-md text-white/70 text-balance sm:text-pretty">
       Use your favorite Vite framework, add the backend features you need, and deploy with one
       command.
@@ -36,9 +37,10 @@ const { frontmatter } = useData();
 
   <div class="bg-white text-primary">
     <section
-      class="wrapper border-t border-stroke px-5 sm:px-10 h-70 sm:h-80 flex flex-col justify-center gap-5"
+      class="wrapper border-t border-stroke px-5 sm:px-10 h-70 sm:h-80 flex flex-col justify-center items-center gap-5 text-center"
       aria-labelledby="full-stack-heading"
     >
+      <img src="/void-platform-dark.svg" alt="" aria-hidden="true" class="section-label" />
       <h2 id="full-stack-heading" class="text-primary text-2xl md:text-[2.5rem]">
         Self-host Void Platform
       </h2>
@@ -64,6 +66,11 @@ const { frontmatter } = useData();
 .hero-file-tree {
   margin-top: 2rem;
   max-width: calc(100vw - 80px);
+}
+
+.section-label {
+  height: 0.9rem;
+  width: auto;
 }
 
 @media (min-width: 768px) {
