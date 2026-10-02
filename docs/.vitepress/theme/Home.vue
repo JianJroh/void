@@ -42,11 +42,11 @@ const { frontmatter } = useData();
     >
       <img src="/void-platform-dark.svg" alt="" aria-hidden="true" class="section-label" />
       <h2 id="full-stack-heading" class="text-primary text-2xl md:text-[2.5rem]">
-        Self-host Void Platform
+        Deploy with your Security Built-In
       </h2>
       <p class="max-w-md text-pretty text-primary/70">
-        Run Void Platform in your team's Cloudflare account. Manage projects centrally while
-        developers deploy from the CLI.
+        Self-host your team's Void Platform and customize it to fit your security needs. Unlock fast
+        deployment for your team.
       </p>
     </section>
 
