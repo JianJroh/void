@@ -35,7 +35,7 @@ const { frontmatter } = useData();
 
   <HomeFeatures />
 
-  <div class="bg-white text-primary">
+  <div class="platform-surface bg-white text-primary">
     <section
       class="wrapper border-t border-stroke px-5 sm:px-10 h-70 sm:h-80 flex flex-col justify-center items-center gap-5 text-center"
       aria-labelledby="full-stack-heading"
@@ -51,7 +51,7 @@ const { frontmatter } = useData();
     </section>
 
     <HomePlatform />
-    <div class="wrapper border-stroke h-16 sm:h-30" aria-hidden="true"></div>
+    <Spacer />
   </div>
 
   <Footer
@@ -71,6 +71,18 @@ const { frontmatter } = useData();
 .section-label {
   height: 0.9rem;
   width: auto;
+}
+
+.platform-surface :deep(.wrapper) {
+  border-color: var(--color-stroke);
+}
+
+.platform-surface :deep(.wrapper--ticks::before) {
+  border-left-color: var(--color-stroke);
+}
+
+.platform-surface :deep(.wrapper--ticks::after) {
+  border-right-color: var(--color-stroke);
 }
 
 @media (min-width: 768px) {
