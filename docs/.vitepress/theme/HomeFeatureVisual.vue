@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { Icon } from '@iconify/vue';
+import RiveAnimation from '@components/shared/RiveAnimation.vue';
+import frameworksAnimation from './assets/animations/639_x_320_flexible_plugin_cloudflare_void.riv';
 import voidLogo from './void-dark.svg';
 
 defineProps<{
@@ -18,19 +19,10 @@ const capabilities = [
   'AI inference',
 ];
 
-const frameworks = [
-  { name: 'React', icon: 'logos:react' },
-  { name: 'Vue', icon: 'logos:vue' },
-  { name: 'Svelte', icon: 'logos:svelte-icon' },
-  { name: 'Solid', icon: 'logos:solidjs-icon' },
-  { name: 'Nuxt', icon: 'logos:nuxt-icon' },
-  { name: 'Astro', icon: 'simple-icons:astro' },
-];
-
 const descriptions = {
   deploy: 'Illustrative terminal showing the steps in a Void deployment.',
   stack: 'Void brings edge runtime, data, storage, jobs, email, and AI together.',
-  frameworks: 'Tiles for React, Vue, Svelte, Solid, Nuxt, and Astro.',
+  frameworks: 'Animated illustration of Void framework integrations.',
 };
 </script>
 
@@ -68,11 +60,13 @@ const descriptions = {
       <img :src="voidLogo" alt="" class="stack-logo" />
     </div>
 
-    <div v-else-if="kind === 'frameworks'" class="framework-grid">
-      <div v-for="framework in frameworks" :key="framework.name" class="framework-tile">
-        <Icon :icon="framework.icon" class="framework-icon" />
-        <span>{{ framework.name }}</span>
-      </div>
+    <div v-else-if="kind === 'frameworks'" class="framework-animation">
+      <RiveAnimation
+        :desktop-src="frameworksAnimation"
+        :desktop-width="639"
+        :desktop-height="320"
+        canvas-class="w-full h-auto"
+      />
     </div>
   </div>
 </template>
@@ -203,55 +197,18 @@ const descriptions = {
 }
 
 .feature-visual--frameworks {
-  background: radial-gradient(circle at 50% 30%, #2b2738, #111017 72%);
+  border: 0;
+  background: transparent;
 }
 
-.framework-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0.7rem;
-  width: min(78%, 28rem);
-  transform: perspective(700px) rotateX(22deg) rotateZ(-10deg);
-}
-
-.framework-tile {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 0.45rem;
-  min-height: 5.3rem;
-  border: 1px solid #4b445a;
-  border-radius: 12px;
-  background: linear-gradient(145deg, #302b3a, #211e29);
-  box-shadow:
-    0 9px 0 #0b0a10,
-    0 16px 20px rgba(0, 0, 0, 0.28);
-  color: #f1eef7;
-  font-family: var(--font-mono);
-  font-size: 0.65rem;
-}
-
-.framework-icon {
-  width: 1.8rem;
-  height: 1.8rem;
+.framework-animation {
+  width: 100%;
+  max-width: 40rem;
 }
 
 @media (min-width: 768px) {
   .feature-visual {
     height: 20rem;
-  }
-}
-
-@media (max-width: 420px) {
-  .framework-grid {
-    gap: 0.5rem;
-    width: 83%;
-    transform: perspective(700px) rotateX(18deg) rotateZ(-7deg);
-  }
-
-  .framework-tile {
-    min-height: 4.6rem;
   }
 }
 </style>

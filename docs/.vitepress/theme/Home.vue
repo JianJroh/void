@@ -25,7 +25,9 @@ const { frontmatter } = useData();
     class="wrapper border-t border-nickel px-5 sm:px-10 h-70 sm:h-[22rem] flex flex-col justify-center gap-6 text-center items-center"
     aria-labelledby="features-heading"
   >
-    <img src="/void-sdk.svg" alt="" aria-hidden="true" class="section-label" />
+    <a href="/guide/" class="section-label-link" aria-label="Void SDK guide">
+      <img src="/void-sdk.svg" alt="" class="section-label section-label--sdk" />
+    </a>
     <h2 id="features-heading" class="text-white">Turn Vite Apps Full-Stack</h2>
     <p class="max-w-md text-white/70 text-balance sm:text-pretty">
       Use your favorite Vite framework, add the backend features you need, and deploy with one
@@ -40,7 +42,13 @@ const { frontmatter } = useData();
       class="wrapper border-t border-stroke px-5 sm:px-10 h-70 sm:h-80 flex flex-col justify-center items-center gap-5 text-center"
       aria-labelledby="full-stack-heading"
     >
-      <img src="/void-platform-dark.svg" alt="" aria-hidden="true" class="section-label" />
+      <a
+        href="/guide/self-hosted-platform"
+        class="section-label-link"
+        aria-label="Self-host Void Platform guide"
+      >
+        <img src="/void-platform-dark.svg" alt="" class="section-label" />
+      </a>
       <h2 id="full-stack-heading" class="text-primary text-2xl md:text-[2.5rem]">
         Deploy with your Security Built-In
       </h2>
@@ -71,6 +79,24 @@ const { frontmatter } = useData();
 .section-label {
   height: 0.9rem;
   width: auto;
+}
+
+.section-label--sdk {
+  width: 6rem;
+  height: auto;
+}
+
+.section-label-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 0.9rem;
+  line-height: 0;
+}
+
+.section-label-link:focus-visible {
+  outline: 2px solid var(--color-electric);
+  outline-offset: 4px;
 }
 
 .platform-surface :deep(.wrapper) {
