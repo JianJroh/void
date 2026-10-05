@@ -2,6 +2,7 @@
 import { Icon } from '@iconify/vue';
 import { useData } from 'vitepress';
 import HomeFeatureVisual from './HomeFeatureVisual.vue';
+import HomeResourceCode from './HomeResourceCode.vue';
 
 const { frontmatter } = useData();
 </script>
@@ -42,10 +43,18 @@ const { frontmatter } = useData();
         </a>
       </div>
       <div
-        class="bg-primary border-t border-nickel md:border-t-0 min-h-[22rem] sm:min-h-[30rem] p-5 sm:p-10 flex items-center justify-center"
+        class="border-t border-nickel md:border-t-0 min-h-[22rem] sm:min-h-[30rem] min-w-0 flex items-center justify-center"
+        :class="feature.visual === 'resources' ? 'resources-background' : 'bg-primary p-5 sm:p-10'"
       >
-        <HomeFeatureVisual v-if="feature.visual" :kind="feature.visual" />
+        <HomeResourceCode v-if="feature.visual === 'resources'" />
+        <HomeFeatureVisual v-else-if="feature.visual" :kind="feature.visual" />
       </div>
     </section>
   </div>
 </template>
+
+<style scoped>
+.resources-background {
+  background: var(--color-wine) url('./assets/backgrounds/viteplus.jpg') center / cover;
+}
+</style>

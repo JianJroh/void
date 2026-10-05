@@ -5,7 +5,7 @@ theme: dark
 hero:
   name: Void
   text: Launch Vite Apps at Warp Speed
-  tagline: Void is an SDK, platform and CLI that unifies build and deploy so apps go from local save to global production.
+  tagline: Void is a full-stack SDK, platform and CLI that unifies building & deploying apps
   actions:
     - theme: brand
       text: Get Started
@@ -14,18 +14,6 @@ hero:
       text: View on Github
       link: https://github.com/voidzero-dev/void
 features:
-  - iconify: lucide:terminal
-    visual: deploy
-    title: Deploy with One Command
-    command: void deploy
-    details: builds your app, provisions resources, applies migrations, and deploys it.
-    highlights:
-      - Deploy to Cloudflare Workers or a Void platform
-      - Provision D1, KV, and R2 as your app uses them
-      - Validate and apply database migrations
-    guide:
-      text: Deployment guide
-      link: /guide/deployment
   - iconify: lucide:layers
     visual: stack
     title: Full-Stack Features
@@ -37,6 +25,17 @@ features:
     guide:
       text: Explore app types
       link: /guide/app-types
+  - iconify: lucide:wand-sparkles
+    visual: resources
+    title: Resources from Your Code
+    details: Void detects supported resources from your imports and provisions them on deploy. Configure existing resources explicitly.
+    highlights:
+      - Database, KV, and storage inferred from imports
+      - Local resources for development
+      - Types shared between server loaders and pages
+    guide:
+      text: Resource inference guide
+      link: /reference/resource-inference
   - iconify: lucide:blocks
     visual: frameworks
     title: Choose Your Framework
