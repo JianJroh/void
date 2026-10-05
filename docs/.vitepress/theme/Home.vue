@@ -3,6 +3,7 @@ import Footer from '@components/oss/Footer.vue';
 import Spacer from '@components/shared/Spacer.vue';
 import { useData } from 'vitepress';
 import Hero from './Hero.vue';
+import HomeCli from './HomeCli.vue';
 import HomeFeatures from './HomeFeatures.vue';
 import HomePlatform from './HomePlatform.vue';
 
@@ -13,6 +14,10 @@ const { frontmatter } = useData();
   <Hero />
 
   <Spacer />
+
+  <HomeCli />
+
+  <Spacer class="bg-primary" />
 
   <section
     class="wrapper border-t border-nickel px-5 sm:px-10 h-70 sm:h-[22rem] flex flex-col justify-center gap-6 text-center items-center"
