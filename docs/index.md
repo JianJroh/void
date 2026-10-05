@@ -4,7 +4,7 @@ theme: dark
 
 hero:
   name: Void
-  text: Ship Vite Apps at Warp Speed
+  text: Launch Vite Apps at Warp Speed
   tagline: Void is an SDK, platform and CLI that unifies build and deploy so apps go from local save to global production.
   actions:
     - theme: brand
@@ -13,10 +13,6 @@ hero:
     - theme: alt
       text: View on Github
       link: https://github.com/voidzero-dev/void
-  image:
-    src: /hero.svg
-    alt: Void deployment platform
-
 features:
   - iconify: lucide:terminal
     visual: deploy

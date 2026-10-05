@@ -42,8 +42,7 @@ const { frontmatter } = useData();
         </a>
       </div>
       <div
-        class="border-t border-nickel md:border-t-0 min-h-[22rem] sm:min-h-[30rem] p-5 sm:p-10 flex items-center justify-center"
-        :class="feature.visual === 'frameworks' ? 'bg-primary' : 'bg-slate'"
+        class="bg-primary border-t border-nickel md:border-t-0 min-h-[22rem] sm:min-h-[30rem] p-5 sm:p-10 flex items-center justify-center"
       >
         <HomeFeatureVisual v-if="feature.visual" :kind="feature.visual" />
       </div>

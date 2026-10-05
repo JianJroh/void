@@ -1,27 +1,15 @@
 <script setup lang="ts">
 import RiveAnimation from '@components/shared/RiveAnimation.vue';
-import frameworksAnimation from './assets/animations/639_x_320_flexible_plugin_cloudflare_void.riv';
-import voidLogo from './void-dark.svg';
+import frameworksAnimation from './assets/animations/640_x_320_vite_frameworks_diamond.riv';
+import connectorsAnimation from './assets/animations/640_x_320_void_connectors.riv';
 
 defineProps<{
   kind: 'deploy' | 'stack' | 'frameworks';
 }>();
 
-const capabilities = [
-  'Serverless edge',
-  'Database',
-  'Key-value cache',
-  'Object storage',
-  'Queues',
-  'Cron jobs',
-  'API layer',
-  'Email',
-  'AI inference',
-];
-
 const descriptions = {
   deploy: 'Illustrative terminal showing the steps in a Void deployment.',
-  stack: 'Void brings edge runtime, data, storage, jobs, email, and AI together.',
+  stack: 'Animated illustration of Void connectors.',
   frameworks: 'Animated illustration of Void framework integrations.',
 };
 </script>
@@ -48,23 +36,21 @@ const descriptions = {
       </div>
     </div>
 
-    <div v-else-if="kind === 'stack'" class="stack-diagram">
-      <ul class="stack-list">
-        <li v-for="capability in capabilities" :key="capability">{{ capability }}</li>
-      </ul>
-      <svg class="stack-brace" viewBox="0 0 60 240" preserveAspectRatio="none" focusable="false">
-        <path
-          d="M2 2H18C43 2 43 17 43 40V94C43 111 48 118 58 120C48 122 43 129 43 146V200C43 223 43 238 18 238H2"
-        />
-      </svg>
-      <img :src="voidLogo" alt="" class="stack-logo" />
+    <div v-else-if="kind === 'stack'" class="feature-animation">
+      <RiveAnimation
+        :desktop-src="connectorsAnimation"
+        :desktop-width="640"
+        :desktop-height="320"
+        canvas-class="w-full h-auto"
+      />
     </div>
 
-    <div v-else-if="kind === 'frameworks'" class="framework-animation">
+    <div v-else-if="kind === 'frameworks'" class="feature-animation">
       <RiveAnimation
         :desktop-src="frameworksAnimation"
-        :desktop-width="639"
+        :desktop-width="640"
         :desktop-height="320"
+        state-machines="State Machine 1"
         canvas-class="w-full h-auto"
       />
     </div>
@@ -146,62 +132,13 @@ const descriptions = {
   color: #22ff73;
 }
 
-.feature-visual--stack {
-  border-color: #e2e1e8;
-  background: #fbfbfd;
-}
-
-.stack-diagram {
-  display: grid;
-  grid-template-columns: minmax(0, 1.5fr) 2.6rem minmax(0, 1fr);
-  align-items: center;
-  gap: 0.5rem;
-  width: 100%;
-  height: 100%;
-  padding: 1rem;
-}
-
-.stack-list {
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  height: 100%;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.stack-list li {
-  color: #16171d;
-  font-family: var(--font-heading);
-  font-size: clamp(0.65rem, 1.1vw, 0.86rem);
-  font-weight: 500;
-  line-height: 1.15;
-  white-space: nowrap;
-}
-
-.stack-brace {
-  width: 100%;
-  height: 100%;
-  fill: none;
-  stroke: #16171d;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 3;
-}
-
-.stack-logo {
-  width: 100%;
-  max-width: 10rem;
-  height: auto;
-}
-
+.feature-visual--stack,
 .feature-visual--frameworks {
   border: 0;
   background: transparent;
 }
 
-.framework-animation {
+.feature-animation {
   width: 100%;
   max-width: 40rem;
 }
