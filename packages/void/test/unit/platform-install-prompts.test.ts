@@ -1,4 +1,9 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { stripVTControlCharacters } from 'node:util';
 import { createPlatformDeploymentManifest } from '@void/platform';
+import { CANCEL_SYMBOL, intro } from '@voidzero-dev/vite-plus-prompts';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import { pc } from '../../src/cli/output.ts';
 import { parsePlatformArgs } from '../../src/cli/platform-args.ts';
@@ -14,21 +19,32 @@ const mocks = vi.hoisted(() => ({
   text: vi.fn(),
   plan: vi.fn(),
 }));
-vi.mock('@clack/prompts', async (original) => ({
-  ...(await original<typeof import('@clack/prompts')>()),
+
+function notesWithoutColors(): Array<[string, string]> {
+  return mocks.note.mock.calls.map(([message, title]) => [
+    stripVTControlCharacters(message),
+    stripVTControlCharacters(title),
+  ]);
+}
+vi.mock('@voidzero-dev/vite-plus-prompts', async (original) => ({
+  ...(await original<typeof import('@voidzero-dev/vite-plus-prompts')>()),
   // These fixtures retain GitHub-only setup; Access choices have their own matrix.
   confirm: (input: { message: string }) =>
     input.message === 'Also protect the platform UI and APIs with Cloudflare Access?'
       ? Promise.resolve(false)
       : mocks.confirm(input),
   multiselect: mocks.multiselect,
-  select: mocks.select,
+  select: (input: { message: string }) =>
+    input.message === 'Who should be able to access deployed apps?'
+      ? Promise.resolve('public')
+      : mocks.select(input),
   text: mocks.text,
   intro: vi.fn(),
   note: mocks.note,
   outro: vi.fn(),
 }));
-vi.mock('../../src/cli/platform-auth.ts', () => ({
+vi.mock('../../src/cli/platform-auth.ts', async (original) => ({
+  ...(await original<typeof import('../../src/cli/platform-auth.ts')>()),
   resolvePlatformCloudflareCredential: async () => ({ source: 'oauth', token: 'test-token' }),
   resolvePlatformCloudflareCredentialWithInput: async (input: () => Promise<unknown>) => ({
     input: await input(),
@@ -47,6 +63,7 @@ vi.mock('../../src/cli/platform-plan.ts', async (original) => ({
 }));
 
 const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
+let directory: string;
 const args = [
   'install',
   '--plan',
@@ -60,6 +77,8 @@ const args = [
 
 beforeEach(() => {
   vi.clearAllMocks();
+  directory = mkdtempSync(join(tmpdir(), 'void-install-prompts-'));
+  vi.stubEnv('VOID_PLATFORM_REGISTRY_DIR', directory);
   mocks.multiselect.mockResolvedValue(['github']);
   Object.defineProperty(process.stdin, 'isTTY', { configurable: true, value: true });
   vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -67,16 +86,14 @@ beforeEach(() => {
     { id: 'account', name: 'Account' },
   ]);
   vi.spyOn(PlatformCloudflareClient.prototype, 'listHyperdriveConfigs').mockResolvedValue([]);
-  mocks.text.mockResolvedValue('');
+  mocks.text.mockImplementation(async ({ defaultValue }) => defaultValue ?? '');
   mocks.select.mockImplementation(async ({ message, options }) =>
     message === 'How should Void set up Hyperdrive?' ||
     message === 'Which Hyperdrive should Void use?'
       ? options[0].value
       : 'workers-dev',
   );
-  mocks.confirm.mockImplementation(async ({ message }) =>
-    message.startsWith('Use ') ? true : false,
-  );
+  mocks.confirm.mockResolvedValue(false);
   mocks.plan.mockResolvedValue({
     account: { id: 'account', name: 'Account' },
     actions: [],
@@ -92,6 +109,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+  rmSync(directory, { recursive: true, force: true });
   if (ttyDescriptor) {
     Object.defineProperty(process.stdin, 'isTTY', ttyDescriptor);
   } else {
@@ -100,7 +118,8 @@ afterEach(() => {
 });
 
 describe('interactive platform installation prompts', () => {
-  it('lists and confirms an externally managed Hyperdrive with an unrelated name', async () => {
+  it('uses the selected Hyperdrive without a second confirmation', async () => {
+    mocks.multiselect.mockResolvedValueOnce(['google', 'oidc']);
     vi.spyOn(PlatformCloudflareClient.prototype, 'listHyperdriveConfigs').mockResolvedValue([
       { id: 'other-id', name: 'another-database' },
       { id: 'terraform-id', name: 'company-managed-postgres' },
@@ -111,7 +130,8 @@ describe('interactive platform installation prompts', () => {
       origin: {
         database: 'void_platform',
         host: 'hyperdrive-productiondb.databases.cfdata.org/itdb/primary',
-        port: 5432,
+        accessClientId: 'tunnel-client-id',
+        port: null,
         scheme: 'postgresql',
         user: 'hyperdrive_void_platform_service',
       },
@@ -126,10 +146,12 @@ describe('interactive platform installation prompts', () => {
     );
     await runPlatformLifecycleCommand(parsePlatformArgs([...args, '--workers-dev']));
 
-    expect(mocks.note).toHaveBeenCalledWith(
-      expect.stringContaining('Database: void_platform'),
+    expect(intro).not.toHaveBeenCalled();
+
+    expect(notesWithoutColors()).toContainEqual([
+      expect.stringContaining('Port: configured by Cloudflare Tunnel'),
       'Existing Hyperdrive company-managed-postgres',
-    );
+    ]);
     expect(mocks.select).toHaveBeenCalledWith({
       message: 'How should Void set up Hyperdrive?',
       options: [
@@ -145,16 +167,22 @@ describe('interactive platform installation prompts', () => {
         { value: 'terraform-id', label: 'company-managed-postgres', hint: 'terraform-id' },
       ],
     });
-    expect(mocks.confirm).toHaveBeenCalledWith({
-      message: 'Use company-managed-postgres for this platform?',
-      initialValue: true,
-    });
+    expect(mocks.confirm).not.toHaveBeenCalled();
+    expect(mocks.multiselect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: 'Platform login methods (select all that apply):',
+        initialValues: [],
+        required: true,
+      }),
+    );
     expect(mocks.plan).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
+        authentication: { providers: ['google', 'oidc'], configurable: true },
         externalHyperdrive: {
           id: 'terraform-id',
           name: 'company-managed-postgres',
+          database: 'void_platform',
           host: 'hyperdrive-productiondb.databases.cfdata.org/itdb/primary',
           user: 'hyperdrive_void_platform_service',
         },
@@ -178,6 +206,10 @@ describe('interactive platform installation prompts', () => {
     expect(mocks.select).not.toHaveBeenCalled();
     expect(mocks.multiselect).not.toHaveBeenCalled();
     expect(mocks.confirm).not.toHaveBeenCalled();
+    expect(notesWithoutColors()).not.toContainEqual([
+      expect.any(String),
+      'Existing Hyperdrive company-managed-postgres',
+    ]);
     expect(PlatformCloudflareClient.prototype.getHyperdriveConfig).toHaveBeenCalledWith(
       'account',
       'terraform-id',
@@ -259,39 +291,30 @@ describe('interactive platform installation prompts', () => {
         { value: 'setup', label: 'Set up a separately managed Hyperdrive' },
       ],
     });
-    expect(mocks.note).toHaveBeenCalledWith(
+    expect(notesWithoutColors()).toContainEqual([
       expect.stringContaining('with any unused name such as void-test-database'),
       'Set up Hyperdrive first',
-    );
+    ]);
     expect(mocks.plan).not.toHaveBeenCalled();
   });
 
-  it('stops before planning if an existing Hyperdrive is declined', async () => {
+  it('stops before planning if Hyperdrive selection is cancelled', async () => {
     vi.spyOn(PlatformCloudflareClient.prototype, 'listHyperdriveConfigs').mockResolvedValue([
       { id: 'terraform-id', name: 'void-test-database' },
     ]);
-    vi.spyOn(PlatformCloudflareClient.prototype, 'getHyperdriveConfig').mockResolvedValue({
-      id: 'terraform-id',
-      name: 'void-test-database',
-      origin: {
-        database: 'void_platform',
-        host: 'db.example.com',
-        port: 5432,
-        scheme: 'postgresql',
-        user: 'runtime_user',
-      },
-      cachingDisabled: true,
-    });
-
-    mocks.confirm.mockResolvedValue(false);
+    const getConfig = vi.spyOn(PlatformCloudflareClient.prototype, 'getHyperdriveConfig');
+    mocks.select.mockImplementation(async ({ message }) =>
+      message === 'Which Hyperdrive should Void use?' ? CANCEL_SYMBOL : 'existing',
+    );
 
     await expect(
       runPlatformLifecycleCommand(parsePlatformArgs([...args, '--workers-dev'])),
     ).rejects.toThrow('Cancelled');
+    expect(getConfig).not.toHaveBeenCalled();
     expect(mocks.plan).not.toHaveBeenCalled();
   });
 
-  it('bolds platform runtime labels without styling their values', async () => {
+  it('bolds all section headings and runtime labels without styling their values', async () => {
     vi.spyOn(pc, 'bold').mockImplementation(pc.createColors(true).bold);
     const runtime = loadPlatformRuntime('');
     await runPlatformLifecycleCommand(parsePlatformArgs([...args, '--workers-dev']));
@@ -302,12 +325,17 @@ describe('interactive platform installation prompts', () => {
         `\u001b[1mRevision:\u001b[22m ${runtime.manifest.sourceRevision ?? 'not recorded'}`,
         `\u001b[1mManifest SHA-256:\u001b[22m ${runtime.manifestSha256}`,
       ].join('\n'),
-      'Platform runtime',
+      '\u001b[1mPlatform runtime\u001b[22m',
     );
+    expect(mocks.note.mock.calls.map(([, title]) => title)).toEqual([
+      '\u001b[1mRead-only installation plan\u001b[22m',
+      '\u001b[1mPlatform runtime\u001b[22m',
+      '\u001b[1mRequired Credentials\u001b[22m',
+    ]);
   });
 
-  it('uses a placeholder, not a prefilled installation name', async () => {
-    mocks.text.mockResolvedValueOnce('my-team');
+  it('preserves the entered name in the display name suggestion', async () => {
+    mocks.text.mockResolvedValueOnce('My Team');
     await runPlatformLifecycleCommand(
       parsePlatformArgs(['install', '--plan', '--account', 'account', '--workers-dev']),
     );
@@ -315,7 +343,7 @@ describe('interactive platform installation prompts', () => {
     expect(prompt).toMatchObject({ message: 'Installation name:', placeholder: 'company' });
     expect(prompt).not.toHaveProperty('initialValue');
     expect(prompt.validate('')).toBe('A value is required.');
-    expect(prompt.validate('my-team')).toBeUndefined();
+    expect(prompt.validate('My Team')).toBeUndefined();
     expect(mocks.plan).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ installationSlug: 'my-team' }),
@@ -325,8 +353,52 @@ describe('interactive platform installation prompts', () => {
     expect(mocks.text).toHaveBeenCalledWith(
       expect.objectContaining({
         message: 'Platform display name:',
-        initialValue: 'my-team Void',
+        placeholder: 'My Team Void',
+        defaultValue: 'My Team Void',
       }),
+    );
+  });
+
+  it('accepts suggested zones and display names while requiring an application domain', async () => {
+    mocks.select.mockResolvedValue('domain');
+    mocks.text.mockResolvedValueOnce('apps.example.com');
+    await runPlatformLifecycleCommand(
+      parsePlatformArgs(['install', '--plan', '--name', 'team', '--account', 'account']),
+    );
+    const domainPrompt = mocks.text.mock.calls.find(
+      ([input]) => input.message === 'Application base domain:',
+    )![0];
+    expect(domainPrompt.validate('')).toBe('A value is required.');
+    expect(domainPrompt).not.toHaveProperty('defaultValue');
+    for (const [message, suggestion] of [
+      ['Cloudflare zone:', 'apps.example.com'],
+      ['Platform display name:', 'team Void'],
+    ]) {
+      const prompt = mocks.text.mock.calls.find(([input]) => input.message === message)![0];
+      expect(prompt).toMatchObject({ placeholder: suggestion, defaultValue: suggestion });
+      expect(prompt).not.toHaveProperty('initialValue');
+      expect(prompt.validate('')).toBeUndefined();
+    }
+    const apiPrompt = mocks.text.mock.calls.find(([input]) =>
+      input.message.startsWith('Where do you want to host the Void Platform API?'),
+    )![0];
+    expect(apiPrompt).toMatchObject({
+      message:
+        'Where do you want to host the Void Platform API? Leave empty for a workers.dev fallback.',
+      placeholder: 'apps.example.com',
+    });
+    expect(apiPrompt).not.toHaveProperty('initialValue');
+    expect(apiPrompt).not.toHaveProperty('defaultValue');
+    expect(apiPrompt.validate('')).toBeUndefined();
+    expect(mocks.plan).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        zoneName: 'apps.example.com',
+        displayName: 'team Void',
+        controlPlaneDomain: '',
+      }),
+      null,
+      expect.anything(),
     );
   });
 
@@ -336,6 +408,13 @@ describe('interactive platform installation prompts', () => {
   ])('skips the dedicated-zone question for testing mode: $name', async ({ flags }) => {
     await runPlatformLifecycleCommand(parsePlatformArgs([...args, ...flags]));
     expect(mocks.confirm).not.toHaveBeenCalled();
+    expect(mocks.text).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message:
+          'Where do you want to host the Void Platform API? Leave empty for a workers.dev fallback.',
+        placeholder: 'platform.example.com',
+      }),
+    );
     expect(mocks.plan).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ workersDev: true, zoneName: '', dedicatedZone: false }),

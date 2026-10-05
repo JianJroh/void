@@ -1,12 +1,11 @@
-import { intro, outro, log, select, confirm, isCancel, cancel } from '@clack/prompts';
+import { outro, log, select, confirm, isCancel, cancel } from '@voidzero-dev/vite-plus-prompts';
 import { getToken } from './auth.ts';
 import { PlatformClient } from './client.ts';
-import { cliTitle, createSpinner, dim, ensureUtc, pc } from './output.ts';
+import { createSpinner, dim, ensureUtc, formatCount, pc } from './output.ts';
 import { readDeploymentPlatform, readProjectConfig } from './project.ts';
 
 export async function runRollbackCommand(root: string, deployId?: string): Promise<void> {
   console.log();
-  intro(cliTitle('project rollback'));
 
   const platform = readDeploymentPlatform(root);
   if (platform === 'cloudflare') {
@@ -83,7 +82,7 @@ export async function runRollbackCommand(root: string, deployId?: string): Promi
 
   if (migrationDiff.length > 0) {
     log.warn(
-      `The current database has ${migrationDiff.length} migration(s) applied after this deployment:`,
+      `The current database has ${formatCount(migrationDiff.length, 'migration')} applied after this deployment:`,
     );
     for (const m of migrationDiff) {
       log.message(`  ${dim('•')} ${m}`);
@@ -166,7 +165,7 @@ async function runCloudflareRollback(root: string, deployId?: string): Promise<v
         value: version.id,
         label: `${version.id} ${dim(formatAge(version.createdAt))}`,
         hint: version.metadata
-          ? `${version.metadata.migrations.length} migration(s)`
+          ? formatCount(version.metadata.migrations.length, 'migration')
           : 'migration state unknown',
       })),
     });
@@ -204,7 +203,7 @@ async function runCloudflareRollback(root: string, deployId?: string): Promise<v
     );
     if (migrationDiff.length > 0) {
       log.warn(
-        `The current database has ${migrationDiff.length} migration(s) applied after this version:`,
+        `The current database has ${formatCount(migrationDiff.length, 'migration')} applied after this version:`,
       );
       for (const migration of migrationDiff) {
         log.message(`  ${dim('•')} ${migration}`);

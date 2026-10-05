@@ -3,13 +3,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import type { PlatformClient } from '../../src/cli/client.ts';
+import { savePlatformConnection } from '../../src/cli/platform-registry.ts';
 
 const mockText = vi.fn();
 const mockInfo = vi.fn();
 const mockError = vi.fn();
 const mockWarn = vi.fn();
 
-vi.mock('@clack/prompts', () => ({
+vi.mock('@voidzero-dev/vite-plus-prompts', () => ({
   cancel: vi.fn(),
   isCancel: () => false,
   log: {
@@ -25,7 +26,7 @@ vi.mock('@clack/prompts', () => ({
 function createClient() {
   return {
     // `promptAndCreateProject` records the platform identity behind the client's
-    // API URL; the hosted Void Cloud URL resolves without any local connection.
+    // API URL, verified by an explicit connection.
     apiUrl: 'https://api.void.cloud',
     createProject: vi.fn(),
   } as unknown as PlatformClient & {
@@ -38,6 +39,16 @@ describe('promptAndCreateProject', () => {
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'void-create-project-'));
+    process.env.VOID_PLATFORM_REGISTRY_DIR = join(root, 'registry');
+    savePlatformConnection({
+      accountId: null,
+      apiUrl: 'https://api.void.cloud',
+      applicationDomain: 'void.app',
+      displayName: 'Test platform',
+      installationId: null,
+      kind: 'connected',
+      proxyUrl: 'https://proxy.void.cloud',
+    });
     writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'test-app' }));
     mockText.mockReset();
     mockInfo.mockReset();
@@ -46,6 +57,7 @@ describe('promptAndCreateProject', () => {
   });
 
   afterEach(() => {
+    delete process.env.VOID_PLATFORM_REGISTRY_DIR;
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -171,10 +183,14 @@ describe('promptAndCreateProject', () => {
     expect(client.createProject).toHaveBeenNthCalledWith(1, tooLong);
     expect(client.createProject).toHaveBeenNthCalledWith(2, 'shorter-app');
     expect(mockText).toHaveBeenCalledTimes(2);
-    // The rejected slug becomes the next prompt's initial value so the user
-    // edits it rather than retyping it.
-    const secondPrompt = mockText.mock.calls[1]?.[0] as { initialValue: string } | undefined;
-    expect(secondPrompt?.initialValue).toBe(tooLong);
+    // Enter must still validate a suggested slug rejected on the previous attempt.
+    const secondPrompt = mockText.mock.calls[1]?.[0] as {
+      defaultValue: string;
+      validate: (value: string) => string | undefined;
+    };
+    expect(secondPrompt.defaultValue).toBe(tooLong);
+    expect(secondPrompt.validate('')).toContain('Slug must be at most 56 characters');
+    expect(secondPrompt.validate('shorter-app')).toBeUndefined();
     expect(mockError).toHaveBeenCalledWith(
       expect.stringContaining('slug must be at most 56 characters'),
     );

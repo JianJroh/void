@@ -11,8 +11,17 @@ import {
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { intro, outro, log, confirm, isCancel, cancel, note, select, text } from '@clack/prompts';
 import type { PlatformDiscoveryDocument } from '@void/platform';
+import {
+  outro,
+  log,
+  confirm,
+  isCancel,
+  cancel,
+  note,
+  select,
+  text,
+} from '@voidzero-dev/vite-plus-prompts';
 import { parse, type ParseError } from 'jsonc-parser';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'pathslash';
 import { materializeCloudflareConfig } from '../cloudflare-config.ts';
@@ -30,7 +39,6 @@ import { maybeScaffoldEnvTs } from './env-scaffold.ts';
 import { migrateFrameworkAdapterPaths } from './framework-config-migrate.ts';
 import { initialCommitCommand, setupGit } from './init-git.ts';
 import { migrateLegacyVoidConfig } from './migrate.ts';
-import { cliTitle } from './output.ts';
 import { discoverPlatform, saveDiscoveredPlatform } from './platform-cmd.ts';
 import { formatProjectCommand } from './preset.ts';
 import {
@@ -604,11 +612,12 @@ async function resolveInitRoot(root: string): Promise<string> {
     return root;
   }
 
+  const defaultFolder = 'my-void-app';
   const folder = await text({
     message: 'New project folder name:',
-    placeholder: 'my-void-app',
-    initialValue: 'my-void-app',
-    validate: (value) => validateSubfolderName(root, value),
+    placeholder: defaultFolder,
+    defaultValue: defaultFolder,
+    validate: (value) => validateSubfolderName(root, value || defaultFolder),
   });
 
   if (isCancel(folder) || typeof folder === 'symbol') {
@@ -1862,7 +1871,7 @@ export async function ensureVoidPlatformConnection(
     selectedApiUrl = getApiUrl(root);
     getSiteDomain(root);
   } catch (error) {
-    if (!(error instanceof Error) || !error.message.includes('No Void platform selected')) {
+    if (!(error instanceof Error) || !error.message.includes('No Void platform connected')) {
       throw error;
     }
     // A genuinely new user must identify the company platform before login.
@@ -1920,10 +1929,6 @@ function getNodeVersionLine(root: string): string {
   }
   return 'node-version: lts/*';
 }
-
-// The default Void API endpoint baked into the scaffolded workflow. Users can
-// override it with a `VOID_API_URL` repository variable (see the env block).
-const WORKFLOW_DEFAULT_API_URL = 'https://api.void.cloud';
 
 // Per-package-manager install + setup steps. `void deploy` always runs through
 // the package-manager-appropriate runner in the deploy step below.
@@ -1988,7 +1993,7 @@ export function getWorkflowYaml(
   pm: ProjectState['packageManager'],
   slug: string | null,
   platform: 'cloudflare' | 'void' = 'void',
-  platformApiUrl: string = WORKFLOW_DEFAULT_API_URL,
+  platformApiUrl?: string,
 ): string {
   const { setup, install, runner } = getWorkflowSetupSteps(root, pm);
   if (platform === 'cloudflare') {
@@ -2024,6 +2029,11 @@ ${install}
           CF_ACCESS_CLIENT_SECRET: \${{ secrets.CF_ACCESS_CLIENT_SECRET }}
         run: ${runner} deploy --platform cloudflare
 `;
+  }
+  if (!platformApiUrl) {
+    throw new Error(
+      'init: Connect to a Void platform before generating a deployment workflow. Run `void connect <url>` first.',
+    );
   }
   // When the slug is unknown, fall back to a repository variable and prefix the
   // `VOID_PROJECT` line with a comment (each comment line indented to 2 spaces
@@ -2066,7 +2076,9 @@ jobs:
 ${setup}
 ${install}
       - name: Deploy
-        run: ${runner} deploy --platform void --project "$VOID_PROJECT"
+        run: |
+          ${runner} connect "$VOID_API_URL" --no-login
+          ${runner} deploy --platform void --project "$VOID_PROJECT"
 `;
 }
 
@@ -2074,7 +2086,7 @@ function setupGithubActions(
   root: string,
   state: ProjectState,
   platform: 'cloudflare' | 'void' = 'void',
-  platformApiUrl: string = WORKFLOW_DEFAULT_API_URL,
+  platformApiUrl?: string,
 ): void {
   const workflowDir = join(root, '.github', 'workflows');
   const workflowPath = join(workflowDir, 'void-deploy.yml');
@@ -3017,7 +3029,6 @@ function injectAgentBlock(root: string): void {
 
 export async function runInitCommand(root: string, initArgs?: InitArgs): Promise<void> {
   console.log();
-  intro(cliTitle('init'));
 
   const targeted = Boolean(initArgs && (initArgs.tsconfig || initArgs.github || initArgs.agents));
   if (!targeted) {

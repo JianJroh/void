@@ -46,9 +46,11 @@ export type CloudflareNamedResource = Readonly<{
   name: string;
 }>;
 export type CloudflareHyperdriveOrigin = Readonly<{
+  accessClientId?: string;
   database: string;
   host: string;
-  port: number;
+  /** Tunnel-backed origins get their database port from the tunnel service. */
+  port: number | null;
   scheme: 'postgresql';
   user: string | null;
 }>;
@@ -263,7 +265,7 @@ export class PlatformCloudflareClient {
         status === 401 || status === 403
           ? 'Check your Cloudflare login or API token permissions for this account, then rerun the command.'
           : status === 404
-            ? `Check ${setupUrl}. If no subdomain is shown, finish Workers onboarding and choose one; otherwise check account access and retry.`
+            ? `Open ${setupUrl} once to provision your account for Workers automatically, then retry the install.`
             : 'Rerun the command. If the dashboard already shows a subdomain, no Workers onboarding change is needed.';
       throw new Error(
         `platform: Could not read the workers.dev subdomain for account ${accountId} (${reason}). ${guidance}`,
@@ -1193,6 +1195,7 @@ export function hyperdriveOriginConfigHash(origin: CloudflareHyperdriveOrigin): 
         port: origin.port,
         scheme: 'postgresql',
         user: origin.user,
+        ...(origin.accessClientId ? { accessClientId: origin.accessClientId } : {}),
       }),
     )
     .digest('hex');
@@ -1206,6 +1209,7 @@ export function hyperdriveOriginMatches(
     live.database === expected.database &&
     live.host.toLowerCase() === expected.host.toLowerCase() &&
     live.port === expected.port &&
+    live.accessClientId === expected.accessClientId &&
     live.scheme === expected.scheme &&
     (live.user === null || live.user === expected.user)
   );
@@ -1221,8 +1225,17 @@ function parseHyperdriveConfig(value: Record<string, unknown>): CloudflareHyperd
   if (scheme !== 'postgres' && scheme !== 'postgresql') {
     throw new Error(`platform: Unsupported Hyperdrive origin scheme ${JSON.stringify(scheme)}.`);
   }
-  const port = typeof record.port === 'number' ? record.port : Number(record.port);
-  if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
+  const accessClientId =
+    typeof record.access_client_id === 'string' && record.access_client_id
+      ? record.access_client_id
+      : undefined;
+  const port =
+    accessClientId && record.port == null
+      ? null
+      : typeof record.port === 'number' || typeof record.port === 'string'
+        ? Number(record.port)
+        : NaN;
+  if (port !== null && (!Number.isInteger(port) || port <= 0 || port > 65_535)) {
     throw new Error('platform: Cloudflare Hyperdrive config has an invalid origin port.');
   }
   return {
@@ -1234,6 +1247,7 @@ function parseHyperdriveConfig(value: Record<string, unknown>): CloudflareHyperd
       !Array.isArray(value.caching) &&
       (value.caching as Record<string, unknown>).disabled === true,
     origin: {
+      ...(accessClientId ? { accessClientId } : {}),
       database: requiredString(record.database, 'Hyperdrive origin database'),
       host: requiredString(record.host, 'Hyperdrive origin host').toLowerCase(),
       port,

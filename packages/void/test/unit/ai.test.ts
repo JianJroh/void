@@ -1,5 +1,4 @@
-import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vite-plus/test';
-import type { ai } from '../../src/runtime/ai.ts';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 /**
  * Build a fake Workers AI binding (`env.AI`) for the P3 self-host backend.
@@ -25,6 +24,25 @@ function makeDirectAi(
 }
 
 describe('runtime ai', () => {
+  it.each([undefined, '1'])(
+    'rejects missing proxy metadata without sending credentials (legacy staging=%s)',
+    async (staging) => {
+      vi.resetModules();
+      const { envContext } = await import('../../src/runtime/env-raw.ts');
+      const { ai } = await import('../../src/runtime/ai.ts');
+      const request = vi.fn();
+      vi.stubGlobal('fetch', request);
+      await envContext.run(
+        { __VOID_TOKEN: 'token', __VOID_PROJECT_ID: 'project', __VOID_STAGING: staging },
+        async () => {
+          await expect(
+            ai.run('@cf/meta/llama', {}).match({ ok: (value) => value, limited: (limit) => limit }),
+          ).rejects.toThrow('No connected platform proxy');
+        },
+      );
+      expect(request).not.toHaveBeenCalled();
+    },
+  );
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -354,28 +372,6 @@ describe('runtime ai', () => {
       providerKey: 'sk-test',
       projectId: 'proj_1',
     });
-  });
-
-  it('types provider fetch calls', () => {
-    type ProviderMethod = typeof ai.provider;
-    const provider = undefined as unknown as ProviderMethod;
-
-    const assertTypes = () => {
-      provider('openai').fetch('/chat/completions', {
-        body: {
-          model: 'gpt-4o',
-          messages: [{ role: 'user', content: 'Hello' }],
-        },
-      });
-      provider('custom', { apiKeyEnv: 'CUSTOM_AI_KEY' }).fetch('/v1/respond', {
-        method: 'POST',
-        headers: { 'x-test': '1' },
-        body: new Uint8Array([1, 2]),
-      });
-    };
-
-    expectTypeOf(assertTypes).toBeFunction();
-    expectTypeOf(provider).toBeFunction();
   });
 
   it('returns blobs for non-JSON run responses', async () => {

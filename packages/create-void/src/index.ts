@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import * as p from '@clack/prompts';
+import * as p from '@voidzero-dev/vite-plus-prompts';
 import { resolve } from 'pathslash';
 import pc from 'picocolors';
 import { detectPM, pmExec, pmInstall, run, writePnpmBuildPolicy } from './pm.ts';
@@ -10,7 +10,6 @@ const pm = detectPM();
 
 async function main() {
   console.log();
-  p.intro(pc.bgCyan(pc.black(' create-void ')));
 
   // 1. Get app name from argv or prompt
   let appName = process.argv[2];

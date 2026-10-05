@@ -1,12 +1,13 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { log } from '@clack/prompts';
+import { stripVTControlCharacters } from 'node:util';
 import {
   CloudflareWorkerInspectionError,
   parseCloudflareVersionMessage,
   type CloudflareOperation,
 } from '@void/deploy-cloudflare';
+import { log } from '@voidzero-dev/vite-plus-prompts';
 import { toSlash } from 'pathslash';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import { activateCloudflareVersion as activateCloudflareVersionPrimitive } from '../../../deploy-cloudflare/src/index.ts';
@@ -102,19 +103,19 @@ const silentCliLog: CliLogger = {
   close: async () => {},
 };
 
-/** Run a deploy while capturing its user-facing success output. */
-async function captureSuccessMessages(run: () => Promise<void>): Promise<Array<string>> {
-  const messages: Array<string> = [];
-  const restore = log.success;
-  log.success = (message: string) => {
-    messages.push(message);
-  };
+/** Capture the real renderer so successful native deploys must emit an enclosed summary. */
+async function captureDeployOutput(run: () => Promise<void>): Promise<string> {
+  const chunks: Array<string> = [];
+  const write = vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+    chunks.push(String(chunk));
+    return true;
+  });
   try {
     await run();
   } finally {
-    log.success = restore;
+    write.mockRestore();
   }
-  return messages;
+  return stripVTControlCharacters(chunks.join(''));
 }
 
 /** Synthetic real ids (shape-valid) for drift/provision fixtures. */
@@ -1952,7 +1953,9 @@ describe('runCloudflareDeploy — PostgreSQL checked-in migrations', () => {
         return ['0000_init.sql'];
       },
     });
-    await runCloudflareDeploy(root, { platform: 'cloudflare' }, silentCliLog, deps);
+    const output = await captureDeployOutput(() =>
+      runCloudflareDeploy(root, { platform: 'cloudflare' }, silentCliLog, deps),
+    );
     expect(exitCalls).toEqual([]);
     expect(applied).toEqual([
       { dir: toSlash(join(root, 'db', 'migrations')), url: 'postgresql://prod.example/app' },
@@ -1960,6 +1963,8 @@ describe('runCloudflareDeploy — PostgreSQL checked-in migrations', () => {
     expect(trace.indexOf('migrate-gate')).toBeLessThan(trace.indexOf('postgres-migrate'));
     expect(trace.indexOf('postgres-migrate')).toBeLessThan(trace.indexOf('wrangler:deploy'));
     expect(wranglerArgs.some((a) => a[0] === 'd1')).toBe(false);
+    expect(output).toMatch(/[│|]\s+1 migration applied\s+[│|]/);
+    expect(output).not.toContain('D1 migrations up to date');
   });
 
   it('still deploys a pg app WITHOUT checked-in migrations (external schema — no false-reject)', async () => {
@@ -2395,7 +2400,7 @@ describe('runCloudflareDeploy — static, SPA, and SSG apps', () => {
     });
     const { deps, exitCalls } = harness();
 
-    const successMessages = await captureSuccessMessages(() =>
+    const output = await captureDeployOutput(() =>
       runCloudflareDeploy(root, { platform: 'cloudflare' }, silentCliLog, deps),
     );
 
@@ -2405,9 +2410,18 @@ describe('runCloudflareDeploy — static, SPA, and SSG apps', () => {
     expect(generated.durable_objects).toEqual({ bindings: [] });
     expect(generated.queues).toEqual({ producers: [], consumers: [] });
     expect(generated.workflows).toEqual([]);
-    expect(successMessages).toContain(
-      'Deployed "switchable-app" to your Cloudflare account.\nhttps://preview.example.workers.dev',
+    expect(output).toMatch(/[╭+].*https:\/\/preview\.example\.workers\.dev.*[╮+]/);
+    expect(output).toContain('switchable-app → Cloudflare');
+    expect(output.indexOf('switchable-app → Cloudflare')).toBeLessThan(
+      output.indexOf('Preparing deployment'),
     );
+    expect(output).toContain('Worker: switchable-app');
+    expect(output).toMatch(/[│|]\s+Static SPA\s+[│|]/);
+    expect(output).toContain('✓ Successfully deployed!');
+    expect(output).not.toContain('Done!');
+    expect(output).not.toContain('Deployed!');
+    expect(output.indexOf('✓ Successfully deployed!')).toBeGreaterThan(output.indexOf('╰'));
+    expect(output.match(/Successfully deployed!/g)).toHaveLength(1);
   });
 
   it('passes a complete Access service-token pair to the readiness probe', async () => {
@@ -3213,7 +3227,7 @@ describe('runCloudflareDeploy — resource provisioning', () => {
       }) as CloudflareDeployDeps['provision'],
     });
 
-    const successMessages = await captureSuccessMessages(() =>
+    const output = await captureDeployOutput(() =>
       runCloudflareDeploy(root, { platform: 'cloudflare' }, silentCliLog, deps),
     );
 
@@ -3221,9 +3235,16 @@ describe('runCloudflareDeploy — resource provisioning', () => {
     expect(provisionTrace).toEqual(['provision']);
     expect(trace).toContain('build');
     expect(trace).toContain('wrangler:deploy');
-    expect(successMessages).toContain(
-      'Deployed "myapp" to your Cloudflare account.\nhttps://preview.example.workers.dev',
-    );
+    expect(output).toMatch(/[╭+].*https:\/\/preview\.example\.workers\.dev.*[╮+]/);
+    expect(output).toContain('myapp → Cloudflare');
+    expect(output.startsWith('myapp → Cloudflare\n\n')).toBe(true);
+    expect(output).toContain('Worker: myapp');
+    expect(output).not.toContain('D1 migrations up to date');
+    expect(output).toContain('✓ Successfully deployed!');
+    expect(output).not.toContain('Done!');
+    expect(output).not.toContain('Deployed!');
+    expect(output.indexOf('✓ Successfully deployed!')).toBeGreaterThan(output.indexOf('╰'));
+    expect(output.match(/Successfully deployed!/g)).toHaveLength(1);
   });
 
   it('reconciles D1 replication before build, gate, migrations and deploy when fully provisioned', async () => {
@@ -3235,12 +3256,11 @@ describe('runCloudflareDeploy — resource provisioning', () => {
       'wrangler.jsonc': JSON.stringify(PROVISIONED_D1, null, 2),
     });
     const { deps, trace, wranglerArgs } = harness();
-    await runCloudflareDeploy(
-      root,
-      { platform: 'cloudflare', provision: true },
-      silentCliLog,
-      deps,
+    const output = await captureDeployOutput(() =>
+      runCloudflareDeploy(root, { platform: 'cloudflare', provision: true }, silentCliLog, deps),
     );
+    expect(output).toContain('D1 migrations up to date');
+    expect(output).not.toMatch(/\d+ migrations? applied/);
     // The BUILD runs BEFORE the secret gate (ground-truth validation reads the real emitted
     // artifact); the LOCAL migration gate runs AFTER the build (against the post-build files),
     // and the REMOTE D1 apply runs after that (a failed gate never mutates D1).
@@ -10554,7 +10574,7 @@ describe('runCloudflareDeploy — Mode B email step (3b-ii)', () => {
     expect(spawns.some((s) => s.args[0] === 'deploy')).toBe(true);
   });
 
-  it('no `email.from`: says what to add to void.config.ts and deploys without email (no wrangler email call)', async () => {
+  it('no `email.from`: explains automatic setup is skipped (no wrangler email call)', async () => {
     const root = emailProject(PROVISIONED_D1, {}, {});
     const { deps, spawns, exitCalls } = emailHarness();
     const output = captureOutput();
@@ -10569,6 +10589,97 @@ describe('runCloudflareDeploy — Mode B email step (3b-ii)', () => {
     );
     expect(spawns.some((s) => s.args[0] === 'email' || s.args[0] === 'auth')).toBe(false);
     expect(spawns.some((s) => s.args[0] === 'deploy')).toBe(true);
+  });
+
+  it('no email.from preserves restricted manual email configuration without claiming email is absent or ready', async () => {
+    const root = emailProject(
+      {
+        ...PROVISIONED_D1,
+        send_email: [
+          {
+            name: 'SEND_EMAIL',
+            allowed_sender_addresses: ['support@mail.acme.com'],
+            allowed_destination_addresses: ['owner@acme.com'],
+          },
+        ],
+        addresses: ['support@mail.acme.com'],
+        vars: { __VOID_EMAIL_FROM: 'support@mail.acme.com' },
+      },
+      {},
+      {},
+    );
+    const before = readRootConfig(root);
+    const { deps, spawns, fetchCalls, confirms, trace, exitCalls } = emailHarness();
+    const output = captureOutput();
+    try {
+      await runCloudflareDeploy(root, { platform: 'cloudflare' }, silentCliLog, deps);
+    } finally {
+      output.restore();
+    }
+    expect(exitCalls).toEqual([]);
+    expect(confirms).toEqual([]);
+    expect(fetchCalls).toEqual([]);
+    expect(spawns.some((spawn) => spawn.args[0] === 'email' || spawn.args[0] === 'auth')).toBe(
+      false,
+    );
+    expect(trace).toContain('build');
+    expect(spawns.some((spawn) => spawn.args[0] === 'deploy')).toBe(true);
+    const after = readRootConfig(root);
+    expect(after.send_email).toEqual(before.send_email);
+    expect(after.addresses).toEqual(before.addresses);
+    expect(after.vars).toEqual(before.vars);
+    const printed = output.lines.join('\n');
+    expect(printed).toContain('skipping automatic email setup');
+    expect(printed).toContain('Existing Cloudflare email configuration is preserved.');
+    expect(printed).not.toContain('deploying without email');
+    expect(printed).not.toContain('email on mail.acme.com is ready');
+  });
+
+  it('require-email still refuses unverified manual configuration without email.from before build or upload', async () => {
+    const root = emailProject(
+      {
+        ...PROVISIONED_D1,
+        send_email: [
+          {
+            name: 'SEND_EMAIL',
+            allowed_sender_addresses: ['support@mail.acme.com'],
+            allowed_destination_addresses: ['owner@acme.com'],
+          },
+        ],
+        addresses: ['support@mail.acme.com'],
+      },
+      {},
+      {},
+    );
+    const before = readRootConfig(root);
+    const { deps, spawns, fetchCalls, confirms, trace, exitCalls } = emailHarness();
+    const output = captureOutput();
+    try {
+      await expect(
+        runCloudflareDeploy(
+          root,
+          { platform: 'cloudflare', requireEmail: true },
+          silentCliLog,
+          deps,
+        ),
+      ).rejects.toBeInstanceOf(ExitError);
+    } finally {
+      output.restore();
+    }
+    expect(exitCalls).toEqual([1]);
+    expect(confirms).toEqual([]);
+    expect(fetchCalls).toEqual([]);
+    expect(spawns.some((spawn) => spawn.args[0] === 'email' || spawn.args[0] === 'auth')).toBe(
+      false,
+    );
+    expect(trace).not.toContain('build');
+    expect(trace).not.toContain('provision');
+    expect(spawns.some((spawn) => spawn.args[0] === 'deploy')).toBe(false);
+    expect(readRootConfig(root)).toEqual(before);
+    const printed = output.lines.join('\n');
+    expect(printed).toContain('Existing Cloudflare email configuration is preserved.');
+    expect(printed).toContain('--require-email');
+    expect(printed).toContain('Nothing was built or uploaded.');
   });
 
   it('second deploy, everything ready: no prompt, no write, no bearer write, address map printed', async () => {

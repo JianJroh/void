@@ -1,15 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import {
-  type CANCEL_SYMBOL,
-  confirm,
-  isCancel,
-  multiselect,
-  password,
-  select,
-  text,
-} from '@clack/prompts';
-import {
   PLATFORM_LOGIN_KINDS,
   parsePlatformAccessProtection,
   parsePlatformAdmissionPolicy,
@@ -20,15 +11,33 @@ import {
   type PlatformLoginKind,
 } from '@void/platform';
 import {
+  type CANCEL_SYMBOL,
+  confirm,
+  isCancel,
+  multiselect,
+  password,
+  select,
+  text,
+} from '@voidzero-dev/vite-plus-prompts';
+import {
   activatePlatformAccessCredentials,
   parsePlatformAccessSetupSpec,
   preparePlatformAccessSetup,
   type PlatformAccessSetupSpec,
 } from './platform-access-setup.ts';
+import type { PlatformManagementAccess } from './platform-auth.ts';
 import type { PlatformCloudflareClient } from './platform-cloudflare.ts';
 import type { PlatformInstallPlan } from './platform-plan.ts';
 
+export type AppAccessFile = {
+  mode: import('@void/platform').PlatformAppAccess;
+  tokenEnv?: string;
+  identityProviderIds?: Array<string>;
+  policyIds?: Array<string>;
+};
+
 type AuthFile = {
+  appAccess?: AppAccessFile;
   connections: Array<{ configuration: Record<string, unknown>; clientSecretEnv?: string }>;
   administratorConnectionId?: string;
   admission?: unknown;
@@ -39,6 +48,32 @@ export type PlatformAuthSelection = {
   authentication: PlatformDeploymentManifest['authentication'];
   file?: AuthFile;
 };
+
+export function platformManagementAccessForAuthentication(
+  selection: PlatformAuthSelection,
+  accountId: string,
+  checkpoint: Readonly<Record<string, string>> | null,
+): PlatformManagementAccess | undefined {
+  if (
+    !selection.authentication.accessProtection &&
+    (!selection.authentication.providers.includes('cloudflare-access') ||
+      (selection.file && !selection.file.cloudflareAccess))
+  ) {
+    return undefined;
+  }
+  const spec =
+    selection.file?.cloudflareAccess ??
+    (checkpoint?.accessSetupSpecJson
+      ? parsePlatformAccessSetupSpec(JSON.parse(checkpoint.accessSetupSpecJson))
+      : undefined);
+  if (spec?.accountId && spec.accountId !== accountId) {
+    return undefined;
+  }
+  return {
+    protection: !!selection.authentication.accessProtection,
+    readOnly: spec?.mode === 'existing',
+  };
+}
 
 function answer<T>(value: T | typeof CANCEL_SYMBOL): T {
   if (isCancel(value) || typeof value === 'symbol') {
@@ -123,8 +158,8 @@ export async function selectInstallationAuthentication(
       ? ['github' as const]
       : answer(
           await multiselect<PlatformLoginKind>({
-            message: 'Platform login methods:',
-            initialValues: ['github'],
+            message: 'Platform login methods (select all that apply):',
+            initialValues: [],
             required: true,
             options: [
               { value: 'github' as const, label: 'GitHub' },

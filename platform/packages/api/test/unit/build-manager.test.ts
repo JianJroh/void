@@ -241,9 +241,9 @@ vi.mock('../../src/db.ts', () => ({
       connectionId: string | undefined,
       _projectId: string,
       _installationId: string,
-      repositoryId: string | null,
+      _repositoryId: string,
     ) => {
-      if (!connectionId || !repositoryId) {
+      if (!connectionId) {
         return false;
       }
       return dbState.installationCovered;
@@ -731,6 +731,7 @@ describe('BuildManager.startBuild', () => {
       PLATFORM_ENV: 'staging',
       CF_ACCESS_CLIENT_ID_STAGING: 'svc-id.access',
       CF_ACCESS_CLIENT_SECRET_STAGING: 'svc-secret',
+      PROXY_URL: 'https://proxy.staging.void.cloud',
     });
     const m = makeManager(ctx, env);
     await m.startBuild(makeConfig());
@@ -738,6 +739,7 @@ describe('BuildManager.startBuild', () => {
     // The CLI reads the un-suffixed names; the worker holds the *_STAGING secrets.
     expect(envVars.CF_ACCESS_CLIENT_ID).toBe('svc-id.access');
     expect(envVars.CF_ACCESS_CLIENT_SECRET).toBe('svc-secret');
+    expect(envVars.VOID_PROXY_URL).toBe('https://proxy.staging.void.cloud');
   });
 
   it('does NOT forward CF Access creds on production builds (api.void.cloud is not Access-gated)', async () => {
@@ -1615,18 +1617,6 @@ describe('BuildManager.startBuild source-token scoping', () => {
       permissions: { contents: 'read' },
     });
   });
-
-  it('mints no source token when repositoryId is null', async () => {
-    const ctx = makeStubCtx();
-    const env = makeEnv();
-    const m = makeManager(ctx, env);
-
-    // A null repository id fails the coverage recheck closed BEFORE any mint.
-    await m.startBuild(makeConfig({ repositoryId: null }));
-
-    expect(vi.mocked(getInstallationToken)).not.toHaveBeenCalled();
-    expect(containerCalls.started).toBe(0);
-  });
 });
 
 // The container executor starts from the queued row's stored commit_sha
@@ -1778,21 +1768,6 @@ describe('BuildManager.startBuild installation coverage recheck (TOCTOU)', () =>
       (env as unknown as { BUILD_SCHEDULER: { get: ReturnType<typeof vi.fn> } }).BUILD_SCHEDULER
         .get,
     ).toHaveBeenCalled();
-  });
-
-  it('fails closed (cancels) when the connection carries a null repository id', async () => {
-    // A build without a repository id can't prove membership, regardless of
-    // dbState.installationCovered.
-    dbState.installationCovered = true;
-    const ctx = makeStubCtx();
-    const env = makeEnv();
-    const m = makeManager(ctx, env);
-
-    await m.startBuild(makeConfig({ repositoryId: null }));
-
-    expect(dbState.status.get('b1')).toBe('cancelled');
-    expect(vi.mocked(signDeployToken)).not.toHaveBeenCalled();
-    expect(containerCalls.started).toBe(0);
   });
 
   it('fails closed (cancels) when a stored build config has no connection id', async () => {
@@ -6286,6 +6261,7 @@ describe('build-agent sanitizeChildEnv (env scrub)', () => {
     VOID_TOKEN: 'deploy-jwt',
     CF_ACCESS_CLIENT_ID: 'svc-id.access',
     CF_ACCESS_CLIENT_SECRET: 'svc-secret',
+    VOID_ACCESS_CREDENTIALS: '{"https://proxy.example.com":{"CF_ACCESS_TOKEN":"private"}}',
     VOID_API_URL: 'https://api.void.cloud',
     VOID_PROJECT: 'my-app',
   };
@@ -6304,6 +6280,7 @@ describe('build-agent sanitizeChildEnv (env scrub)', () => {
     // pair reaches every Access-gated staging host — so it's scrubbed too.
     expect(child.CF_ACCESS_CLIENT_ID).toBeUndefined();
     expect(child.CF_ACCESS_CLIENT_SECRET).toBeUndefined();
+    expect(child.VOID_ACCESS_CREDENTIALS).toBeUndefined();
     // The scrub list is exactly these secrets.
     expect([...SCRUBBED_ENV_VARS].sort()).toEqual([
       'AGENT_TOKEN',
@@ -6311,6 +6288,7 @@ describe('build-agent sanitizeChildEnv (env scrub)', () => {
       'CF_ACCESS_CLIENT_SECRET',
       'DO_LOG_URL',
       'SOURCE_TOKEN',
+      'VOID_ACCESS_CREDENTIALS',
       'VOID_TOKEN',
     ]);
   });
@@ -6470,7 +6448,7 @@ describe('build-agent parent-process secret scrub', () => {
 
       // The trusted deploy child STILL receives the token (captured into a local
       // before the parent-env delete and re-injected via the extra overrides).
-      const deploy = seen.find((s) => s.cmd === 'npx');
+      const deploy = [...seen].reverse().find((s) => s.cmd === 'npx');
       expect(deploy?.env?.VOID_TOKEN).toBe('deploy-jwt');
     } finally {
       for (const [key, value] of Object.entries(saved)) {
@@ -6541,7 +6519,7 @@ describe('build-agent nonInteractiveEnv (CI-safe child output)', () => {
         hasLocalVoid: () => true,
       });
       expect(code).toBe(0);
-      expect(seen.map((s) => s.cmd)).toEqual(['npm', 'npx']);
+      expect(seen.map((s) => s.cmd)).toEqual(['npm', 'npx', 'npx']);
       for (const child of seen) {
         expect(child.env?.CI).toBe('true');
       }
@@ -6625,7 +6603,7 @@ describe('build-agent non-root child isolation', () => {
       expect(install?.env?.COREPACK_HOME).toBe('/home/builder/.cache/node/corepack');
       expect(install?.env?.BUN_INSTALL).toBe('/home/builder/.bun');
 
-      const deploy = seen.find((s) => s.cmd === 'npx');
+      const deploy = [...seen].reverse().find((s) => s.cmd === 'npx');
       expect(deploy?.env?.HOME).toBe('/home/builder');
       // The builder cache env must NOT clobber the re-injected deploy token.
       expect(deploy?.env?.VOID_TOKEN).toBe('deploy-jwt');
@@ -6796,7 +6774,14 @@ describe('parseProcStatusUid', () => {
 // timeout alarm). Previously a non-zero install exit `return`ed out of the
 // driver, bypassing `process.exit` and `server.close`.
 describe('build-agent lifecycle (container must always exit)', () => {
-  const REQUIRED_ENV = ['VOID_TOKEN', 'VOID_API_URL', 'VOID_PROJECT'] as const;
+  const REQUIRED_ENV = [
+    'VOID_TOKEN',
+    'VOID_API_URL',
+    'VOID_PROJECT',
+    'VOID_PROXY_URL',
+    'CF_ACCESS_CLIENT_ID',
+    'CF_ACCESS_CLIENT_SECRET',
+  ] as const;
   let savedEnv: Record<string, string | undefined>;
 
   beforeEach(() => {
@@ -6844,6 +6829,66 @@ describe('build-agent lifecycle (container must always exit)', () => {
     expect(runChild).toHaveBeenCalledTimes(1);
   });
 
+  it.each([0, 19])(
+    'connects before deploy and stops if connection fails (exit %s)',
+    async (connectExit) => {
+      const runChild = vi.fn(
+        async (_cmd: string, args: ReadonlyArray<string>, _opts?: { env?: NodeJS.ProcessEnv }) =>
+          args.includes('connect') ? connectExit : 0,
+      );
+      const code = await runBuild({
+        downloadSource: vi.fn(async () => {}),
+        resolveInstall: () => ({ manager: 'npm', cmd: 'npm', args: ['ci'] }),
+        runChild,
+        reportStatus: vi.fn(async () => {}),
+        hasLocalVoid: () => true,
+      });
+      expect(code).toBe(connectExit);
+      const calls = runChild.mock.calls;
+      expect(calls[1]?.[1]).toEqual([
+        '--yes',
+        'void',
+        'connect',
+        'https://api.void.cloud',
+        '--no-login',
+      ]);
+      expect(calls[1]?.[2]?.env?.VOID_TOKEN).toBeUndefined();
+      expect(calls[1]?.[2]?.env?.VOID_ACCESS_ORIGIN).toBe('https://api.void.cloud');
+      expect(calls.some(([, args]) => args.includes('deploy'))).toBe(connectExit === 0);
+    },
+  );
+
+  it('scopes captured Access credentials to the configured API and proxy only for deployment', async () => {
+    process.env.VOID_PROXY_URL = 'https://proxy.example.com';
+    process.env.CF_ACCESS_CLIENT_ID = 'service-id';
+    process.env.CF_ACCESS_CLIENT_SECRET = 'service-secret';
+    const runChild = vi.fn(
+      async (_cmd: string, _args: ReadonlyArray<string>, _opts?: { env?: NodeJS.ProcessEnv }) => 0,
+    );
+    expect(
+      await runBuild({
+        downloadSource: vi.fn(async () => {}),
+        resolveInstall: () => ({ manager: 'npm', cmd: 'npm', args: ['ci'] }),
+        runChild,
+        reportStatus: vi.fn(async () => {}),
+        hasLocalVoid: () => true,
+      }),
+    ).toBe(0);
+    const [install, connect, deploy] = runChild.mock.calls;
+    expect(install?.[2]?.env?.VOID_ACCESS_CREDENTIALS).toBeUndefined();
+    expect(connect?.[2]?.env?.VOID_ACCESS_CREDENTIALS).toBeUndefined();
+    expect(JSON.parse(deploy?.[2]?.env?.VOID_ACCESS_CREDENTIALS ?? 'null')).toEqual({
+      'https://api.void.cloud': {
+        CF_ACCESS_CLIENT_ID: 'service-id',
+        CF_ACCESS_CLIENT_SECRET: 'service-secret',
+      },
+      'https://proxy.example.com': {
+        CF_ACCESS_CLIENT_ID: 'service-id',
+        CF_ACCESS_CLIENT_SECRET: 'service-secret',
+      },
+    });
+  });
+
   it('passes VOID_TOKEN to the DEPLOY child but NOT the INSTALL child', async () => {
     // Capture the env each spawned child receives. runChild is called first for
     // the install (cmd !== 'npx'), then for the deploy (cmd === 'npx').
@@ -6865,7 +6910,7 @@ describe('build-agent lifecycle (container must always exit)', () => {
     expect(code).toBe(0);
 
     const install = seen.find((s) => s.cmd === 'npm');
-    const deploy = seen.find((s) => s.cmd === 'npx');
+    const deploy = [...seen].reverse().find((s) => s.cmd === 'npx');
     expect(install).toBeDefined();
     expect(deploy).toBeDefined();
     // The untrusted install (postinstall scripts) must NOT see the deploy token.
@@ -6896,7 +6941,7 @@ describe('build-agent lifecycle (container must always exit)', () => {
       });
       expect(code).toBe(0);
 
-      const deploy = seen.find((s) => s.cmd === 'npx');
+      const deploy = [...seen].reverse().find((s) => s.cmd === 'npx');
       expect(deploy).toBeDefined();
       expect(deploy?.args).toContain('void@0.9.1');
       expect(deploy?.args.some((a) => a === 'void@latest')).toBe(false);

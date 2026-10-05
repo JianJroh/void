@@ -82,7 +82,7 @@ try {
 
   for (const [name, entrypoint] of workers) {
     const configPath = join(temporaryRoot, `${name}.json`);
-    const outputDirectory = join(runtimeRoot, name);
+    const outputDirectory = join(temporaryRoot, name);
     writeFileSync(
       configPath,
       JSON.stringify({
@@ -95,11 +95,21 @@ try {
         compatibility_date: '2026-02-24',
         compatibility_flags:
           name === 'api' || name === 'proxy' || name === 'emailGateway' ? ['nodejs_compat'] : [],
+        keep_names: true,
       }),
     );
     const result = spawnSync(
       process.execPath,
-      [wrangler, 'deploy', '--dry-run', '--config', configPath, '--outdir', outputDirectory],
+      [
+        wrangler,
+        'deploy',
+        '--dry-run',
+        '--config',
+        configPath,
+        '--outdir',
+        outputDirectory,
+        '--minify',
+      ],
       { cwd: dirname(entrypoint), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
     if (result.status !== 0) {
@@ -108,7 +118,13 @@ try {
       throw new Error(`Failed to build the ${name} platform Worker.`);
     }
     const artifactPath = join(outputDirectory, 'index.js');
-    const contents = readFileSync(artifactPath);
+    // Publish executable artifacts without build-only maps or dangling map references.
+    const contents = Buffer.from(
+      readFileSync(artifactPath, 'utf8').replace(/\n\/\/# sourceMappingURL=[^\r\n]*\s*$/u, '\n'),
+    );
+    const packagedArtifactPath = join(runtimeRoot, name, 'index.js');
+    mkdirSync(dirname(packagedArtifactPath), { recursive: true });
+    writeFileSync(packagedArtifactPath, contents);
     artifacts[name] = {
       path: `${name}/index.js`,
       sha256: createHash('sha256').update(contents).digest('hex'),
@@ -141,6 +157,7 @@ try {
     applicationRoutingVersion: 1,
     authenticationProtocolVersion: 1,
     deploymentExecution: 1,
+    appAccessSetup: 1,
     emailProtocolVersion: 1,
     database,
     platformVersion: packageJson.version,

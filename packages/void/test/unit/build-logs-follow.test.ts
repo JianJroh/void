@@ -1,15 +1,31 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { savePlatformConnection } from '../../src/cli/platform-registry.ts';
+const registries: Array<string> = [];
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import { followBuildLogs, isFatalFollowError, runBuildCommand } from '../../src/cli/build-cmd.ts';
 import { PlatformApiError, PlatformClient, type BuildLogsResponse } from '../../src/cli/client.ts';
 
 afterEach(() => {
+  for (const registry of registries.splice(0)) {
+    rmSync(registry, { recursive: true, force: true });
+  }
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   vi.useRealTimers();
 });
 
 function page(partial: Partial<BuildLogsResponse>): BuildLogsResponse {
-  return { lines: [], lastSeq: 0, status: 'building', terminal: false, external: null, ...partial };
+  return {
+    lines: [],
+    lastSeq: 0,
+    status: 'building',
+    terminal: false,
+    logsComplete: null,
+    external: null,
+    ...partial,
+  };
 }
 
 function apiError(status: number, body = '{}'): PlatformApiError {
@@ -203,31 +219,28 @@ describe('followBuildLogs', () => {
     expect(written).toEqual(['final tail']);
   });
 
-  it.each([undefined, null])(
-    'prints retained logs before rejecting %s completion proof',
-    async (logsComplete) => {
-      const written: Array<string> = [];
-      await expect(
-        followBuildLogs({
-          fetchPage: () =>
-            Promise.resolve(
-              page({
-                status: 'complete',
-                terminal: true,
-                logsComplete,
-                lines: [{ seq: 3, line: 'retained tail', stream: 'stdout', ts: 3 }],
-                lastSeq: 3,
-              }),
-            ),
-          write: (line) => written.push(line),
-          sleep: () => Promise.resolve(),
-          since: 2,
-          status: 'complete',
-        }),
-      ).rejects.toThrow('upgrade the platform runtime');
-      expect(written).toEqual(['retained tail']);
-    },
-  );
+  it('prints retained logs before rejecting null completion proof', async () => {
+    const written: Array<string> = [];
+    await expect(
+      followBuildLogs({
+        fetchPage: () =>
+          Promise.resolve(
+            page({
+              status: 'complete',
+              terminal: true,
+              logsComplete: null,
+              lines: [{ seq: 3, line: 'retained tail', stream: 'stdout', ts: 3 }],
+              lastSeq: 3,
+            }),
+          ),
+        write: (line) => written.push(line),
+        sleep: () => Promise.resolve(),
+        since: 2,
+        status: 'complete',
+      }),
+    ).rejects.toThrow('upgrade the platform runtime');
+    expect(written).toEqual(['retained tail']);
+  });
 
   it('bounds terminal drain waiting at two minutes', async () => {
     let now = 0;
@@ -256,6 +269,18 @@ describe('followBuildLogs', () => {
     // Bind this fixture token explicitly so a saved platform cannot select the destination.
     vi.stubEnv('VOID_TOKEN', 'test-build-logs-token');
     vi.stubEnv('VOID_API_URL', 'https://api.example.test');
+    const registry = mkdtempSync(join(tmpdir(), 'void-build-connections-'));
+    registries.push(registry);
+    vi.stubEnv('VOID_PLATFORM_REGISTRY_DIR', registry);
+    savePlatformConnection({
+      accountId: null,
+      apiUrl: 'https://api.example.test',
+      applicationDomain: 'apps.example.test',
+      displayName: 'Test',
+      installationId: null,
+      kind: 'connected',
+      proxyUrl: 'https://proxy.example.test',
+    });
     vi.stubEnv('VOID_PROJECT', '');
     vi.spyOn(PlatformClient.prototype, 'listProjects').mockResolvedValue([
       { id: 'project', slug: 'project' } as Awaited<

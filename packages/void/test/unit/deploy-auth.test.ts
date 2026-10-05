@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { intro } from '@voidzero-dev/vite-plus-prompts';
 import { toSlash } from 'pathslash';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import { buildEnv, runDeploy } from '../../src/cli/deploy.ts';
@@ -25,7 +26,7 @@ const originalIsTTY = process.stdin.isTTY;
 let savedVoidToken: string | undefined;
 let savedVoidApiUrl: string | undefined;
 
-vi.mock('@clack/prompts', () => ({
+vi.mock('@voidzero-dev/vite-plus-prompts', () => ({
   intro: vi.fn(),
   outro: vi.fn(),
   note: vi.fn(),
@@ -79,6 +80,7 @@ vi.mock('../../src/cli/login', () => ({
 }));
 
 beforeEach(() => {
+  vi.mocked(intro).mockClear();
   mockError.mockReset();
   mockInfo.mockReset();
   mockStep.mockReset();
@@ -118,26 +120,40 @@ beforeEach(() => {
 });
 
 describe('runDeploy auth failures', () => {
+  it('rejects an unconnected platform before reading credentials or exchanging OIDC tokens', async () => {
+    mockGetApiUrl.mockImplementation(() => {
+      throw new Error('platform: Run `void connect <url>` first.');
+    });
+    mockIsOidcAvailable.mockReturnValue(true);
+    await expect(
+      runDeploy(process.cwd(), { platform: 'void', projectSlug: 'my-app' }),
+    ).rejects.toThrow('void connect');
+    expect(mockGetToken).not.toHaveBeenCalled();
+    expect(mockExchangeOidc).not.toHaveBeenCalled();
+    expect(mockClientCtor).not.toHaveBeenCalled();
+  });
   it('shows a re-login instruction for expired local auth tokens in non-interactive mode', async () => {
     await expect(runDeploy(process.cwd(), { projectSlug: 'my-app' })).rejects.toThrow(
       'Auth token expired. Run `void account login` and try again.',
     );
   });
 
-  it('prints the resolved Void deployment target before authentication', async () => {
+  it('does not print a deployment heading until the managed project is resolved', async () => {
     await expect(
       runDeploy(process.cwd(), { platform: 'void', projectSlug: 'my-app' }),
     ).rejects.toThrow();
 
-    expect(mockInfo).toHaveBeenCalledWith('Deployment target: Void');
+    expect(intro).not.toHaveBeenCalled();
+    expect(mockInfo).not.toHaveBeenCalledWith('Deployment target: Void');
   });
 
-  it('prints the resolved Cloudflare deployment target before target validation', async () => {
+  it('does not print a deployment heading for an invalid Cloudflare target', async () => {
     await expect(
       runDeploy(process.cwd(), { platform: 'cloudflare', projectSlug: 'my-app' }),
     ).rejects.toThrow('--project is not supported with platform cloudflare');
 
-    expect(mockInfo).toHaveBeenCalledWith('Deployment target: Cloudflare');
+    expect(intro).not.toHaveBeenCalled();
+    expect(mockInfo).not.toHaveBeenCalledWith('Deployment target: Cloudflare');
   });
 
   it('reauthenticates and retries once for expired local auth tokens in interactive mode', async () => {
@@ -190,7 +206,12 @@ describe('runDeploy project access', () => {
     mkdirSync(join(root, '.void'));
     writeFileSync(
       join(root, '.void', 'project.json'),
-      JSON.stringify({ projectId: 'proj_1', slug, platform: 'void' }),
+      JSON.stringify({
+        projectId: 'proj_1',
+        slug,
+        platform: 'void',
+        platformUrl: 'https://api.test',
+      }),
     );
   }
 
@@ -376,7 +397,7 @@ describe('runDeploy GitHub Actions OIDC exchange', () => {
       mockGetToken.mockImplementation((tokenRoot: string) => realGetToken(tokenRoot));
 
       await expect(runDeploy(root, { platform: 'void', projectSlug: 'my-app' })).rejects.toThrow(
-        'VOID_TOKEN is not bound to https://platform.example.test',
+        'Set VOID_API_URL alongside VOID_TOKEN',
       );
 
       expect(mockGetToken).toHaveBeenCalledWith(root);

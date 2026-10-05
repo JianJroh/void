@@ -24,7 +24,8 @@ const mockWhoami = vi.fn();
 const mockIsExpiredTokenError = vi.fn();
 const mockDiscoverPlatform = vi.fn();
 
-vi.mock('@clack/prompts', () => ({
+vi.mock('@voidzero-dev/vite-plus-prompts', () => ({
+  settings: { accessible: false },
   intro: (...args: Array<unknown>) => mockIntro(...args),
   outro: (...args: Array<unknown>) => mockOutro(...args),
   log: {

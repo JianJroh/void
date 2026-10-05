@@ -8,6 +8,7 @@ import {
   savePlatformConnection,
 } from '../../src/cli/platform-registry.ts';
 import { runProjectCommand } from '../../src/cli/project-cmd.ts';
+import { withPlatformDiscovery } from '../helpers/platform-discovery.ts';
 
 const keyring = vi.hoisted(() => ({ read: vi.fn(), write: vi.fn(), remove: vi.fn() }));
 vi.mock('../../src/cli/keyring.ts', () => ({
@@ -24,10 +25,18 @@ function rootWithPlatform(
 ): string {
   const root = mkdtempSync(join(tmpdir(), 'void-project-team-'));
   roots.push(root);
+  vi.stubEnv('VOID_PLATFORM_REGISTRY_DIR', join(root, 'registry'));
+  connect('https://api.example.test', 'Test platform');
   mkdirSync(join(root, '.void'));
   writeFileSync(
     join(root, '.void', 'project.json'),
-    JSON.stringify({ platform, projectId: 'project_1', slug: 'my-app', ...metadata }),
+    JSON.stringify({
+      platform,
+      projectId: 'project_1',
+      slug: 'my-app',
+      platformUrl: 'https://api.example.test',
+      ...metadata,
+    }),
   );
   return root;
 }
@@ -82,7 +91,7 @@ describe('project team target selection', () => {
         ? Response.json({ invitations: [] })
         : Response.json({});
     });
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('fetch', withPlatformDiscovery(fetchMock));
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 
@@ -132,7 +141,7 @@ describe('project team target selection', () => {
           ? Response.json({ invitations: [] })
           : Response.json({});
       });
-      vi.stubGlobal('fetch', fetchMock);
+      vi.stubGlobal('fetch', withPlatformDiscovery(fetchMock));
       vi.spyOn(console, 'log').mockImplementation(() => undefined);
       vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 
@@ -170,7 +179,7 @@ describe('project team target selection', () => {
   );
 
   it.each(['cloudflare', 'void'] as const)(
-    'keeps an unscoped VOID_TOKEN bound to Void Cloud for account invitations from a %s project',
+    'rejects an unscoped VOID_TOKEN for account invitations from a %s project',
     async (platform) => {
       const platformA = 'https://platform-a.example.test';
       const platformB = 'https://platform-b.example.test';
@@ -186,18 +195,14 @@ describe('project team target selection', () => {
           : null,
       );
       const fetchMock = vi.fn(async () => Response.json({ invitations: [] }));
-      vi.stubGlobal('fetch', fetchMock);
+      vi.stubGlobal('fetch', withPlatformDiscovery(fetchMock));
       vi.spyOn(console, 'log').mockImplementation(() => undefined);
       vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 
-      await runProjectCommand(root, { subcommand: 'team', action: 'pending' });
-
-      expect(fetchMock).toHaveBeenCalledWith(
-        'https://api.void.cloud/me/project-invitations',
-        expect.objectContaining({
-          headers: expect.objectContaining({ Authorization: 'Bearer void-cloud-token' }),
-        }),
-      );
+      await expect(
+        runProjectCommand(root, { subcommand: 'team', action: 'pending' }),
+      ).rejects.toThrow('Set VOID_API_URL alongside VOID_TOKEN');
+      expect(fetchMock).not.toHaveBeenCalled();
     },
   );
 
@@ -205,10 +210,11 @@ describe('project team target selection', () => {
     const root = rootWithPlatform('void', { platformUrl: 'https://platform-a.example.test' });
     vi.stubEnv('VOID_PLATFORM_REGISTRY_DIR', join(root, 'registry'));
     connect('https://platform-b.example.test', 'Platform B');
+    connect('https://platform-c.example.test', 'Platform C');
     vi.stubEnv('VOID_API_URL', 'https://platform-c.example.test/');
     vi.stubEnv('VOID_TOKEN', 'platform-c-token');
     const fetchMock = vi.fn(async () => Response.json({ invitations: [] }));
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('fetch', withPlatformDiscovery(fetchMock));
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     const output: Array<string> = [];
     vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
@@ -240,7 +246,7 @@ describe('project team target selection', () => {
         : null,
     );
     const fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('fetch', withPlatformDiscovery(fetchMock));
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     vi.spyOn(process, 'exit').mockImplementation(() => {
@@ -274,7 +280,7 @@ describe('project team target selection', () => {
         members: [{ user: { id: 'user_1', login: 'alex' }, role: 'owner' }],
       }),
     );
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('fetch', withPlatformDiscovery(fetchMock));
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 
@@ -314,7 +320,7 @@ describe('project team target selection', () => {
           members: [{ user: { id: 'owner_1', login: 'owner' }, role: 'owner' }],
         }),
       );
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('fetch', withPlatformDiscovery(fetchMock));
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
     vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 

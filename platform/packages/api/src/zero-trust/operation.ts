@@ -26,8 +26,8 @@ import {
 import {
   ZeroTrustCloudflareClient,
   ZeroTrustCloudflareError,
-  healthCheckApplication,
   reusablePolicyReferences,
+  publicAppManagementApplication,
 } from './cloudflare.ts';
 import {
   type ZeroTrustConfiguration,
@@ -374,10 +374,12 @@ export async function runConfigureOperation(
     const client = suppliedClient ?? (await clientForConfiguration(env, configuration));
     const selection =
       suppliedSelection ??
-      (await client.validateSelection({
-        identityProviderIds: configuration.identityProviderIds,
-        policyIds: configuration.policyIds,
-      }));
+      (await (configuration.publicAccess
+        ? client.getOrganization()
+        : client.validateSelection({
+            identityProviderIds: configuration.identityProviderIds,
+            policyIds: configuration.policyIds,
+          })));
     if (selection.teamDomain !== configuration.teamDomain) {
       configuration = await patchConfiguration(db, configuration, {
         teamDomain: selection.teamDomain,
@@ -485,21 +487,21 @@ export async function runConfigureOperation(
           // hostname, and dispatch never routes that path to a project.
           const health =
             healthHostname && configuration.healthApplicationName
-              ? await client.ensureApplication(
-                  healthCheckApplication(configuration.healthApplicationName, healthHostname),
-                  {
-                    id: configuration.healthApplication?.id,
-                    name: configuration.healthApplicationName,
-                  },
+              ? await client.ensureHealthApplication(
+                  configuration.healthApplicationName,
+                  healthHostname,
+                  configuration.healthApplication,
                 )
               : configuration.healthApplication;
           const wildcard = await client.ensureApplication(
-            {
-              name,
-              destinations: zeroTrustWildcardDestinations(readPlatformApplication(env)),
-              allowedIdentityProviderIds: configuration.identityProviderIds,
-              policies: reusablePolicyReferences(configuration.policyIds),
-            },
+            configuration.publicAccess
+              ? publicAppManagementApplication(name, configuration.publicAccessGuardDestination!)
+              : {
+                  name,
+                  destinations: zeroTrustWildcardDestinations(readPlatformApplication(env)),
+                  allowedIdentityProviderIds: configuration.identityProviderIds,
+                  policies: reusablePolicyReferences(configuration.policyIds),
+                },
             { id: configuration.wildcardApplication?.id, name },
           );
           return advanceOperation(lockedDb, configuration, 'projects', {
@@ -706,10 +708,17 @@ export async function runDisableOperation(
           );
           // The health exception outlives the wildcard, so health probes never
           // meet Access. Deleting the wildcard again on a retry is a no-op.
-          await client.deleteApplication(
-            configuration.healthApplication?.id,
-            configuration.healthApplicationName,
-          );
+          // A different name identifies a verified installer/operator-owned
+          // exception. Keep it for platform health after project Access ends.
+          if (
+            !configuration.healthApplication ||
+            configuration.healthApplication.name === configuration.healthApplicationName
+          ) {
+            await client.deleteApplication(
+              configuration.healthApplication?.id,
+              configuration.healthApplicationName,
+            );
+          }
           return advanceOperation(lockedDb, configuration, 'bypass-delete', {
             enabled: false,
             wildcardApplication: null,

@@ -31,7 +31,7 @@ vi.mock('../../src/cli/client.ts', () => ({
     whoami = mocks.whoami;
   },
 }));
-vi.mock('@clack/prompts', () => ({
+vi.mock('@voidzero-dev/vite-plus-prompts', () => ({
   log: { success: vi.fn(), info: vi.fn() },
   select: mocks.select,
   text: vi.fn(),
@@ -122,10 +122,13 @@ describe('connect workflow', () => {
     expect(mocks.login).toHaveBeenCalledWith(root, discovery);
     expect(getActivePlatformConnection()?.apiUrl).toBe(discovery.apiUrl);
   });
-  it('preserves a legacy project link when connecting elsewhere', async () => {
-    const original = seedProject({ projectId: 'old-project', slug: 'old' });
+  it('requires relinking an unscoped legacy project after connecting', async () => {
+    seedProject({ projectId: 'old-project', slug: 'old' });
     await runConnectCommand(root, parseConnectArgs([discovery.apiUrl]), true);
-    expect(readFileSync(projectFile(), 'utf8')).toBe(original);
+    const saved = JSON.parse(readFileSync(projectFile(), 'utf8'));
+    expect(saved.platformUrl).toBe(discovery.apiUrl);
+    expect(saved.projectId).toBeUndefined();
+    expect(saved.slug).toBeUndefined();
   });
   it('preserves a project id on the same platform', async () => {
     seedProject({ projectId: 'project', slug: 'app', platformUrl: discovery.apiUrl });
@@ -139,7 +142,10 @@ describe('connect workflow', () => {
   it('verifies an existing origin-scoped session without opening a browser', async () => {
     mocks.token.mockReturnValue('saved-token');
     await runConnectCommand(root, parseConnectArgs([discovery.apiUrl]), true);
-    expect(mocks.client).toHaveBeenCalledWith('saved-token', { apiUrl: discovery.apiUrl });
+    expect(mocks.client).toHaveBeenCalledWith('saved-token', {
+      apiUrl: discovery.apiUrl,
+      checkPlatformVersion: false,
+    });
     expect(mocks.whoami).toHaveBeenCalledOnce();
     expect(mocks.login).not.toHaveBeenCalled();
   });
@@ -163,7 +169,10 @@ describe('connect workflow', () => {
     vi.stubEnv('VOID_TOKEN', 'ci-token');
     vi.stubEnv('VOID_API_URL', discovery.apiUrl);
     await runConnectCommand(root, parseConnectArgs([discovery.apiUrl]), false);
-    expect(mocks.client).toHaveBeenCalledWith('ci-token', { apiUrl: discovery.apiUrl });
+    expect(mocks.client).toHaveBeenCalledWith('ci-token', {
+      apiUrl: discovery.apiUrl,
+      checkPlatformVersion: false,
+    });
     expect(mocks.login).not.toHaveBeenCalled();
   });
   it.each(['', 'https://different.example.com'])(

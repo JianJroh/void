@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
+import { withPlatformDiscovery } from '../helpers/platform-discovery.ts';
 
 // Capture how many times each asset path is read via `readFileSync`. Mocked
 // before any importer of `node:fs` so the spy is in place when `package.ts`
@@ -18,14 +19,17 @@ vi.mock('node:fs', async () => {
   };
 });
 
-// `@clack/prompts` opens TTY-bound spinners we don't want to render in tests.
+// `@voidzero-dev/vite-plus-prompts` opens TTY-bound spinners we don't want to render in tests.
 const noopSpinner = {
   start: vi.fn(),
   stop: vi.fn(),
   message: vi.fn(),
+  clear: vi.fn(),
 };
-vi.mock('@clack/prompts', async () => {
-  const actual = await vi.importActual<typeof import('@clack/prompts')>('@clack/prompts');
+vi.mock('@voidzero-dev/vite-plus-prompts', async () => {
+  const actual = await vi.importActual<typeof import('@voidzero-dev/vite-plus-prompts')>(
+    '@voidzero-dev/vite-plus-prompts',
+  );
   return {
     ...actual,
     intro: vi.fn(),
@@ -82,7 +86,7 @@ beforeEach(() => {
   }
 
   originalFetch = globalThis.fetch;
-  globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+  globalThis.fetch = withPlatformDiscovery(fetchMock);
   fetchMock.mockReset();
   readFileSyncMock.mockClear();
 });
@@ -198,7 +202,7 @@ function ndjsonResponse(events: Array<unknown>): Response {
   });
   return new Response(stream, {
     status: 200,
-    headers: { 'content-type': 'application/x-ndjson' },
+    headers: { 'content-type': 'application/x-ndjson', 'x-void-deployment-id': 'dep_test' },
   });
 }
 
@@ -219,6 +223,37 @@ function openTestLog(): ReturnType<typeof openDeployLog> {
 }
 
 describe('direct-to-R2 deploy flow', () => {
+  it.each([true, undefined, false])(
+    'prints a single success after the box only when routing is published (%s)',
+    async (published) => {
+      const { note, outro } = await import('@voidzero-dev/vite-plus-prompts');
+      const summary = vi.mocked(note).mockClear();
+      const ending = vi.mocked(outro).mockClear();
+      const events = defaultDoneEvents() as Array<Record<string, unknown>>;
+      events.at(-1)!.published = published;
+      installPlatformMocks({ finalizeEvents: events });
+
+      await runStaticDeploy(
+        workdir,
+        { projectId: 'proj_t', slug: 'test' },
+        makeClient(),
+        { buildCommand: null, outputDir: assetsDir, appType: 'spa' },
+        true,
+      );
+
+      expect(summary).toHaveBeenCalledOnce();
+      if (published === false) {
+        expect(ending).not.toHaveBeenCalled();
+      } else {
+        expect(ending).toHaveBeenCalledOnce();
+        expect(ending.mock.calls[0][0]).toContain('✓ Successfully deployed!');
+        expect(ending.mock.invocationCallOrder[0]).toBeGreaterThan(
+          summary.mock.invocationCallOrder[0],
+        );
+      }
+    },
+  );
+
   it('uploads assets directly to R2 then calls finalize JSON endpoint', async () => {
     const state = installPlatformMocks();
     const client = makeClient();

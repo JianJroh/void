@@ -6,6 +6,8 @@ import {
   readWranglerOAuthCredential,
   resolvePlatformCloudflareCredential,
   resolvePlatformCloudflareCredentialWithInput,
+  platformOperatorNeedsManagementToken,
+  verifyPlatformManagementAccess,
 } from '../../src/cli/platform-auth.ts';
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
@@ -23,6 +25,45 @@ afterEach(() => {
 });
 
 describe('platform Cloudflare authentication', () => {
+  it('requires a management token for Access even without DNS writes', () => {
+    const credential = { source: 'oauth' as const, token: 'browser' };
+    const plan = { actions: [] };
+    expect(platformOperatorNeedsManagementToken(credential, plan)).toBe(false);
+    expect(
+      platformOperatorNeedsManagementToken(credential, plan, { protection: true, readOnly: false }),
+    ).toBe(true);
+    expect(() =>
+      assertPlatformOperatorCredentialCanApplyPlan(credential, plan, {
+        protection: true,
+        readOnly: false,
+      }),
+    ).toThrow('Access: Service Tokens → Edit');
+    expect(
+      platformOperatorNeedsManagementToken({ source: 'environment', token: 'manager' }, plan, {
+        protection: true,
+        readOnly: false,
+      }),
+    ).toBe(false);
+  });
+  it.each([false, true])(
+    'checks Access permissions using only reads, with protection: %s',
+    async (protection) => {
+      const request = vi.fn(async (_path: string) => ({}));
+      await verifyPlatformManagementAccess({ request } as never, 'account', {
+        protection,
+        readOnly: false,
+      });
+      expect(request.mock.calls.map(([path]) => path)).toEqual([
+        '/accounts/account/access/organizations',
+        '/accounts/account/access/identity_providers?per_page=1',
+        '/accounts/account/access/groups?per_page=1',
+        '/accounts/account/access/policies?per_page=1',
+        '/accounts/account/access/apps?per_page=1',
+        ...(protection ? ['/accounts/account/access/service_tokens?per_page=1'] : []),
+      ]);
+      expect(request.mock.calls.every((call) => call.length === 1)).toBe(true);
+    },
+  );
   it('requires an API token before browser OAuth applies zone or DNS writes', () => {
     const action = (kind: 'dns-record' | 'zone', action: 'create' | 'reuse') => ({
       action,
@@ -62,6 +103,46 @@ describe('platform Cloudflare authentication', () => {
     ).resolves.toEqual({ source: 'environment', token: 'ci-token' });
     expect(runWrangler).not.toHaveBeenCalled();
   });
+
+  it.each([false, true])(
+    'uses saved management authority before browser login (interactive: %s)',
+    async (interactive) => {
+      const runWrangler = vi.fn();
+      const credential = await resolvePlatformCloudflareCredential({
+        interactive,
+        runWrangler,
+        savedManagementToken: ' saved-manager ',
+      });
+      expect(credential).toEqual({ source: 'saved', token: 'saved-manager' });
+      expect(runWrangler).not.toHaveBeenCalled();
+      expect(() =>
+        assertPlatformOperatorCredentialCanApplyPlan(
+          credential,
+          { actions: [] },
+          {
+            protection: true,
+            readOnly: false,
+          },
+        ),
+      ).not.toThrow();
+    },
+  );
+
+  it.each(['CLOUDFLARE_API_TOKEN', 'CF_API_TOKEN'])(
+    'keeps explicit %s ahead of the saved token',
+    async (name) => {
+      process.env[name] = 'explicit-manager';
+      const runWrangler = vi.fn();
+      await expect(
+        resolvePlatformCloudflareCredential({
+          interactive: false,
+          runWrangler,
+          savedManagementToken: 'saved-manager',
+        }),
+      ).resolves.toEqual({ source: 'environment', token: 'explicit-manager' });
+      expect(runWrangler).not.toHaveBeenCalled();
+    },
+  );
 
   it('reads OAuth through the Cloudflare session command', async () => {
     await expect(

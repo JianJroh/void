@@ -2,8 +2,12 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
-import { log, outro } from '@clack/prompts';
-import { createPlatformDeploymentManifest, transitionInstallation } from '@void/platform';
+import {
+  createPlatformDeploymentManifest,
+  recordInstallationResource,
+  transitionInstallation,
+} from '@void/platform';
+import { log, note, outro } from '@voidzero-dev/vite-plus-prompts';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import { pc } from '../../src/cli/output.ts';
 import { parsePlatformArgs } from '../../src/cli/platform-args.ts';
@@ -19,12 +23,14 @@ import {
   writePendingInstallationSecrets,
   writeInstallationManifest,
 } from '../../src/cli/platform-registry.ts';
+import { listSavedPlatformInstallPlans } from '../../src/cli/platform-saved-plans.ts';
 import {
   completePlatformSetupDraft,
   isPlatformSetupDraft,
   isPlatformInstallInProgress,
   savePlatformSetupDraft,
 } from '../../src/cli/platform-setup-draft.ts';
+import { platformAccessFixture } from '../fixtures/platform-access.ts';
 
 const mocks = vi.hoisted(() => ({
   confirm: vi.fn(),
@@ -32,6 +38,7 @@ const mocks = vi.hoisted(() => ({
   select: vi.fn(),
   text: vi.fn(),
   password: vi.fn(),
+  operatorCredential: vi.fn(),
   open: vi.fn(),
   install: vi.fn(),
   preflight: vi.fn(),
@@ -40,8 +47,8 @@ const mocks = vi.hoisted(() => ({
   spinner: vi.fn(),
   progress: { start: vi.fn(), stop: vi.fn(), message: vi.fn(), error: vi.fn(), clear: vi.fn() },
 }));
-vi.mock('@clack/prompts', async (original) => ({
-  ...(await original<typeof import('@clack/prompts')>()),
+vi.mock('@voidzero-dev/vite-plus-prompts', async (original) => ({
+  ...(await original<typeof import('@voidzero-dev/vite-plus-prompts')>()),
   // These fixtures retain GitHub-only setup; Access choices have their own matrix.
   confirm: (input: { message: string }) =>
     input.message === 'Also protect the platform UI and APIs with Cloudflare Access?'
@@ -49,9 +56,11 @@ vi.mock('@clack/prompts', async (original) => ({
       : mocks.confirm(input),
   multiselect: mocks.multiselect,
   select: (input: { message: string; options: Array<{ value: string }> }) =>
-    input.message === 'How should Void set up Hyperdrive?'
-      ? Promise.resolve(input.options[0]!.value)
-      : mocks.select(input),
+    input.message === 'Who should be able to access deployed apps?'
+      ? Promise.resolve('public')
+      : input.message === 'How should Void set up Hyperdrive?'
+        ? Promise.resolve(input.options[0]!.value)
+        : mocks.select(input),
   text: mocks.text,
   password: mocks.password,
   intro: vi.fn(),
@@ -67,13 +76,13 @@ vi.mock('../../src/cli/output.ts', async (original) => ({
   ...(await original<typeof import('../../src/cli/output.ts')>()),
   createSpinner: mocks.spinner,
 }));
-vi.mock('../../src/cli/platform-auth.ts', () => ({
-  resolvePlatformCloudflareCredential: async () => ({ source: 'oauth', token: 'operator-token' }),
+vi.mock('../../src/cli/platform-auth.ts', async (original) => ({
+  ...(await original<typeof import('../../src/cli/platform-auth.ts')>()),
+  resolvePlatformCloudflareCredential: mocks.operatorCredential,
   resolvePlatformCloudflareCredentialWithInput: async (input: () => Promise<unknown>) => ({
     input: await input(),
-    credential: { source: 'oauth', token: 'operator-token' },
+    credential: await mocks.operatorCredential(),
   }),
-  assertPlatformOperatorCredentialCanApplyPlan: vi.fn(),
 }));
 vi.mock('../../src/cli/platform-cloudflare.ts', async (original) => ({
   ...(await original<typeof import('../../src/cli/platform-cloudflare.ts')>()),
@@ -115,6 +124,8 @@ const environment = {
 };
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.database.mockReset();
+  mocks.operatorCredential.mockResolvedValue({ source: 'oauth', token: 'operator-token' });
   mocks.multiselect.mockResolvedValue(['github']);
   directory = mkdtempSync(join(tmpdir(), 'void-credential-flow-'));
   vi.stubEnv('VOID_PLATFORM_REGISTRY_DIR', directory);
@@ -124,6 +135,10 @@ beforeEach(() => {
     ...Object.keys(environment),
     'VOID_PLATFORM_PROJECT_SECRET_KEYS_JSON',
     'VOID_PLATFORM_PROJECT_SECRET_ACTIVE_KEY_VERSION',
+    'CLOUDFLARE_API_TOKEN',
+    'CF_API_TOKEN',
+    'VOID_PLATFORM_ACCESS_SETUP_TOKEN',
+    'VOID_ACCESS_CREDENTIALS',
   ]) {
     vi.stubEnv(key, '');
   }
@@ -142,6 +157,7 @@ beforeEach(() => {
   mocks.plan.mockImplementation(async (_client, input, existing) => {
     const id = existing?.id ?? `${input.installationSlug}-123456abcdef`;
     const deployment = createPlatformDeploymentManifest({
+      appAccess: input.appAccess ?? existing?.deployment.appAccess,
       installationSlug: input.installationSlug,
       displayName: input.displayName,
       ...(input.emailSharedZoneId && input.emailSenderDomain
@@ -208,6 +224,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   if (tty) {
     Object.defineProperty(process.stdin, 'isTTY', tty);
   } else {
@@ -244,18 +261,692 @@ async function interruptedInstall() {
   return manifest;
 }
 
+async function externalHyperdrivePlanner() {
+  const actual = await vi.importActual<typeof import('../../src/cli/platform-plan.ts')>(
+    '../../src/cli/platform-plan.ts',
+  );
+  mocks.plan.mockImplementation(actual.createPlatformInstallPlan);
+  mocks.database.mockResolvedValue(null);
+  vi.spyOn(PlatformCloudflareClient.prototype, 'getWorkersSubdomain').mockResolvedValue('account');
+  for (const method of [
+    'listAiGateways',
+    'listKvNamespaces',
+    'listR2Buckets',
+    'listQueues',
+    'listDispatchNamespaces',
+    'listWorkerNames',
+  ] as const) {
+    vi.spyOn(PlatformCloudflareClient.prototype, method).mockResolvedValue([]);
+  }
+  const selected = {
+    id: 'managed-drive',
+    name: 'company-managed-postgres',
+    database: 'platform',
+    host: 'tunnel.example.com/cluster/primary',
+    user: 'runtime_user',
+  };
+  vi.mocked(PlatformCloudflareClient.prototype.listHyperdriveConfigs).mockResolvedValue([
+    { id: selected.id, name: selected.name },
+  ]);
+  const config = {
+    id: selected.id,
+    name: selected.name,
+    cachingDisabled: true,
+    origin: {
+      scheme: 'postgresql' as const,
+      host: selected.host,
+      user: selected.user,
+      database: selected.database,
+      port: null,
+      accessClientId: 'tunnel-client',
+    },
+  };
+  const getConfig = vi
+    .spyOn(PlatformCloudflareClient.prototype, 'getHyperdriveConfig')
+    .mockResolvedValue(config);
+  return { selected, config, getConfig };
+}
+
+function requireManagementToken() {
+  const original = mocks.plan.getMockImplementation()!;
+  mocks.plan.mockImplementation(async (...input) => {
+    const plan = await original(...input);
+    return {
+      ...plan,
+      deployment: createPlatformDeploymentManifest({
+        installationSlug: plan.deployment.installationSlug,
+        displayName: plan.deployment.displayName,
+        application: { baseDomain: 'example.com', zoneName: 'example.com' },
+      }),
+      actions: [
+        {
+          action: 'adopt',
+          kind: 'dns-record',
+          key: 'wildcard-dns',
+          id: 'dns-id',
+          name: '*.example.com',
+          reason: 'test',
+        },
+      ],
+    };
+  });
+}
+
+function accessManagementPlan() {
+  const original = mocks.plan.getMockImplementation()!;
+  mocks.plan.mockImplementation(async (...input) => {
+    const plan = await original(...input);
+    return {
+      ...plan,
+      deployment: createPlatformDeploymentManifest({
+        installationSlug: plan.deployment.installationSlug,
+        displayName: plan.deployment.displayName,
+        application: plan.deployment.application,
+        authentication: input[1].authentication,
+        capabilities: { githubOAuth: false },
+        resources: plan.deployment.resources,
+      }),
+    };
+  });
+  for (const [key, value] of Object.entries(environment)) {
+    vi.stubEnv(key, value);
+  }
+  return [...args, '--login-methods', 'cloudflare-access', '--access-protection'];
+}
+
 describe('platform credential onboarding', () => {
+  it('uses one management token from initial setup through automatic Access provisioning', async () => {
+    const installArgs = accessManagementPlan();
+    const access = platformAccessFixture();
+    const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer management-secret');
+      const url = new URL(String(input));
+      const path = url.pathname.slice(url.pathname.indexOf('/accounts/')) + url.search;
+      const result = path.includes('/access/groups')
+        ? []
+        : await access.transport.request(path, init);
+      return Response.json({ success: true, result });
+    });
+    vi.stubGlobal('fetch', fetcher);
+    mocks.password.mockResolvedValueOnce('management-secret');
+    mocks.select.mockImplementation(async ({ options }) => options[0].value);
+    mocks.multiselect.mockImplementation(async ({ options }) =>
+      options
+        .map(({ value }: { value: string }) => value)
+        .filter((value: string) => ['company-idp', 'employees'].includes(value)),
+    );
+    mocks.install.mockImplementation(async (_plan, _secrets, manifest, dependencies) => {
+      await dependencies.prepareAuthentication(manifest);
+      return { manifest, waitingForDns: false, waitingForSandboxDrain: false };
+    });
+    await runPlatformLifecycleCommand(parsePlatformArgs(installArgs));
+    expect(mocks.password).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ message: 'Paste management API token:' }),
+    );
+    expect(access.apps.size).toBe(2);
+    expect(access.tokens.size).toBe(1);
+    expect(mocks.install.mock.calls[0]![1].cloudflareApiToken).toBe(
+      environment.VOID_PLATFORM_RUNTIME_CLOUDFLARE_API_TOKEN,
+    );
+    const manifest = listInstallationManifests()[0]!;
+    writePendingInstallationSecrets(manifest, {
+      ...readPendingInstallationSecrets(manifest),
+      accessManagementToken: 'stale-separate-access-token',
+    });
+    vi.clearAllMocks();
+    await runPlatformLifecycleCommand(
+      parsePlatformArgs(['install', '--resume', '--name', manifest.id]),
+    );
+    expect(mocks.password).not.toHaveBeenCalled();
+    expect(readPendingInstallationSecrets(manifest)?.accessManagementToken).toBeUndefined();
+    expect(access.apps.size).toBe(2);
+    expect(access.tokens.size).toBe(1);
+  });
+
+  it('rejects missing Access permissions at the initial management prompt before provisioning', async () => {
+    const installArgs = accessManagementPlan();
+    mocks.password
+      .mockResolvedValueOnce('missing-access')
+      .mockResolvedValueOnce('complete-manager');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(async (_input, init) =>
+        new Headers(init?.headers).get('Authorization') === 'Bearer missing-access'
+          ? Response.json(
+              { success: false, errors: [{ message: 'Access denied', code: 10000 }] },
+              { status: 403 },
+            )
+          : Response.json({ success: true, result: [] }),
+      ),
+    );
+    await runPlatformLifecycleCommand(parsePlatformArgs(installArgs));
+    expect(mocks.password.mock.calls.map(([input]) => input.message)).toEqual([
+      'Paste management API token:',
+      'Paste management API token:',
+    ]);
+    expect(mocks.install).toHaveBeenCalledOnce();
+    expect(mocks.install.mock.calls[0]![1].managementApiToken).toBe('complete-manager');
+    expect(mocks.install.mock.invocationCallOrder[0]).toBeGreaterThan(
+      mocks.password.mock.invocationCallOrder[1]!,
+    );
+  });
+
+  it('propagates Access service failures without reprompting or provisioning', async () => {
+    const installArgs = accessManagementPlan();
+    mocks.password.mockResolvedValueOnce('management-secret');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(async () =>
+        Response.json(
+          { success: false, errors: [{ message: 'Access unavailable', code: 10000 }] },
+          { status: 503 },
+        ),
+      ),
+    );
+    await expect(runPlatformLifecycleCommand(parsePlatformArgs(installArgs))).rejects.toThrow(
+      'Access unavailable',
+    );
+    expect(mocks.password).toHaveBeenCalledOnce();
+    expect(mocks.install).not.toHaveBeenCalled();
+    expect(listInstallationManifests()).toEqual([]);
+  });
+
+  it('previews the Access management requirement without collecting or probing credentials', async () => {
+    const installArgs = accessManagementPlan();
+    const fetcher = vi.fn();
+    vi.stubGlobal('fetch', fetcher);
+    await runPlatformLifecycleCommand(parsePlatformArgs([...installArgs, '--plan']));
+    expect(note).toHaveBeenCalledWith(
+      expect.stringContaining('Cloudflare management API token for Access setup'),
+      expect.any(String),
+    );
+    expect(mocks.password).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(mocks.install).not.toHaveBeenCalled();
+  });
+
+  it('checks an explicit management token before provisioning without replacing it interactively', async () => {
+    const installArgs = accessManagementPlan();
+    mocks.operatorCredential.mockResolvedValue({
+      source: 'environment',
+      token: 'explicit-manager',
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(async () =>
+        Response.json(
+          { success: false, errors: [{ message: 'Access denied', code: 10000 }] },
+          { status: 403 },
+        ),
+      ),
+    );
+    await expect(runPlatformLifecycleCommand(parsePlatformArgs(installArgs))).rejects.toThrow(
+      'Access denied',
+    );
+    expect(mocks.password).not.toHaveBeenCalled();
+    expect(mocks.install).not.toHaveBeenCalled();
+    expect(listInstallationManifests()).toEqual([]);
+  });
+  it.each([false, true])(
+    'resumes external Hyperdrive before adoption with a saved selection: %s',
+    async (savedSelection) => {
+      const { selected, getConfig } = await externalHyperdrivePlanner();
+      mocks.install.mockRejectedValueOnce(new Error('interrupted before adoption'));
+      const originalArgs = [...args, '--hyperdrive', selected.id];
+      await expect(runPlatformLifecycleCommand(parsePlatformArgs(originalArgs))).rejects.toThrow(
+        'interrupted before adoption',
+      );
+      const manifest = listInstallationManifests()[0]!;
+      expect(isPlatformSetupDraft(manifest)).toBe(false);
+      expect(manifest.resources).toEqual([]);
+      const checkpoint = readPendingInstallationSecrets(manifest)!;
+      expect(JSON.parse(checkpoint.externalHyperdriveJson!)).toEqual(selected);
+      if (!savedSelection) {
+        delete checkpoint.externalHyperdriveJson;
+        writePendingInstallationSecrets(manifest, checkpoint);
+        await runPlatformLifecycleCommand(parsePlatformArgs([...originalArgs, '--plan']));
+        expect(console.log).toHaveBeenLastCalledWith(
+          expect.stringContaining(`--hyperdrive ${selected.id}`),
+        );
+        expect(readPendingInstallationSecrets(manifest)?.externalHyperdriveJson).toBeUndefined();
+      }
+      vi.clearAllMocks();
+      await runPlatformLifecycleCommand(
+        parsePlatformArgs(
+          savedSelection ? ['install', '--resume', '--name', manifest.id] : originalArgs,
+        ),
+      );
+      expect(getConfig).toHaveBeenCalledExactlyOnceWith('account', selected.id);
+      expect(mocks.install).toHaveBeenCalledOnce();
+      expect(mocks.install.mock.calls[0]![0].actions).toContainEqual(
+        expect.objectContaining({ key: 'hyperdrive', action: 'adopt', id: selected.id }),
+      );
+      expect(mocks.install.mock.calls[0]![2].id).toBe(manifest.id);
+      expect(mocks.password).not.toHaveBeenCalled();
+      expect(JSON.parse(readPendingInstallationSecrets(manifest)!.externalHyperdriveJson!)).toEqual(
+        selected,
+      );
+    },
+  );
+
+  it('keeps the selected Hyperdrive when credential collection is cancelled', async () => {
+    const { selected, getConfig } = await externalHyperdrivePlanner();
+    mocks.password.mockResolvedValueOnce(Symbol('cancel'));
+    await expect(
+      runPlatformLifecycleCommand(parsePlatformArgs([...args, '--hyperdrive', selected.id])),
+    ).rejects.toThrow('Cancelled');
+    const manifest = listInstallationManifests()[0]!;
+    expect(isPlatformSetupDraft(manifest)).toBe(true);
+    expect(JSON.parse(readPendingInstallationSecrets(manifest)!.externalHyperdriveJson!)).toEqual(
+      selected,
+    );
+    vi.clearAllMocks();
+    await runPlatformLifecycleCommand(
+      parsePlatformArgs(['install', '--resume', '--name', manifest.id, '--plan']),
+    );
+    expect(getConfig).toHaveBeenCalledExactlyOnceWith('account', selected.id);
+    expect(mocks.select).not.toHaveBeenCalled();
+    expect(mocks.install).not.toHaveBeenCalled();
+    expect(mocks.plan.mock.calls[0]![1].externalHyperdrive).toEqual(selected);
+  });
+
+  it.each(['id', 'origin', 'caching'] as const)(
+    'rejects changed external Hyperdrive %s before resuming',
+    async (change) => {
+      const { selected, config, getConfig } = await externalHyperdrivePlanner();
+      mocks.install.mockRejectedValueOnce(new Error('interrupted before adoption'));
+      await expect(
+        runPlatformLifecycleCommand(parsePlatformArgs([...args, '--hyperdrive', selected.id])),
+      ).rejects.toThrow('interrupted before adoption');
+      const manifest = listInstallationManifests()[0]!;
+      const checkpoint = readPendingInstallationSecrets(manifest);
+      vi.clearAllMocks();
+      if (change === 'origin') {
+        getConfig.mockResolvedValue({
+          ...config,
+          origin: { ...config.origin, database: 'different-database' },
+        });
+      }
+      if (change === 'caching') {
+        getConfig.mockResolvedValue({ ...config, cachingDisabled: false });
+      }
+      await expect(
+        runPlatformLifecycleCommand(
+          parsePlatformArgs([
+            'install',
+            '--resume',
+            '--name',
+            manifest.id,
+            ...(change === 'id' ? ['--hyperdrive', 'another-drive'] : []),
+          ]),
+        ),
+      ).rejects.toThrow(
+        change === 'caching' ? 'Disable SQL result caching' : 'differs from the saved installation',
+      );
+      expect(mocks.plan).not.toHaveBeenCalled();
+      expect(mocks.install).not.toHaveBeenCalled();
+      expect(readPendingInstallationSecrets(manifest)).toEqual(checkpoint);
+    },
+  );
+
+  it('checks the authoritative Hyperdrive receipt before accepting a resume selection', async () => {
+    const { selected, getConfig } = await externalHyperdrivePlanner();
+    mocks.install.mockRejectedValueOnce(new Error('interrupted before adoption'));
+    await expect(
+      runPlatformLifecycleCommand(parsePlatformArgs([...args, '--hyperdrive', selected.id])),
+    ).rejects.toThrow('interrupted before adoption');
+    const manifest = listInstallationManifests()[0]!;
+    mocks.database.mockResolvedValue(
+      recordInstallationResource(
+        manifest,
+        {
+          key: 'hyperdrive',
+          kind: 'hyperdrive',
+          id: 'different-drive',
+          name: selected.name,
+          ownership: 'adopted',
+          state: 'ready',
+          configHash: 'a'.repeat(64),
+        },
+        new Date().toISOString(),
+      ),
+    );
+    vi.clearAllMocks();
+    await expect(
+      runPlatformLifecycleCommand(
+        parsePlatformArgs(['install', '--resume', '--name', manifest.id]),
+      ),
+    ).rejects.toThrow('differs from the saved installation');
+    expect(getConfig).not.toHaveBeenCalled();
+    expect(mocks.plan).not.toHaveBeenCalled();
+    expect(mocks.install).not.toHaveBeenCalled();
+  });
+
+  it('explains the management token requirement in a preview without collecting secrets', async () => {
+    requireManagementToken();
+    await runPlatformLifecycleCommand(parsePlatformArgs([...args, '--plan']));
+    const notes = vi
+      .mocked(note)
+      .mock.calls.map(([message, title]) => [
+        stripVTControlCharacters(message ?? ''),
+        stripVTControlCharacters(title ?? ''),
+      ]);
+    expect(outro).toHaveBeenCalledWith('Plan complete and ready to execute.');
+    expect(notes).toContainEqual([
+      expect.stringContaining('• Cloudflare management API token for DNS changes'),
+      'Required Credentials',
+    ]);
+    expect(notes.map(([, title]) => title)).toEqual([
+      'Read-only installation plan',
+      'Platform runtime',
+      'Required Credentials',
+    ]);
+    expect(notes).toContainEqual([
+      expect.stringContaining(
+        `Login callback: ${(await mocks.plan.mock.results[0]!.value).apiUrl}/auth/callback`,
+      ),
+      'Read-only installation plan',
+    ]);
+    const credentialSummary = notes.find(([, title]) => title === 'Required Credentials')![0];
+    expect(credentialSummary).not.toContain('/auth/callback');
+    expect(mocks.password).not.toHaveBeenCalled();
+    expect(mocks.open).not.toHaveBeenCalled();
+    expect(listInstallationManifests()).toEqual([]);
+  });
+
+  it('saves a prompted management token encrypted and keeps it separate from the runtime token', async () => {
+    requireManagementToken();
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ success: true, result: {} }));
+    vi.stubGlobal('fetch', fetcher);
+    mocks.password.mockResolvedValueOnce('  management-secret  ');
+    await runPlatformLifecycleCommand(parsePlatformArgs(args));
+    expect(mocks.password.mock.calls[0]![0].message).toBe('Paste management API token:');
+    expect(mocks.plan).toHaveBeenCalledTimes(2);
+    const management = mocks.plan.mock.calls[1]![0] as PlatformCloudflareClient;
+    expect(management).not.toBe(mocks.plan.mock.calls[0]![0]);
+    expect(mocks.install.mock.calls[0]![3].client).toBe(management);
+    await management.request('/test');
+    expect(fetcher).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer management-secret' }),
+      }),
+    );
+    expect(mocks.open).toHaveBeenCalledWith(
+      expect.stringContaining('name=Test+Management'),
+      expect.any(Function),
+    );
+    const secrets = readPendingInstallationSecrets(listInstallationManifests()[0]!);
+    expect(secrets?.cloudflareApiToken).toBe(
+      environment.VOID_PLATFORM_RUNTIME_CLOUDFLARE_API_TOKEN,
+    );
+    expect(secrets?.managementApiToken).toBe('management-secret');
+    expect(mocks.install.mock.calls[0]![1].managementApiToken).toBe('management-secret');
+    const savedFiles = readdirSync(directory, { recursive: true }).filter(
+      (entry): entry is string => typeof entry === 'string' && /\.(json|enc)$/.test(entry),
+    );
+    for (const file of savedFiles) {
+      expect(readFileSync(join(directory, file), 'utf8')).not.toContain('management-secret');
+    }
+    expect(process.env.CLOUDFLARE_API_TOKEN).toBe('');
+    expect(vi.mocked(console.log).mock.calls.flat().join(' ')).not.toContain('management-secret');
+  });
+
+  it.each([true, false])(
+    'reuses the saved management token on resume with pending DNS changes: %s',
+    async (needsDns) => {
+      if (needsDns) {
+        requireManagementToken();
+      }
+      const manifest = await interruptedInstall();
+      writePendingInstallationSecrets(manifest, {
+        ...readPendingInstallationSecrets(manifest),
+        managementApiToken: 'saved-management-secret',
+      });
+      for (const [key, value] of Object.entries(environment)) {
+        vi.stubEnv(key, value);
+      }
+      const fetcher = vi.fn<typeof fetch>(async () => Response.json({ success: true, result: {} }));
+      vi.stubGlobal('fetch', fetcher);
+
+      await runPlatformLifecycleCommand(
+        parsePlatformArgs(['install', '--resume', '--name', manifest.id]),
+      );
+
+      expect(mocks.password).not.toHaveBeenCalled();
+      expect(mocks.open).not.toHaveBeenCalled();
+      expect(mocks.plan).toHaveBeenCalledTimes(2);
+      const client = mocks.install.mock.calls[0]![3].client as PlatformCloudflareClient;
+      await client.request('/management-token-check');
+      expect(fetcher).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          headers: expect.objectContaining({ Authorization: 'Bearer saved-management-secret' }),
+        }),
+      );
+      expect(mocks.install.mock.calls[0]![1].cloudflareApiToken).toBe('saved-runtime-token');
+      expect(readPendingInstallationSecrets(manifest)?.managementApiToken).toBe(
+        'saved-management-secret',
+      );
+    },
+  );
+
+  it('retains a verified management token if the next credential prompt is cancelled', async () => {
+    requireManagementToken();
+    mocks.password
+      .mockResolvedValueOnce('management-secret')
+      .mockResolvedValueOnce(Symbol('cancel'));
+    await expect(runPlatformLifecycleCommand(parsePlatformArgs(args))).rejects.toThrow('Cancelled');
+    const manifest = listInstallationManifests()[0]!;
+    expect(isPlatformSetupDraft(manifest)).toBe(true);
+    expect(readPendingInstallationSecrets(manifest)?.managementApiToken).toBe('management-secret');
+    vi.clearAllMocks();
+    await runPlatformLifecycleCommand(
+      parsePlatformArgs(['install', '--resume', '--name', manifest.id]),
+    );
+    expect(
+      mocks.password.mock.calls.some(([input]) => input.message === 'Paste management API token:'),
+    ).toBe(false);
+    expect(mocks.install).toHaveBeenCalledOnce();
+  });
+
+  it.each(['unauthorized', 'wrong account', 'plan denied'] as const)(
+    'replaces a rejected saved management token: %s',
+    async (reason) => {
+      requireManagementToken();
+      const manifest = await interruptedInstall();
+      writePendingInstallationSecrets(manifest, {
+        ...readPendingInstallationSecrets(manifest),
+        managementApiToken: 'rejected-secret',
+      });
+      const accounts = vi.mocked(PlatformCloudflareClient.prototype.listAccounts);
+      accounts.mockResolvedValueOnce([{ id: 'account', name: 'Account' }]);
+      if (reason === 'wrong account') {
+        accounts.mockResolvedValueOnce([{ id: 'other', name: 'Other' }]);
+      }
+      if (reason === 'unauthorized') {
+        accounts.mockRejectedValueOnce(new PlatformCloudflareApiError('expired', 401));
+      }
+      if (reason === 'plan denied') {
+        const original = mocks.plan.getMockImplementation()!;
+        mocks.plan
+          .mockImplementationOnce(original)
+          .mockRejectedValueOnce(new PlatformCloudflareApiError('denied', 403));
+      }
+      mocks.password.mockResolvedValueOnce('replacement-secret');
+      await runPlatformLifecycleCommand(
+        parsePlatformArgs(['install', '--resume', '--name', manifest.id]),
+      );
+      expect(
+        mocks.password.mock.calls.filter(
+          ([input]) => input.message === 'Paste management API token:',
+        ),
+      ).toHaveLength(1);
+      expect(mocks.open).toHaveBeenCalledWith(
+        expect.stringContaining('Management'),
+        expect.any(Function),
+      );
+      expect(readPendingInstallationSecrets(manifest)?.managementApiToken).toBe(
+        'replacement-secret',
+      );
+      expect(mocks.install).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('forgets a rejected management token if replacement is cancelled, preserving other credentials', async () => {
+    requireManagementToken();
+    const manifest = await interruptedInstall();
+    const checkpoint = readPendingInstallationSecrets(manifest)!;
+    writePendingInstallationSecrets(manifest, {
+      ...checkpoint,
+      managementApiToken: 'expired-secret',
+    });
+    vi.mocked(PlatformCloudflareClient.prototype.listAccounts)
+      .mockResolvedValueOnce([{ id: 'account', name: 'Account' }])
+      .mockRejectedValueOnce(new PlatformCloudflareApiError('expired', 401));
+    mocks.password.mockResolvedValueOnce(Symbol('cancel'));
+    await expect(
+      runPlatformLifecycleCommand(
+        parsePlatformArgs(['install', '--resume', '--name', manifest.id]),
+      ),
+    ).rejects.toThrow('Cancelled');
+    expect(readPendingInstallationSecrets(manifest)).toEqual(checkpoint);
+    expect(mocks.install).not.toHaveBeenCalled();
+  });
+
+  it('retains the saved management token after a service failure without requesting a replacement', async () => {
+    requireManagementToken();
+    const manifest = await interruptedInstall();
+    const checkpoint = {
+      ...readPendingInstallationSecrets(manifest),
+      managementApiToken: 'saved-secret',
+    };
+    writePendingInstallationSecrets(manifest, checkpoint);
+    vi.mocked(PlatformCloudflareClient.prototype.listAccounts)
+      .mockResolvedValueOnce([{ id: 'account', name: 'Account' }])
+      .mockRejectedValueOnce(new PlatformCloudflareApiError('unavailable', 503));
+    await expect(
+      runPlatformLifecycleCommand(
+        parsePlatformArgs(['install', '--resume', '--name', manifest.id]),
+      ),
+    ).rejects.toThrow('unavailable');
+    expect(readPendingInstallationSecrets(manifest)).toEqual(checkpoint);
+    expect(mocks.password).not.toHaveBeenCalled();
+    expect(mocks.open).not.toHaveBeenCalled();
+    expect(mocks.install).not.toHaveBeenCalled();
+  });
+
+  it('keeps an environment override ahead of a saved management token', async () => {
+    requireManagementToken();
+    const manifest = await interruptedInstall();
+    writePendingInstallationSecrets(manifest, {
+      ...readPendingInstallationSecrets(manifest),
+      managementApiToken: 'saved-secret',
+    });
+    mocks.operatorCredential.mockResolvedValue({ source: 'environment', token: 'explicit-token' });
+    await runPlatformLifecycleCommand(
+      parsePlatformArgs(['install', '--resume', '--name', manifest.id]),
+    );
+    expect(mocks.plan).toHaveBeenCalledOnce();
+    expect(
+      mocks.password.mock.calls.some(([input]) => input.message === 'Paste management API token:'),
+    ).toBe(false);
+    expect(readPendingInstallationSecrets(manifest)?.managementApiToken).toBe('saved-secret');
+    expect(mocks.install).toHaveBeenCalledOnce();
+  });
+
+  it.each(['wrong account', 'rejected token'])(
+    'lets users replace a management token in the same run: %s',
+    async (failure) => {
+      requireManagementToken();
+      const accounts = vi.mocked(PlatformCloudflareClient.prototype.listAccounts);
+      accounts.mockResolvedValueOnce([{ id: 'account', name: 'Account' }]);
+      if (failure === 'wrong account') {
+        accounts.mockResolvedValueOnce([{ id: 'other', name: 'Other' }]);
+      } else {
+        accounts.mockRejectedValueOnce(new PlatformCloudflareApiError('denied', 403));
+      }
+      mocks.password.mockResolvedValueOnce('wrong-secret').mockResolvedValueOnce('correct-secret');
+      await runPlatformLifecycleCommand(parsePlatformArgs(args));
+      expect(
+        mocks.password.mock.calls.filter(
+          ([input]) => input.message === 'Paste management API token:',
+        ),
+      ).toHaveLength(2);
+      expect(mocks.plan).toHaveBeenCalledTimes(2);
+      expect(mocks.install).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('leaves no draft when management token input is cancelled', async () => {
+    requireManagementToken();
+    mocks.password.mockResolvedValueOnce(Symbol('cancel'));
+    await expect(runPlatformLifecycleCommand(parsePlatformArgs(args))).rejects.toThrow('Cancelled');
+    expect(listInstallationManifests()).toEqual([]);
+    expect(mocks.install).not.toHaveBeenCalled();
+    expect(listSavedPlatformInstallPlans()).toHaveLength(1);
+    const savedFile = readdirSync(directory).find((file) => file.startsWith('plan-'))!;
+    expect(readFileSync(join(directory, savedFile), 'utf8')).not.toContain('operator-token');
+  });
+
+  it('requires a management environment token for headless DNS changes', async () => {
+    requireManagementToken();
+    Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
+    await expect(
+      runPlatformLifecycleCommand(parsePlatformArgs([...args, '--yes'])),
+    ).rejects.toThrow('Set CLOUDFLARE_API_TOKEN');
+    expect(mocks.password).not.toHaveBeenCalled();
+    expect(mocks.open).not.toHaveBeenCalled();
+    expect(listInstallationManifests()).toEqual([]);
+  });
+
+  it('does not replace tokens after a service failure or apply a changed plan', async () => {
+    requireManagementToken();
+    mocks.password.mockResolvedValueOnce('management-secret');
+    vi.mocked(PlatformCloudflareClient.prototype.listAccounts)
+      .mockResolvedValueOnce([{ id: 'account', name: 'Account' }])
+      .mockRejectedValueOnce(new PlatformCloudflareApiError('unavailable', 503));
+    await expect(runPlatformLifecycleCommand(parsePlatformArgs(args))).rejects.toThrow(
+      'unavailable',
+    );
+    expect(mocks.password).toHaveBeenCalledOnce();
+    expect(listInstallationManifests()).toEqual([]);
+    const original = mocks.plan.getMockImplementation()!;
+    mocks.plan.mockImplementationOnce(original).mockImplementationOnce(async (...input) => ({
+      ...(await original(...input)),
+      installationId: 'changed-installation',
+    }));
+    mocks.password.mockResolvedValueOnce('management-secret');
+    await expect(runPlatformLifecycleCommand(parsePlatformArgs(args))).rejects.toThrow(
+      'Resources changed while checking management API token',
+    );
+    expect(listInstallationManifests()).toEqual([]);
+    expect(mocks.install).not.toHaveBeenCalled();
+  });
+
+  it('keeps explicit environment credentials and declined plans out of management token setup', async () => {
+    requireManagementToken();
+    mocks.confirm.mockResolvedValueOnce(false);
+    await runPlatformLifecycleCommand(parsePlatformArgs(args));
+    expect(mocks.open).not.toHaveBeenCalled();
+    expect(mocks.password).not.toHaveBeenCalled();
+    mocks.operatorCredential.mockResolvedValue({ source: 'environment', token: 'explicit-token' });
+    await runPlatformLifecycleCommand(parsePlatformArgs(args));
+    expect(
+      mocks.password.mock.calls.some(([input]) => input.message === 'Paste management API token:'),
+    ).toBe(false);
+    expect(mocks.install).toHaveBeenCalledOnce();
+  });
+
   it('prints a command to install a fresh read-only plan without saving a draft', async () => {
     const colors = pc.createColors(true);
     vi.spyOn(pc, 'bold').mockImplementation(colors.bold);
     vi.spyOn(pc, 'cyan').mockImplementation(colors.cyan);
     await runPlatformLifecycleCommand(parsePlatformArgs([...args, '--plan']));
     const lastOutput = vi.mocked(console.log).mock.calls.at(-1)![0] as string;
-    expect(lastOutput).toContain(
-      colors.bold(colors.cyan('Next step: run this command to install')),
-    );
+    expect(lastOutput).toContain(colors.bold('Next, run this command to install the platform'));
     expect(stripVTControlCharacters(lastOutput)).toMatch(
-      /Next step: run this command to install\n\nvoid platform install /,
+      /Next, run this command to install the platform\n\nvoid platform install /,
     );
     expect(vi.mocked(outro).mock.invocationCallOrder.at(-1)).toBeLessThan(
       vi.mocked(console.log).mock.invocationCallOrder.at(-1)!,
@@ -388,8 +1079,10 @@ describe('platform credential onboarding', () => {
   });
 
   it('does not offer to reinstall an already completed platform when its name is entered', async () => {
+    await runPlatformLifecycleCommand(parsePlatformArgs([...args, '--plan']));
     const draft = await savedSetup();
     writeInstallationManifest({ ...draft, status: 'installed' });
+    vi.clearAllMocks();
     mocks.text.mockResolvedValueOnce('test-setup');
     await expect(
       runPlatformLifecycleCommand(parsePlatformArgs(['install', '--plan'])),
@@ -397,6 +1090,7 @@ describe('platform credential onboarding', () => {
     expect(mocks.select).not.toHaveBeenCalled();
     expect(mocks.confirm).not.toHaveBeenCalled();
     expect(mocks.plan).not.toHaveBeenCalled();
+    expect(listSavedPlatformInstallPlans()).toHaveLength(1);
   });
 
   it('stops if the database says a selected installation completed elsewhere', async () => {
@@ -532,12 +1226,18 @@ describe('platform credential onboarding', () => {
     expect(mocks.password).toHaveBeenCalledWith(
       expect.objectContaining({ message: 'Secret Access Key:' }),
     );
-    const descriptions = info.mock.calls.map(([message]) => message).join('\n');
+    const descriptions = stripVTControlCharacters(
+      info.mock.calls.map(([message]) => message).join('\n'),
+    );
     expect(descriptions).toContain(
       'https://void.cloud/guide/platform/installation/prerequisites#platform-database',
     );
-    expect(descriptions).toContain('Signs platform login tokens. Run openssl rand -base64 32');
-    expect(descriptions).toContain('Encrypts app secrets. Run openssl rand -base64 32 separately');
+    expect(descriptions).toContain(
+      'Create a JWT signing key for platform login tokens. Run openssl rand -base64 32',
+    );
+    expect(descriptions).toContain(
+      'Generate a project encryption key for app secrets. Run openssl rand -base64 32 separately',
+    );
     expect(descriptions).not.toContain(environment.VOID_PLATFORM_DATABASE_URL);
     expect(descriptions).not.toContain(environment.VOID_PLATFORM_JWT_SECRET);
     expect(descriptions).not.toContain(environment.VOID_PLATFORM_PROJECT_SECRET_KEY);
@@ -820,7 +1520,8 @@ describe('platform credential onboarding', () => {
     );
     expect(mocks.text).toHaveBeenCalledWith(
       expect.objectContaining({
-        message: 'Custom API hostname. Leave empty for workers.dev:',
+        message:
+          'Where do you want to host the Void Platform API? Leave empty for a workers.dev fallback.',
       }),
     );
     const draft = listInstallationManifests()[0]!;
@@ -829,9 +1530,6 @@ describe('platform credential onboarding', () => {
     expect(draft.deployment.resources).toEqual(preview.deployment.resources);
     expect(isPlatformSetupDraft(draft)).toBe(true);
     const callback = `https://${draft.deployment.resources.apiWorker}.void-platform-e2e-test.workers.dev/auth/callback`;
-    expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining('Login callback: ' + callback),
-    );
     expect(info).toHaveBeenCalledWith(expect.stringContaining('Redirect URI: ' + callback));
     mocks.password.mockImplementation(normalPassword);
     mocks.open.mockClear();
@@ -876,12 +1574,19 @@ describe('platform credential onboarding', () => {
     expect(listInstallationManifests()).toEqual([]);
   });
 
-  it('keeps plan mode read-only, with direct links and no browser launches', async () => {
+  it('saves plan choices without Cloudflare changes, credentials, or browser launches', async () => {
     await runPlatformLifecycleCommand(parsePlatformArgs([...args, '--plan']));
     expect(mocks.open).not.toHaveBeenCalled();
     expect(mocks.password).not.toHaveBeenCalled();
     expect(listInstallationManifests()).toEqual([]);
-    expect(readdirSync(directory)).toEqual([]);
+    expect(listSavedPlatformInstallPlans()).toEqual([
+      expect.objectContaining({
+        accountName: 'Account',
+        args: expect.objectContaining({ name: 'test-setup', account: 'account', workersDev: true }),
+      }),
+    ]);
+    expect(readdirSync(directory)).toHaveLength(1);
+    expect(mocks.install).not.toHaveBeenCalled();
     expect(mocks.spinner).not.toHaveBeenCalled();
   });
   it('continues from the printed command without repeating nonsecret choices', async () => {
@@ -900,10 +1605,91 @@ describe('platform credential onboarding', () => {
     expect(mocks.multiselect).not.toHaveBeenCalled();
     expect(mocks.select).not.toHaveBeenCalled();
     expect(
-      mocks.text.mock.calls.some(([input]) => input.message.startsWith('Custom API hostname')),
+      mocks.text.mock.calls.some(([input]) =>
+        input.message.startsWith('Where do you want to host the Void Platform API?'),
+      ),
     ).toBe(false);
     expect(mocks.password).toHaveBeenCalled();
     expect(mocks.install).toHaveBeenCalledOnce();
+  });
+  it('offers a saved preview on a bare invocation and replans before installation', async () => {
+    await runPlatformLifecycleCommand(parsePlatformArgs([...args, '--plan']));
+    const saved = listSavedPlatformInstallPlans()[0]!;
+    const firstInput = mocks.plan.mock.calls[0]![1];
+    vi.clearAllMocks();
+    for (const [key, value] of Object.entries(environment)) {
+      vi.stubEnv(key, value);
+    }
+
+    await runPlatformLifecycleCommand(parsePlatformArgs(['install']));
+
+    expect(mocks.select).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        options: [
+          {
+            value: `plan:${saved.id}`,
+            label: 'Use saved plan for Test (test-setup)',
+            hint: 'Account · workers.dev',
+          },
+          { value: 'new', label: 'Start a new platform install' },
+        ],
+      }),
+    );
+    expect(mocks.text).not.toHaveBeenCalled();
+    expect(mocks.multiselect).not.toHaveBeenCalled();
+    expect(mocks.plan).toHaveBeenCalledWith(expect.anything(), firstInput, null, expect.anything());
+    expect(mocks.confirm).toHaveBeenCalledWith({
+      message: 'Apply this plan?',
+      initialValue: true,
+    });
+    expect(mocks.install).toHaveBeenCalledOnce();
+    expect(listSavedPlatformInstallPlans()).toEqual([]);
+    expect(listInstallationManifests()).toHaveLength(1);
+  });
+  it('never carries --yes from a saved plan and retains choices when applying is declined', async () => {
+    await runPlatformLifecycleCommand(parsePlatformArgs([...args, '--yes', '--plan']));
+    expect(listSavedPlatformInstallPlans()[0]?.args.yes).toBe(false);
+    vi.clearAllMocks();
+    mocks.confirm.mockResolvedValueOnce(false);
+    await runPlatformLifecycleCommand(parsePlatformArgs(['install']));
+    expect(mocks.confirm).toHaveBeenCalledWith({
+      message: 'Apply this plan?',
+      initialValue: true,
+    });
+    expect(mocks.install).not.toHaveBeenCalled();
+    expect(listSavedPlatformInstallPlans()).toHaveLength(1);
+    expect(listInstallationManifests()).toEqual([]);
+  });
+  it('can refresh a saved preview without prompting for its choices or applying it', async () => {
+    await runPlatformLifecycleCommand(parsePlatformArgs([...args, '--plan']));
+    const firstInput = mocks.plan.mock.calls[0]![1];
+    vi.clearAllMocks();
+    await runPlatformLifecycleCommand(parsePlatformArgs(['install', '--plan']));
+    expect(mocks.plan).toHaveBeenCalledWith(expect.anything(), firstInput, null, expect.anything());
+    expect(mocks.text).not.toHaveBeenCalled();
+    expect(mocks.multiselect).not.toHaveBeenCalled();
+    expect(mocks.confirm).not.toHaveBeenCalled();
+    expect(mocks.password).not.toHaveBeenCalled();
+    expect(mocks.install).not.toHaveBeenCalled();
+    expect(listSavedPlatformInstallPlans()).toHaveLength(1);
+  });
+  it('offers started setup instead of a stale preview for the same platform', async () => {
+    await runPlatformLifecycleCommand(parsePlatformArgs([...args, '--plan']));
+    const draft = await savedSetup();
+    vi.clearAllMocks();
+    await runPlatformLifecycleCommand(parsePlatformArgs(['install', '--plan']));
+    expect(mocks.select).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: [
+          {
+            value: draft.id,
+            label: `Continue setup for ${draft.deployment.displayName} (test-setup)`,
+            hint: 'Account',
+          },
+          { value: 'new', label: 'Start a new platform install' },
+        ],
+      }),
+    );
   });
   it('does not save a draft or open pages when the plan is declined', async () => {
     mocks.confirm.mockResolvedValue(false);
@@ -911,6 +1697,7 @@ describe('platform credential onboarding', () => {
     expect(listInstallationManifests()).toEqual([]);
     expect(mocks.open).not.toHaveBeenCalled();
     expect(mocks.spinner).not.toHaveBeenCalled();
+    expect(listSavedPlatformInstallPlans()).toHaveLength(1);
   });
   it('opens each missing credential page and preserves encrypted progress and callback identity across cancellation', async () => {
     const normalPassword = mocks.password.getMockImplementation()!;

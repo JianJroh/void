@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from 'node:util';
 import { createPlatformDeploymentManifest } from '@void/platform';
 import { describe, it, expect, vi } from 'vite-plus/test';
 import { parsePlatformArgs } from '../../src/cli/platform-args.ts';
@@ -7,6 +8,7 @@ import {
   formatPlatformSetupPlan,
   openPlatformSetupPage,
   platformSetupPages,
+  platformManagementSetupPage,
   platformSetupFieldHelp,
 } from '../../src/cli/platform-setup.ts';
 
@@ -42,6 +44,116 @@ function plan(domain = ''): PlatformInstallPlan {
   };
 }
 describe('platform credential setup links', () => {
+  it.each([false, true])(
+    'includes Access in the management token only, with protection: %s',
+    (protection) => {
+      const input = plan();
+      const selected = {
+        ...input,
+        deployment: {
+          ...input.deployment,
+          authentication: {
+            providers: ['cloudflare-access'] as const,
+            configurable: true as const,
+            ...(protection ? { accessProtection: true as const } : {}),
+          },
+        },
+      };
+      const page = platformManagementSetupPage(selected);
+      const permissions = JSON.parse(new URL(page.url).searchParams.get('permissionGroupKeys')!);
+      expect(permissions).toContainEqual({ key: 'access', type: 'edit' });
+      expect(permissions).toContainEqual({ key: 'access_acct', type: 'read' });
+      expect(permissions.some(({ key }: { key: string }) => key === 'access_service_token')).toBe(
+        protection,
+      );
+      if (protection) {
+        expect(permissions).toContainEqual({ key: 'access_service_token', type: 'edit' });
+      }
+      expect(
+        permissions.some(({ key }: { key: string }) =>
+          ['zone', 'dns', 'workers_routes'].includes(key),
+        ),
+      ).toBe(false);
+      expect(page.instructions).toContain('Scope it to Account.');
+      const runtime = JSON.parse(
+        new URL(platformSetupPages(selected).runtime.url).searchParams.get('permissionGroupKeys')!,
+      );
+      expect(runtime.some(({ key }: { key: string }) => key.startsWith('access'))).toBe(false);
+      const disabled = JSON.parse(
+        new URL(platformManagementSetupPage(selected, { access: false }).url).searchParams.get(
+          'permissionGroupKeys',
+        )!,
+      );
+      expect(disabled.some(({ key }: { key: string }) => key.startsWith('access'))).toBe(false);
+    },
+  );
+
+  it('uses read permissions for existing Access applications', () => {
+    const permissions = JSON.parse(
+      new URL(
+        platformManagementSetupPage(plan(), { access: { readOnly: true, protection: true } }).url,
+      ).searchParams.get('permissionGroupKeys')!,
+    );
+    expect(permissions.filter(({ key }: { key: string }) => key.startsWith('access'))).toEqual([
+      { key: 'access', type: 'read' },
+      { key: 'access_acct', type: 'read' },
+      { key: 'access_service_token', type: 'read' },
+    ]);
+  });
+  it('prefills a separate management token with account provisioning and zone permissions', () => {
+    const original = plan('example.com');
+    const page = platformManagementSetupPage(original);
+    const url = new URL(page.url);
+    expect(url.searchParams.get('to')).toBe('/account/api-tokens');
+    expect(url.searchParams.get('name')).toBe('Test & Team Management');
+    const permissions = JSON.parse(url.searchParams.get('permissionGroupKeys')!);
+    for (const key of [
+      'workers_scripts',
+      'workers_kv_storage',
+      'workers_r2',
+      'd1',
+      'queues',
+      'query_cache',
+      'aig',
+      'dns',
+      'workers_routes',
+    ]) {
+      expect(permissions).toContainEqual({ key, type: 'edit' });
+    }
+    expect(permissions).toContainEqual({ key: 'zone', type: 'read' });
+    expect(
+      permissions.some(({ key }: { key: string }) => ['cache', 'account_api_tokens'].includes(key)),
+    ).toBe(false);
+    expect(page.instructions).toBe(
+      'This token lets the Void CLI install your platform. Void will now open a pre-configured token creation site. Please review the permissions and then paste the token here.\nScope it to Account and zone example.com.',
+    );
+    const createZone = platformManagementSetupPage({
+      ...original,
+      actions: [
+        {
+          kind: 'zone',
+          key: 'zone',
+          action: 'create',
+          id: null,
+          name: 'example.com',
+          reason: 'test',
+        },
+      ],
+    });
+    expect(
+      JSON.parse(new URL(createZone.url).searchParams.get('permissionGroupKeys')!),
+    ).toContainEqual({ key: 'zone', type: 'edit' });
+    expect(createZone.instructions).toContain('allow zone creation');
+    const separateApi = platformManagementSetupPage({
+      ...original,
+      deployment: {
+        ...original.deployment,
+        controlPlane: { ...original.deployment.controlPlane, apiHostname: 'api.company.net' },
+      },
+    });
+    expect(separateApi.instructions).toContain('Also include the zone for api.company.net.');
+  });
+
   it('round-trips planned defaults, Hyperdrive, dashboard, and login choices into install arguments', () => {
     const command = formatPlatformInstallCommand({
       commandName: 'void',
@@ -101,21 +213,22 @@ describe('platform credential setup links', () => {
     );
     for (const key of ['jwtSecret', 'projectSecretKey']) {
       const help = platformSetupFieldHelp(key)!;
-      expect(help.description).toContain('Run openssl rand -base64 32');
-      expect(help.description).toContain(
+      const description = stripVTControlCharacters(help.description);
+      expect(description).toContain('Run openssl rand -base64 32');
+      expect(description).toContain(
         'https://void.cloud/guide/platform/installation/credentials#signing-and-encryption-keys',
       );
-      expect(help.description).not.toContain('\n');
+      expect(description).not.toContain('\n');
     }
     expect(platformSetupFieldHelp('jwtSecret')!.description).toContain(
-      'Signs platform login tokens',
+      'Create a JWT signing key for platform login tokens',
     );
     expect(platformSetupFieldHelp('projectSecretKey')!.description).toContain(
-      'Encrypts app secrets',
+      'Generate a project encryption key for app secrets',
     );
     expect(platformSetupFieldHelp('cloudflareApiToken')).toBeUndefined();
   });
-  it('scopes the runtime form to the account and preselects every required permission with an accurate fallback', () => {
+  it('scopes the runtime form to the account and preselects every required permission', () => {
     const pages = platformSetupPages(plan());
     const url = new URL(pages.runtime.url);
     expect(url.origin).toBe('https://dash.cloudflare.com');
@@ -139,12 +252,9 @@ describe('platform credential setup links', () => {
         ['cache', 'ssl_and_certificates', 'account_api_tokens'].includes(permission.key),
       ),
     ).toBe(false);
-    expect(pages.runtime.instructions).toContain('Hyperdrive, AI Gateway.');
-    expect(pages.runtime.instructions).toContain(
-      'Read: Account Settings, Account Analytics, Workers Tail.',
+    expect(pages.runtime.instructions).toBe(
+      'Create a Cloudflare runtime token that Void can use to manage the platform. Please review the permissions and then paste the token here.',
     );
-    expect(pages.runtime.instructions).not.toContain('Also select');
-    expect(pages.runtime.instructions).not.toContain('Zone');
     expect(new URL(pages.r2.url).searchParams.get('to')).toBe('/account/r2/api-tokens/create');
     expect(new URL(pages.r2.url).searchParams.get('type')).toBe('account');
     expect(pages.r2.instructions).toContain('Object Read & Write');
@@ -211,31 +321,58 @@ describe('platform credential setup links', () => {
     expect(permissions(original).some((permission) => emailKeys.includes(permission.key))).toBe(
       false,
     );
-    expect(platformSetupPages(withEmail).runtime.instructions).toContain(
-      'Email Routing Addresses: Edit',
-    );
-    expect(platformSetupPages(withEmail).runtime.instructions).toContain('Email Sending: Edit');
     expect(platformSetupPages(original).runtime.instructions).not.toContain(
       'Email Routing Addresses',
     );
     expect(platformSetupPages(original).runtime.instructions).not.toContain('Email Sending');
   });
-  it('shows the final callback in previews as well as interactive setup', () => {
+  it('lists credentials in previews and shows credential links and callbacks during setup', () => {
     const preview = formatPlatformSetupPlan(plan());
-    expect(preview).toContain('https://github.com/settings/applications/new');
-    expect(preview).toContain(plan().apiUrl + '/auth/callback');
+    expect(preview).toContain(
+      'The installation will guide you through setting up the following credentials:',
+    );
+    expect(preview).not.toContain('https://');
+    expect(preview).not.toContain('/auth/callback');
     expect(platformSetupPages(plan()).github.instructions).toContain(
       plan().apiUrl + '/auth/callback',
     );
-    expect(preview).toContain('Login callback: ' + plan().apiUrl + '/auth/callback');
     expect(preview).toContain('PostgreSQL database URL');
     expect(preview).toContain('JWT signing key and project encryption key');
-    expect(preview).toContain(
-      'Installation collects and validates missing credentials after you confirm the plan.',
-    );
     expect(preview).not.toMatch(/paste|copy|Workers Scripts|Object Read|Register a GitHub/);
     expect(preview).not.toMatch(/[();]/);
     expect(preview.split('\n').length).toBeLessThanOrEqual(10);
+  });
+  it('lists the selected Access credentials and required DNS token concisely', () => {
+    const original = plan('example.com');
+    const preview = formatPlatformSetupPlan(
+      {
+        ...original,
+        deployment: {
+          ...original.deployment,
+          authentication: {
+            providers: ['cloudflare-access'],
+            configurable: true,
+            accessProtection: true,
+          },
+        },
+      },
+      { managementToken: true },
+    );
+    expect(preview).toBe(
+      [
+        'The installation will guide you through setting up the following credentials:',
+        '',
+        '• Cloudflare management API token for DNS changes',
+        '• PostgreSQL database URL',
+        '• Cloudflare runtime token',
+        '• R2 upload token',
+        '• Cloudflare Access OIDC client ID and secret',
+        '• Cloudflare Access application and installer credentials',
+        '• JWT signing key and project encryption key',
+      ].join('\n'),
+    );
+    expect(formatPlatformSetupPlan(plan())).not.toContain('management API token');
+    expect(formatPlatformSetupPlan(plan())).not.toContain('Access application');
   });
   it('includes zone permissions only for an application domain', () => {
     const page = platformSetupPages(plan('example.com')).runtime;
@@ -243,7 +380,6 @@ describe('platform credential setup links', () => {
       key: 'cache',
       type: 'purge',
     });
-    expect(page.instructions).toContain('Zone example.com: Cache Purge: Purge');
   });
   it('opens only in interactive mode and retains a manual link if opening fails', () => {
     const open = vi.fn(() => {

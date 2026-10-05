@@ -9,6 +9,7 @@ import {
   isCloudflareAccessChallenge,
 } from './cf-access.ts';
 import type { CliLogger } from './log-file.ts';
+import { readPlatformDiscoveryResponse } from './platform-discovery.ts';
 import {
   formatPlatformApiError,
   parsePlatformErrorBody,
@@ -42,6 +43,77 @@ export function readCliVersion(): string | null {
 }
 
 const VOID_CLI_VERSION = readCliVersion();
+
+/** The oldest Void platform release this CLI supports. */
+export const MIN_PLATFORM_VERSION = '0.23.0';
+
+const RELEASE_VERSION = /^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
+
+/**
+ * Version checks keyed by platform base URL. Every outcome (pass, inconclusive,
+ * or too old) is kept for the rest of the process, so polling commands probe
+ * discovery once.
+ */
+const platformVersionChecks = new Map<string, Promise<void>>();
+
+/**
+ * What public discovery says about the platform version:
+ * - `version`: the reported `platformVersion`
+ * - `missing`: discovery answered 404, so the platform predates discovery
+ * - `unknown`: no usable answer (network error, timeout, disabled platform,
+ *   Access login page, or an invalid document)
+ */
+type PlatformVersionProbe =
+  | { kind: 'version'; version: string }
+  | { kind: 'missing' }
+  | { kind: 'unknown' };
+
+/**
+ * Returns whether `version` is older than MIN_PLATFORM_VERSION, or null when
+ * it is not a release version. A prerelease sorts before its release.
+ */
+function isOlderThanMinimumPlatform(version: string): boolean | null {
+  const actual = RELEASE_VERSION.exec(version);
+  const minimum = RELEASE_VERSION.exec(MIN_PLATFORM_VERSION)!;
+  if (!actual) {
+    return null;
+  }
+  for (const part of [1, 2, 3]) {
+    const difference = Number(actual[part]) - Number(minimum[part]);
+    if (difference !== 0) {
+      return difference < 0;
+    }
+  }
+  return actual[4] !== undefined && minimum[4] === undefined;
+}
+
+const UPGRADE_PLATFORM_ACTION =
+  'Ask its administrator to upgrade the platform runtime with `void platform upgrade`.';
+
+function assertSupportedPlatform(apiUrl: string, probe: PlatformVersionProbe): void {
+  if (probe.kind === 'unknown') {
+    // Let the real request run and report its own error.
+    return;
+  }
+  if (probe.kind === 'missing') {
+    // Every Void platform release serves discovery, so a 404 there means a
+    // platform that predates it, and therefore predates the minimum.
+    throw new Error(
+      `The Void platform at ${apiUrl} does not report its version, but this CLI requires ${MIN_PLATFORM_VERSION} or later. ${UPGRADE_PLATFORM_ACTION}`,
+    );
+  }
+  const { version } = probe;
+  // Installed and hosted platforms report their release version. "hosted"
+  // comes from a hosted deployment that does not set PLATFORM_VERSION yet.
+  // Any other value that is not a release version comes from a custom or
+  // development build and cannot be ordered. Both pass.
+  if (version === 'hosted' || isOlderThanMinimumPlatform(version) !== true) {
+    return;
+  }
+  throw new Error(
+    `The Void platform at ${apiUrl} runs version ${version}, but this CLI requires ${MIN_PLATFORM_VERSION} or later. ${UPGRADE_PLATFORM_ACTION}`,
+  );
+}
 
 export { parsePlatformErrorBody } from './platform-errors.ts';
 export type { PlatformErrorPayload } from './platform-errors.ts';
@@ -114,7 +186,7 @@ export type ProjectResponse = {
   type: string;
   created_at: string;
   custom_domain: string | null;
-  role?: ProjectRole;
+  role: ProjectRole;
   owner?: {
     id: string;
     login?: string;
@@ -300,7 +372,7 @@ export type BuildLogsResponse = {
   lastSeq: number;
   status: string;
   terminal: boolean;
-  logsComplete?: boolean | null;
+  logsComplete: boolean | null;
   external: string | null;
 };
 
@@ -446,6 +518,7 @@ export type DomainResponse = {
 };
 
 export type DomainStatusResponse = DomainResponse & {
+  cname_target: string;
   ssl_status: string;
   verification_errors?: Array<string>;
   cf_status?: string;
@@ -470,7 +543,6 @@ export type GithubConnection = {
   project_id: string;
   installation_id: string;
   repo_full_name: string;
-  repository_id: string | null;
   branch: string;
   build_executor: 'container' | 'github_actions';
   workflow_path: string;
@@ -523,8 +595,17 @@ const DEPLOY_OBSERVATION_DEADLINE_MS = 30 * 60_000;
 const DEPLOY_OBSERVATION_BACKOFF_MS = [1000, 2000, 5000, 10_000, 30_000];
 const DEPLOY_EVENT_MAX_BYTES = 1024 * 1024;
 
+// Heartbeats carry no `seq`. Heartbeat `status` and the observation page
+// `heartbeat` come from commit 21d4ec46, which 0.23.0 does not ship; keep them
+// optional until MIN_PLATFORM_VERSION includes it. `recoveryAt` is optional:
+// it is sent only while an execution lease exists.
 type SequencedDeployEvent = DeployEvent & { seq?: number };
 class DeploymentProtocolError extends Error {}
+class DeploymentObservationTimeoutError extends Error {
+  constructor(deploymentId: string) {
+    super(`Timed out observing deployment ${deploymentId}. Inspect with \`void project status\`.`);
+  }
+}
 
 function parseDeployEvent(value: unknown): SequencedDeployEvent {
   if (
@@ -541,6 +622,13 @@ function parseDeployEvent(value: unknown): SequencedDeployEvent {
   }
   if (
     (event.event === 'start' && typeof event.deploymentId !== 'string') ||
+    (event.event === 'heartbeat' &&
+      (typeof event.step !== 'string' ||
+        (event.status !== undefined &&
+          !['queued', 'running', 'recovering'].includes(event.status)) ||
+        (event.recoveryAt !== undefined &&
+          (typeof event.recoveryAt !== 'string' ||
+            !Number.isFinite(Date.parse(event.recoveryAt)))))) ||
     (event.event === 'done' &&
       (typeof event.deployment !== 'string' ||
         typeof event.url !== 'string' ||
@@ -567,17 +655,26 @@ export class PlatformClient {
   private readonly authHeaders: Record<string, string>;
   private readonly accessHeaders: Record<string, string>;
   private readonly cliLog?: CliLogger;
+  private readonly checkPlatformVersion: boolean;
   readonly apiUrl: string;
 
+  /**
+   * `checkPlatformVersion: false` skips the minimum platform version check.
+   * Only login uses it, so users can still sign in to an older platform.
+   */
   constructor(
     token: string,
-    options?: string | { apiUrl?: string; root?: string; cliLog?: CliLogger },
+    options?:
+      | string
+      | { apiUrl?: string; root?: string; cliLog?: CliLogger; checkPlatformVersion?: boolean },
   ) {
     if (typeof options === 'string') {
       this.baseUrl = normalizePlatformApiUrl(options);
+      this.checkPlatformVersion = true;
     } else {
       this.baseUrl = normalizePlatformApiUrl(options?.apiUrl ?? getApiUrl(options?.root));
       this.cliLog = options?.cliLog;
+      this.checkPlatformVersion = options?.checkPlatformVersion !== false;
     }
     this.apiUrl = this.baseUrl;
     ensureCloudflaredToken(this.baseUrl);
@@ -596,6 +693,55 @@ export class PlatformClient {
     if (new URL(url).origin !== this.baseUrl) {
       throw new Error('Platform credentials cannot be sent to another origin.');
     }
+    if (this.checkPlatformVersion) {
+      await this.ensureSupportedPlatform();
+    }
+    return this.send(url, options);
+  }
+
+  /**
+   * Checks the platform version once per process and base URL. Concurrent
+   * first requests share one check, and its outcome is kept for later requests.
+   */
+  private ensureSupportedPlatform(): Promise<void> {
+    const apiUrl = this.baseUrl;
+    const cached = platformVersionChecks.get(apiUrl);
+    if (cached) {
+      return cached;
+    }
+    const check = this.probePlatformVersion().then((probe) =>
+      assertSupportedPlatform(apiUrl, probe),
+    );
+    platformVersionChecks.set(apiUrl, check);
+    return check;
+  }
+
+  /** Reads the platform version from public discovery, without credentials. */
+  private async probePlatformVersion(): Promise<PlatformVersionProbe> {
+    let response: Response;
+    try {
+      response = await this.send(`${this.baseUrl}/.well-known/void-platform`, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch {
+      // A network error or timeout says nothing about the version. The real
+      // request reports its own error if the platform is unreachable.
+      return { kind: 'unknown' };
+    }
+    if (response.status === 404) {
+      await response.body?.cancel();
+      return { kind: 'missing' };
+    }
+    try {
+      const discovery = await readPlatformDiscoveryResponse(this.baseUrl, response);
+      return { kind: 'version', version: discovery.platformVersion };
+    } catch {
+      return { kind: 'unknown' };
+    }
+  }
+
+  private async send(url: string | URL, options: RequestInit): Promise<Response> {
     // A service-token pair is long-lived and was captured before managed deploy
     // scrubs the parent environment. User tokens can be renewed in the browser,
     // so keep checking for a newer environment value when no service pair was
@@ -699,11 +845,6 @@ export class PlatformClient {
     const res = await this.request(`${this.baseUrl}/projects/choices`, {
       headers: { ...this.authHeaders },
     });
-    if (res.status === 404) {
-      throw new Error(
-        'This platform does not support project lookup. Ask its administrator to upgrade the platform runtime.',
-      );
-    }
     if (!res.ok) {
       await throwPlatformApiError('Failed to list project choices', res);
     }
@@ -729,11 +870,6 @@ export class PlatformClient {
     const url = new URL(`${this.baseUrl}/projects/resolve`);
     url.searchParams.set('slug', slug);
     const res = await this.request(url.toString(), { headers: { ...this.authHeaders } });
-    if (res.status === 404) {
-      throw new Error(
-        'This platform does not support project lookup. Ask its administrator to upgrade the platform runtime.',
-      );
-    }
     if (!res.ok) {
       await throwPlatformApiError('Failed to resolve project', res);
     }
@@ -1216,22 +1352,23 @@ export class PlatformClient {
     }
 
     const receipt = res.headers.get('x-void-deployment-id');
-    if (receipt !== null && !/^[A-Za-z0-9_-]{1,128}$/.test(receipt)) {
+    const observationDeadline = Date.now() + DEPLOY_OBSERVATION_DEADLINE_MS;
+    if (receipt === null || !/^[A-Za-z0-9_-]{1,128}$/.test(receipt)) {
       void res.body?.cancel().catch(() => {});
-      throw new Error('Invalid deployment receipt from platform.');
+      throw new Error(
+        receipt === null
+          ? 'Platform returned no deployment receipt.'
+          : 'Invalid deployment receipt from platform.',
+      );
     }
     let cursor = 0;
     let terminal = false;
-    // Receipt-aware platforms own execution independently of this observer.
-    // Capturing the ID before the first byte also permits recovery when start
-    // was lost. Older platforms retain their original stream-only behavior.
+    // The platform owns execution independently of this observer. Capturing
+    // the ID before the first byte also permits recovery when start was lost.
     if (!res.body) {
-      if (receipt) {
-        yield { event: 'start', deploymentId: receipt };
-        yield* this.followDeploymentEvents(projectId, receipt, cursor);
-        return;
-      }
-      throw new Error('Platform returned no deployment event stream.');
+      yield { event: 'start', deploymentId: receipt };
+      yield* this.followDeploymentEvents(projectId, receipt, cursor, observationDeadline);
+      return;
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -1244,16 +1381,22 @@ export class PlatformClient {
     let streamFinished = false;
     let readTimer: ReturnType<typeof setTimeout> | undefined;
     const read = async () => {
-      if (!receipt) {
-        return reader.read();
+      const remaining = observationDeadline - Date.now();
+      if (remaining <= 0) {
+        throw new DeploymentObservationTimeoutError(receipt);
       }
       try {
         return await Promise.race([
           reader.read(),
           new Promise<never>((_, reject) => {
             readTimer = setTimeout(
-              () => reject(new TypeError('Deployment event stream timed out.')),
-              DEPLOY_OBSERVATION_TIMEOUT_MS,
+              () =>
+                reject(
+                  Date.now() >= observationDeadline
+                    ? new DeploymentObservationTimeoutError(receipt)
+                    : new TypeError('Deployment event stream timed out.'),
+                ),
+              Math.min(DEPLOY_OBSERVATION_TIMEOUT_MS, remaining),
             );
           }),
         ]);
@@ -1279,7 +1422,7 @@ export class PlatformClient {
       lastEventName = event.event;
       cliLog?.info('deploy_event', { eventCount, event: lastEventName, raw: line.slice(0, 200) });
       // The receipt already supplied start, but still advance its sequence.
-      if (receipt && event.event === 'start') {
+      if (event.event === 'start') {
         return null;
       }
       terminal = event.event === 'done' || event.event === 'error';
@@ -1287,11 +1430,12 @@ export class PlatformClient {
     };
 
     try {
-      if (receipt) {
-        yield { event: 'start', deploymentId: receipt };
-      }
+      yield { event: 'start', deploymentId: receipt };
       while (true) {
         const { done, value } = await read();
+        if (Date.now() >= observationDeadline) {
+          throw new DeploymentObservationTimeoutError(receipt);
+        }
         if (done) {
           streamFinished = true;
           buffer += decoder.decode();
@@ -1340,7 +1484,7 @@ export class PlatformClient {
       // Parse/protocol errors are not transient transport failures. Never hide
       // them behind polling, and never replay a POST that yielded a receipt.
       if (
-        !receipt ||
+        err instanceof DeploymentObservationTimeoutError ||
         err instanceof DeploymentProtocolError ||
         err instanceof SyntaxError ||
         (err instanceof DOMException && err.name === 'AbortError')
@@ -1356,8 +1500,8 @@ export class PlatformClient {
       }
       reader.releaseLock();
     }
-    if (receipt && !terminal) {
-      yield* this.followDeploymentEvents(projectId, receipt, cursor);
+    if (!terminal) {
+      yield* this.followDeploymentEvents(projectId, receipt, cursor, observationDeadline);
     }
   }
 
@@ -1365,10 +1509,10 @@ export class PlatformClient {
     projectId: string,
     deploymentId: string,
     since: number,
+    deadline: number,
   ): AsyncGenerator<DeployEvent> {
     let cursor = since;
     let failures = 0;
-    const deadline = Date.now() + DEPLOY_OBSERVATION_DEADLINE_MS;
     while (Date.now() < deadline) {
       const url = `${this.baseUrl}/projects/${encodeURIComponent(projectId)}/deployments/${encodeURIComponent(deploymentId)}/events?since=${cursor}`;
       let page: {
@@ -1376,16 +1520,22 @@ export class PlatformClient {
         events: Array<{ seq: number; event: unknown }>;
         lastSeq: number;
         terminal: boolean;
+        heartbeat?: unknown;
       };
       try {
         const response = await this.request(url, {
           headers: { ...this.authHeaders },
-          signal: AbortSignal.timeout(DEPLOY_OBSERVATION_TIMEOUT_MS),
+          signal: AbortSignal.timeout(
+            Math.max(1, Math.min(DEPLOY_OBSERVATION_TIMEOUT_MS, deadline - Date.now())),
+          ),
         });
         if (!response.ok) {
           await throwPlatformApiError('Failed to observe deployment', response, 'read');
         }
         page = (await response.json()) as typeof page;
+        if (Date.now() >= deadline) {
+          throw new DeploymentObservationTimeoutError(deploymentId);
+        }
       } catch (err) {
         const transient =
           err instanceof TypeError ||
@@ -1396,7 +1546,7 @@ export class PlatformClient {
         }
         const delayMs = DEPLOY_OBSERVATION_BACKOFF_MS[failures++];
         this.cliLog?.warn('deploy_observation_retry', { deploymentId, cursor, delayMs });
-        await sleep(delayMs);
+        await sleep(Math.min(delayMs, Math.max(0, deadline - Date.now())));
         continue;
       }
       failures = 0;
@@ -1439,11 +1589,19 @@ export class PlatformClient {
       if (page.terminal) {
         throw new Error('Platform finished deployment without a terminal result.');
       }
-      await sleep(1000);
+      if (page.heartbeat !== undefined) {
+        const heartbeat = parseDeployEvent(page.heartbeat);
+        if (
+          heartbeat.event !== 'heartbeat' ||
+          (heartbeat.deploymentId !== undefined && heartbeat.deploymentId !== deploymentId)
+        ) {
+          throw new DeploymentProtocolError('Invalid deployment observation heartbeat.');
+        }
+        yield heartbeat;
+      }
+      await sleep(Math.min(1000, Math.max(0, deadline - Date.now())));
     }
-    throw new Error(
-      `Timed out observing deployment ${deploymentId}. Inspect with \`void project status\`.`,
-    );
+    throw new DeploymentObservationTimeoutError(deploymentId);
   }
 
   async listSecrets(projectId: string): Promise<Array<{ name: string }>> {

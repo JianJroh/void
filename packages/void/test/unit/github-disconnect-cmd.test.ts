@@ -1,4 +1,4 @@
-import { confirm, log } from '@clack/prompts';
+import { confirm, log } from '@voidzero-dev/vite-plus-prompts';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import {
   PlatformApiError,
@@ -12,8 +12,8 @@ import { runGithubDisconnect } from '../../src/cli/github-cmd.ts';
 // configurable in ESM"). Mock the module instead, keeping every other export
 // real (log/cancel/isCancel/select/text) so only `confirm` is replaced with a
 // drivable spy. `vi.mock` is hoisted above the imports above.
-vi.mock('@clack/prompts', async (imp) => ({
-  ...(await imp<typeof import('@clack/prompts')>()),
+vi.mock('@voidzero-dev/vite-plus-prompts', async (imp) => ({
+  ...(await imp<typeof import('@voidzero-dev/vite-plus-prompts')>()),
   confirm: vi.fn(),
 }));
 
@@ -32,7 +32,6 @@ function makeConnection(overrides: Partial<GithubConnection> = {}): GithubConnec
     project_id: projectId,
     installation_id: '123456',
     repo_full_name: 'octocat/hello-world',
-    repository_id: '9876',
     branch: 'main',
     build_executor: 'container',
     workflow_path: '.github/workflows/void-deploy.yml',

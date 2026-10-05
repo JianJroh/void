@@ -1,4 +1,3 @@
-import { confirm, isCancel, log, note, text } from '@clack/prompts';
 import {
   createApplicationRoutes,
   createPlatformDeploymentManifest,
@@ -8,6 +7,7 @@ import {
   type PlatformApplication,
   type PlatformInstallationManifest,
 } from '@void/platform';
+import { confirm, isCancel, log, note, text } from '@voidzero-dev/vite-plus-prompts';
 import { cfAccessHeaders } from '../shared/cf-access.ts';
 import type { PlatformArgs } from './platform-args.ts';
 import {
@@ -231,7 +231,9 @@ export async function activatePlatformDomain(
     },
     body: JSON.stringify({ application }),
   });
-  // An older runtime has no activation handoff and answers with a non-JSON 404.
+  // A runtime before 0.22.0 has no activation handoff and answers with a
+  // non-JSON 404. Platform management commands do not run the minimum
+  // platform version check, so keep this.
   const body = (await response.json().catch(() => null)) as {
     ok?: boolean;
     installationId?: string;

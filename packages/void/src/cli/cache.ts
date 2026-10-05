@@ -1,13 +1,12 @@
-import { intro, outro, log } from '@clack/prompts';
+import { outro, log } from '@voidzero-dev/vite-plus-prompts';
 import { getToken } from './auth.ts';
 import { PlatformClient } from './client.ts';
-import { cliTitle, createSpinner, dim } from './output.ts';
+import { createSpinner, dim, formatCount } from './output.ts';
 import { readProjectConfig } from './project.ts';
 import { getRequestedProjectSlug, resolveProjectBySlug } from './resolve-project.ts';
 
 export async function runPurgeCacheCommand(root: string, projectSlug?: string): Promise<void> {
   console.log();
-  intro(cliTitle('project purge-cache'));
 
   const token = getToken(root);
   if (!token) {
@@ -43,7 +42,7 @@ export async function runPurgeCacheCommand(root: string, projectSlug?: string): 
   try {
     const result = await client.purgeCache(projectId);
     s.stop('Cache purged.');
-    log.success(`Purged ${result.purged} cached page(s).`);
+    log.success(`Purged ${formatCount(result.purged, 'cached page')}.`);
   } catch (err) {
     s.stop('Cache purge failed.');
     log.error(err instanceof Error ? err.message : String(err));

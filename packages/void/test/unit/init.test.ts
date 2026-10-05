@@ -134,6 +134,9 @@ describe('init Git arguments', () => {
 });
 
 describe('GitHub Actions deployment workflows', () => {
+  it('requires a selected URL for a Void deployment workflow', () => {
+    expect(() => getWorkflowYaml('/project', 'npm', 'my-app', 'void')).toThrow('void connect');
+  });
   it('scaffolds the direct Cloudflare deployment path with a scoped API token', () => {
     const yaml = getWorkflowYaml('/project', 'npm', null, 'cloudflare');
     expect(yaml).toContain('name: Deploy to Cloudflare');
@@ -163,6 +166,8 @@ describe('GitHub Actions deployment workflows', () => {
     expect(yaml).toContain(
       "VOID_API_URL: ${{ vars.VOID_API_URL || 'https://api.company.example' }}",
     );
+    expect(yaml).toContain('npx void connect "$VOID_API_URL" --no-login');
+    expect(yaml.indexOf('npx void connect')).toBeLessThan(yaml.indexOf('npx void deploy'));
     expect(yaml).toContain('npx void deploy --platform void --project "$VOID_PROJECT"');
   });
 });
@@ -177,7 +182,8 @@ function expectPnpmAllowBuilds(root: string): void {
   expect(yaml).not.toContain('onlyBuiltDependencies:');
 }
 
-vi.mock('@clack/prompts', () => ({
+vi.mock('@voidzero-dev/vite-plus-prompts', () => ({
+  settings: { accessible: false },
   intro: vi.fn(),
   outro: (...args: Array<unknown>) => mockOutro(...args),
   note: (...args: Array<unknown>) => mockNote(...args),
@@ -431,7 +437,7 @@ describe('Void platform deployment setup', () => {
   it('connects a genuinely new user before attempting platform login', async () => {
     rmSync(platformRegistryDirectory, { force: true, recursive: true });
     mockGetApiUrl.mockImplementation(() => {
-      throw new Error('No Void platform selected');
+      throw new Error('No Void platform connected');
     });
     mockText.mockResolvedValue('https://platform.example.test');
     mockDiscoverPlatform.mockResolvedValueOnce({
@@ -1729,9 +1735,17 @@ describe('isScaffoldableEmptyProject', () => {
       expect(mockText).toHaveBeenCalledWith(
         expect.objectContaining({
           message: 'New project folder name:',
-          initialValue: 'my-void-app',
+          placeholder: 'my-void-app',
+          defaultValue: 'my-void-app',
         }),
       );
+      const folderPrompt = mockText.mock.calls[0]![0];
+      expect(folderPrompt).not.toHaveProperty('initialValue');
+      expect(folderPrompt.validate('')).toBeUndefined();
+      expect(folderPrompt.validate(' ')).toBe('Enter a folder name.');
+      mkdirSync(join(root, 'my-void-app'));
+      expect(folderPrompt.validate('')).toBe('That folder already exists.');
+      expect(folderPrompt.validate('another-app')).toBeUndefined();
       expect(mockSpawnSync).toHaveBeenCalledWith(
         'pnpm',
         ['install', '--no-frozen-lockfile'],

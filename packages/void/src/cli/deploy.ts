@@ -21,16 +21,6 @@ import { basename, dirname, join, normalize, relative, resolve } from 'pathslash
 const drizzleKitBin = join(fileURLToPath(import.meta.resolve('drizzle-kit')), '..', 'bin.cjs');
 const deployDriftCheckDir = join('.void', 'deploy-drift-check');
 import {
-  intro,
-  outro,
-  log as clackLog,
-  note,
-  confirm,
-  isCancel,
-  select,
-  type SpinnerResult,
-} from '@clack/prompts';
-import {
   CloudflareWorkerInspectionError,
   activateCloudflareVersion,
   encodeCloudflareVersionMessage,
@@ -55,6 +45,14 @@ import {
   type ApprovedCloudflareKvBinding,
 } from '@void/deploy-cloudflare';
 import { createDeployArtifact, createDeployUploadPayload } from '@void/deploy-core';
+import {
+  log as clackLog,
+  note,
+  confirm,
+  isCancel,
+  select,
+  type SpinnerResult,
+} from '@voidzero-dev/vite-plus-prompts';
 import { analyzeApplicationSync, type ApplicationAnalysis } from '../application-analysis.ts';
 import { analyzeApplication, completeApplicationAnalysis } from '../application-routing.ts';
 import {
@@ -182,6 +180,7 @@ import {
   formatDeployFailureMessage,
   formatStreamDeployError,
 } from './deploy-errors.ts';
+import { formatDeploySummary, printDeployContext, printDeploySuccess } from './deploy-summary.ts';
 import { uploadAssetsToR2, type DirectR2PutItem } from './direct-r2-upload.ts';
 import {
   applyEmailSetup,
@@ -228,7 +227,7 @@ import { lintDestinationSplats, lintDuplicateSources, mergeRoutingRules } from '
 import { openDeployLog, type CliLogger } from './log-file.ts';
 import { buildDeployLogSummary } from './log-summary.ts';
 import { promptForLoginToken } from './login.ts';
-import { cliTitle, createSpinner, pc } from './output.ts';
+import { createSpinner, formatCount, pc } from './output.ts';
 import {
   collectAndHashAssets,
   buildVoidManifest,
@@ -239,6 +238,7 @@ import {
   getAssetContentType,
   type AssetManifestEntry,
 } from './package.ts';
+import { listPlatformConnections } from './platform-registry.ts';
 import {
   detectPreset,
   FRAMEWORK_PRESETS,
@@ -252,6 +252,7 @@ import {
   attachSelectedPlatform,
   readDeploymentPlatform,
   readProjectConfig,
+  shouldLinkDeployProject,
   writeProjectConfig,
   type DeploymentPlatform,
   type ProjectConfig,
@@ -560,7 +561,6 @@ function assertWorkerMainUploaded(
  */
 export async function runDeploy(root: string, options?: RunDeployOptions): Promise<void> {
   console.log();
-  intro(cliTitle('deploy'));
 
   const cliLog = openDeployLog({
     mirrorToStderr: options?.debug === true || process.env.VOID_DEPLOY_DEBUG === '1',
@@ -4011,12 +4011,24 @@ async function runCloudflareEmailStep(
   const without: CloudflareEmailStepResult = { satisfied: false, configWritten: false, map: null };
   const from = input.voidConfig.email?.from;
   if (!from) {
-    log.warn(
-      [
-        'deploy: this app uses email, but void.config.ts names no sender.',
-        'Set email.from to "you@mail.acme.com" in void.config.ts — deploying without email.',
-      ].join('\n'),
-    );
+    const carriesEmailConfig =
+      (Array.isArray(input.rootConfig.send_email) &&
+        (input.rootConfig.send_email as Array<{ name?: unknown } | null>).some(
+          (binding) => binding?.name === SEND_EMAIL_BINDING,
+        )) ||
+      (Array.isArray(input.rootConfig.addresses) && input.rootConfig.addresses.length > 0);
+    if (carriesEmailConfig) {
+      log.info(
+        'deploy: email.from is unset; skipping automatic email setup. Existing Cloudflare email configuration is preserved.',
+      );
+    } else {
+      log.warn(
+        [
+          'deploy: this app uses email, but void.config.ts names no sender.',
+          'Set email.from to "you@mail.acme.com" in void.config.ts — automatic email setup skipped.',
+        ].join('\n'),
+      );
+    }
     return without;
   }
   const { rootConfig } = input;
@@ -4918,6 +4930,7 @@ export async function runCloudflareDeploy(
   // The worker name `wrangler deploy` uploads as: the root's `name`, else derived. Needed by the
   // email step (routing rules are matched to it) and reconciled into the root config at step 5.
   const workerName = readWranglerTopLevelString(rootConfig, 'name') ?? deriveWorkerName(root);
+  printDeployContext(workerName, 'Cloudflare');
 
   // 3b-ii. Mode B email (design doc 0078) — detect, preflight, and with one Enter set up the
   // developer's own mail domain. Slotted AFTER the uploader hash (3b-i) and the account pin (3b), so its credentialed
@@ -5871,6 +5884,8 @@ export async function runCloudflareDeploy(
     }
   }
 
+  let appliedMigrations = 0;
+
   // 9. Apply pending PostgreSQL migrations transactionally before the Worker upload. The
   // production URL is intentionally provided by the deploy environment rather than recovered
   // from Hyperdrive (Cloudflare never returns the database password). `runPgMigrations` records
@@ -5886,6 +5901,7 @@ export async function runCloudflareDeploy(
         migrationsDir,
         databaseUrl,
       );
+      appliedMigrations += applied.length;
       cliLog.info('cloudflare_postgres_migrations', { applied: applied.length });
       if (applied.length > 0) {
         log.success(
@@ -5909,6 +5925,7 @@ export async function runCloudflareDeploy(
         migrationsDir,
         databaseUrl,
       );
+      appliedMigrations += applied.length;
       cliLog.info('cloudflare_mysql_migrations', { applied: applied.length });
       if (applied.length > 0) {
         log.success(`Applied ${applied.length} MySQL migration${applied.length === 1 ? '' : 's'}.`);
@@ -6153,12 +6170,24 @@ export async function runCloudflareDeploy(
     worker: workerName,
     versionId: execution.versionId,
   });
-  log.success(`Deployed "${workerName}" to your Cloudflare account.\n${execution.previewUrl}`);
+  note(
+    formatDeploySummary({
+      workerName,
+      migrations: appliedMigrations,
+      d1MigrationsCurrent: d1MigrateToken !== undefined,
+      // Existing Worker handoffs preserve remote triggers rather than publishing source jobs.
+      cronJobs: existingWorker ? undefined : source.analysis.jobs.length,
+      queues: existingWorker ? undefined : desired.queues.length,
+      framework: detectedFramework?.name,
+    }),
+    execution.previewUrl,
+  );
   // The address map — the one thing nobody can find today (0078). Printed whenever the worker
   // shipped with email set up; a run that went without email already said so at 3b-ii.
   if (emailMap) {
     log.message(renderAddressMap(emailMap));
   }
+  printDeploySuccess();
 }
 
 /**
@@ -6197,7 +6226,7 @@ async function activateCloudflareVersionWithProgress(
       onProgress: (message) => progress.message(message),
     });
     if (result.ok) {
-      progress.stop('Worker version is ready.');
+      progress.clear();
     } else {
       progress.error('Worker deployment stopped.');
     }
@@ -6643,6 +6672,8 @@ async function runCloudflareStaticDeploy(
     throw new Error('The pending Cloudflare handoff was not saved before deployment.');
   }
   rootConfig = parseRootWranglerConfig(configPath);
+  const workerName = readWranglerTopLevelString(rootConfig, 'name') ?? deriveWorkerName(root);
+  printDeployContext(workerName, 'Cloudflare');
   const rootConfigBeforeBuild = existsSync(configPath) ? readFileSync(configPath, 'utf-8') : null;
   if (preset.buildCommand && !options.skipBuild) {
     log.step('Building...');
@@ -6699,7 +6730,6 @@ async function runCloudflareStaticDeploy(
   const entryPath = join(root, '.void', 'deploy', 'cloudflare', 'static-edge.mjs');
   mkdirSync(dirname(entryPath), { recursive: true });
 
-  const workerName = readWranglerTopLevelString(rootConfig, 'name') ?? deriveWorkerName(root);
   // Static deployment needs a fetch-only entry and must detach Worker-only
   // bindings/triggers, but those are deployment-artifact concerns. Preserve the
   // user's canonical Wrangler source byte-for-byte so switching back to the
@@ -6913,7 +6943,14 @@ async function runCloudflareStaticDeploy(
     worker: workerName,
     versionId: execution.versionId,
   });
-  log.success(`Deployed "${workerName}" to your Cloudflare account.\n${execution.previewUrl}`);
+  note(
+    formatDeploySummary({
+      workerName,
+      typeLabel: preset.appType === 'spa' ? 'Static SPA' : 'Static Site',
+    }),
+    execution.previewUrl,
+  );
+  printDeploySuccess();
 }
 
 type RunDeployTargetAdapter = DeployTargetAdapter<RunDeployOptions, CliLogger>;
@@ -7024,8 +7061,6 @@ async function runDeployInner(
     );
   }
 
-  const targetLabel = platform === 'cloudflare' ? 'Cloudflare' : 'Void';
-  log.info(`Deployment target: ${targetLabel}`);
   cliLog.info('deploy_target', { target: platform });
 
   try {
@@ -7042,9 +7077,22 @@ async function runManagedDeploy(
   options: RunDeployOptions,
   cliLog: CliLogger,
 ): Promise<void> {
+  // Resolve the connected recipient before credentials, OIDC, builds, or platform requests.
+  const apiUrl = getApiUrl(root);
+  const requestedProjectSlug = getRequestedProjectSlug(options);
   let reauthenticated = false;
+  let displayedProject: string | undefined;
   while (true) {
     try {
+      // Project IDs and implicit slugs belong to the platform that issued them.
+      // Re-read after reauthentication: this attempt may have established its first link.
+      const savedProject = readProjectConfig(root);
+      const linkedProject = savedProject?.platformUrl === apiUrl ? savedProject : null;
+      if (savedProject && !linkedProject && !requestedProjectSlug) {
+        throw new Error(
+          `deploy: This project is linked to ${savedProject.platformUrl}. Pass --project <slug> to deploy to ${apiUrl} without changing the saved link.`,
+        );
+      }
       // 1. Auth — resolve the deploy token by precedence:
       //   1. explicit `VOID_TOKEN` env  (deliberate override; wins everywhere)
       //   2. GitHub Actions OIDC exchange  (in Actions, when no explicit token)
@@ -7066,7 +7114,7 @@ async function runManagedDeploy(
         // .void/project.json — the same sources the deploy path uses below. A
         // workflow with `id-token: write` intends OIDC, so an unknown slug is a
         // hard error — we do NOT silently fall back to a saved token.
-        const slug = getRequestedProjectSlug(options) ?? readProjectConfig(root)?.slug;
+        const slug = requestedProjectSlug ?? linkedProject?.slug;
         if (!slug) {
           throw new Error(
             'deploy: running in GitHub Actions but the project is unknown — pass --project <slug> or link the project.',
@@ -7101,8 +7149,6 @@ async function runManagedDeploy(
       // spawn env — see that helper for the full rationale.
 
       // 2. Resolve target project (CLI flag > env var > linked project file)
-      const requestedProjectSlug = getRequestedProjectSlug(options);
-      const linkedProject = readProjectConfig(root);
       let config: ProjectConfig | null = null;
 
       if (requestedProjectSlug) {
@@ -7166,6 +7212,13 @@ async function runManagedDeploy(
         projectId: config.projectId,
         slug: config.slug,
       });
+      if (displayedProject !== config.slug) {
+        const destination =
+          listPlatformConnections().find((connection) => connection.apiUrl === apiUrl)
+            ?.displayName ?? new URL(apiUrl).hostname;
+        printDeployContext(config.slug, destination);
+        displayedProject = config.slug;
+      }
 
       if (migrateLegacyVoidConfig(root)) {
         log.success(
@@ -7313,7 +7366,7 @@ async function runManagedDeploy(
 }
 
 function assertProjectDeployAccess(project: ProjectResponse | undefined): void {
-  // Older platforms omit roles; the API remains authoritative for every deploy.
+  // The API remains authoritative for every deploy.
   if (project?.role === 'reader') {
     throw new Error(
       `deploy: You have reader access to "${project.slug}" and cannot deploy. ` +
@@ -7328,6 +7381,7 @@ export async function promptDeployProjectConfig(
   cliLog?: CliLogger,
 ): Promise<ProjectConfig> {
   const projects = await client.listProjectChoices();
+  const link = shouldLinkDeployProject(root, client.apiUrl);
   const deployableProjects = projects.filter((project) => project.role !== 'reader');
   if (deployableProjects.length !== projects.length) {
     log.warn(
@@ -7336,10 +7390,13 @@ export async function promptDeployProjectConfig(
   }
   const action = await promptProjectSetupAction('Set up a Void project for deploy:', {
     includeLink: deployableProjects.length > 0,
+    ...(link ? {} : { link: false }),
   });
 
   if (action === 'create') {
-    return promptAndCreateProject(root, client);
+    return promptAndCreateProject(root, client, {
+      link,
+    });
   }
 
   // Project names are only shown after the user opts into linking.
@@ -7347,16 +7404,20 @@ export async function promptDeployProjectConfig(
     deployableProjects,
     'Select a project to deploy to:',
     root,
-    { confirmExisting: true, includeCreate: false },
+    { confirmExisting: true, includeCreate: false, ...(link ? {} : { link: false }) },
   );
 
   if (result.action === 'create') {
     throw new Error('Unexpected project selection result.');
   }
   const config = { projectId: result.project.id, slug: result.project.slug };
-  writeProjectConfig(root, attachSelectedPlatform(root, config, client.apiUrl));
-  log.step(`Linked to ${pc.blue(config.slug)}`);
-  cliLog?.info('project_linked', { projectId: config.projectId, slug: config.slug });
+  if (shouldLinkDeployProject(root, client.apiUrl)) {
+    writeProjectConfig(root, attachSelectedPlatform(root, config, client.apiUrl));
+    log.step(`Linked to ${pc.blue(config.slug)}`);
+    cliLog?.info('project_linked', { projectId: config.projectId, slug: config.slug });
+  } else {
+    log.step(`Using ${pc.blue(config.slug)} for this deployment. Saved destination unchanged.`);
+  }
   return config;
 }
 
@@ -7517,6 +7578,9 @@ export function applyDeployEvent(event: DeployEvent, s: SpinnerResult): ApplyDep
       s.message('Deploying...');
       return { kind: 'start', deploymentId: event.deploymentId };
     case 'heartbeat':
+      if (event.status === 'recovering') {
+        s.message('Recovering interrupted deployment...');
+      }
       return { kind: 'continue' };
     case 'asset_upload':
       if (event.new > 0) {
@@ -7566,7 +7630,7 @@ export function applyDeployEvent(event: DeployEvent, s: SpinnerResult): ApplyDep
           'Deployed, but routing was not published — the project may be unreachable or still serving the previous deploy. Re-run `void deploy` to publish routing.',
         );
       } else {
-        s.stop('Deployed!');
+        s.clear();
       }
       return { kind: 'done', event };
     case 'error':
@@ -7589,6 +7653,8 @@ export async function streamDeployEvents(
 ): Promise<StreamDeployResult> {
   const startedAt = Date.now();
   let deploymentId: string | null = null;
+  let lastProgressAt = startedAt;
+  let waitNotice: string | undefined;
   let interrupted = false;
   cliLog?.info('stream_start', { projectId });
   const onSigint = () => {
@@ -7612,6 +7678,34 @@ export async function streamDeployEvents(
 
   try {
     for await (const event of events) {
+      if (event.event === 'heartbeat') {
+        const fields = {
+          deploymentId,
+          step: event.step,
+          status: event.status,
+          recoveryAt: event.recoveryAt,
+        };
+        if (event.status === 'recovering' && waitNotice !== 'recovering') {
+          log.info(
+            `Deployment ${deploymentId ?? event.deploymentId ?? ''} is recovering; waiting for its result.`,
+          );
+          cliLog?.info('deploy_recovering', fields);
+          waitNotice = 'recovering';
+        } else if (Date.now() - lastProgressAt >= 90_000 && waitNotice === undefined) {
+          log.warn(
+            `Deployment ${deploymentId ?? event.deploymentId ?? ''} has not reported new progress for 90 seconds (last reported progress: ${event.step.replaceAll('_', ' ')}).` +
+              (event.recoveryAt
+                ? ` Automatic recovery can start after ${event.recoveryAt} if execution was interrupted.`
+                : '') +
+              ' Inspect with `void project status`.',
+          );
+          cliLog?.warn('deploy_progress_stalled', fields);
+          waitNotice = 'stalled';
+        }
+      } else {
+        lastProgressAt = Date.now();
+        waitNotice = undefined;
+      }
       const result = applyDeployEvent(event, s);
       if (result.kind === 'start') {
         deploymentId = result.deploymentId;
@@ -7707,7 +7801,7 @@ async function streamDirectR2Deploy(
       });
     }
 
-    s.message(`Requesting upload URLs for ${needed.length} asset(s)...`);
+    s.message(`Requesting upload URLs for ${formatCount(needed.length, 'asset')}...`);
 
     // Dedupe by content hash: identical files (same blake3) get presigned
     // and PUT once. `assetManifest` still lists every path for the
@@ -7781,7 +7875,7 @@ async function streamDirectR2Deploy(
       };
     });
 
-    s.message(`Uploading ${items.length} asset(s) to R2...`);
+    s.message(`Uploading ${formatCount(items.length, 'asset')} to R2...`);
     // Per-PUT cleanup: once R2 acks the upload, drop the buffer from the
     // CLI-side cache so peak memory under the bounded upload pool stays
     // close to `R2_PUT_CONCURRENCY` × asset size, not the full bundle.
@@ -7835,13 +7929,6 @@ async function streamDirectR2Deploy(
   } finally {
     cliLog?.info('finalize_end', { durationMs: Date.now() - finalizeStartedAt });
   }
-}
-
-function formatKnownAssetSummary(result: DeployDoneEvent, skipped: number): string {
-  const uploaded = result.assets - skipped;
-  return skipped > 0
-    ? `${result.assets} static asset(s) (${skipped} unchanged, ${uploaded} uploaded)`
-    : `${result.assets} static asset(s)`;
 }
 
 /**
@@ -7959,7 +8046,7 @@ export async function runStaticDeploy(
   });
 
   if (skipped > 0) {
-    log.info(`Skipping ${skipped} unchanged asset(s)`);
+    log.info(`Skipping ${formatCount(skipped, 'unchanged asset')}`);
   }
 
   s.start('Packaging...');
@@ -7993,11 +8080,13 @@ export async function runStaticDeploy(
     cliLog,
   );
 
-  const summary = [`${typeLabel} — ${formatKnownAssetSummary(result, skipped)}`];
-  note(summary.join('\n'), result.url);
+  note(
+    formatDeploySummary({ typeLabel, assets: result.assets, unchangedAssets: skipped }),
+    result.url,
+  );
 
   warnUnpublishedRouting(result);
-  outro('Done!');
+  printDeploySuccess(result.published !== false);
 }
 
 /**
@@ -8164,7 +8253,7 @@ async function runFrameworkDeploy(
   if (rawMigrations.length > 0) {
     try {
       validatedMigrations = validateMigrations(rawMigrations);
-      log.info(`Found ${validatedMigrations.length} migration(s)`);
+      log.info(`Found ${formatCount(validatedMigrations.length, 'migration')}`);
     } catch (err: unknown) {
       log.error(getErrorMessage(err));
       process.exit(1);
@@ -8184,7 +8273,8 @@ async function runFrameworkDeploy(
         (resource: ResourceSummary) => resource.type === 'hyperdrive',
       );
       if (!hasHyperdrive) {
-        const { text: promptText, isCancel: isCancelPrompt } = await import('@clack/prompts');
+        const { text: promptText, isCancel: isCancelPrompt } =
+          await import('@voidzero-dev/vite-plus-prompts');
         const connectionString = await promptText({
           message: `Your project uses ${dialect === 'mysql' ? 'MySQL' : 'PostgreSQL'}. Enter your connection string:`,
           placeholder:
@@ -8296,7 +8386,7 @@ async function runFrameworkDeploy(
   });
 
   if (skipped > 0) {
-    log.info(`Skipping ${skipped} unchanged asset(s)`);
+    log.info(`Skipping ${formatCount(skipped, 'unchanged asset')}`);
   }
 
   s.start('Packaging...');
@@ -8360,36 +8450,26 @@ async function runFrameworkDeploy(
     cliLog,
   );
 
-  const summary = [
-    `${result.workers} worker module(s), ${formatKnownAssetSummary(result, skipped)}`,
-  ];
-  if (result.migrations) {
-    summary.push(`${result.migrations} migration(s) applied`);
-  }
-  if (schedules.length > 0) {
-    summary.push(`${schedules.length} cron job(s) scheduled`);
-  }
-  if (queues.length > 0) {
-    summary.push(`${queues.length} queue(s) configured`);
-  }
-  if (prerender && prerender.length > 0) {
-    summary.push(`${prerender.length} page(s) prerendered`);
-  }
-  if (revalidate) {
-    if (typeof revalidate === 'number') {
-      summary.push(`ISR revalidate: ${revalidate}s`);
-    } else {
-      summary.push(`ISR revalidate: ${Object.keys(revalidate).length} path rule(s)`);
-    }
-  }
-  summary.push(`Framework: ${detected.name}`);
-  note(summary.join('\n'), result.url);
+  note(
+    formatDeploySummary({
+      workers: result.workers,
+      assets: result.assets,
+      unchangedAssets: skipped,
+      migrations: result.migrations,
+      cronJobs: schedules.length,
+      queues: queues.length,
+      prerenderedPages: prerender?.length,
+      revalidate,
+      framework: detected.name,
+    }),
+    result.url,
+  );
 
   // Clean up generated wrapper files
   cleanupWrapper(root);
 
   warnUnpublishedRouting(result);
-  outro('Done!');
+  printDeploySuccess(result.published !== false);
 }
 
 export function assertManagedDurableStateSupported(root: string): void {
@@ -8511,7 +8591,7 @@ async function runFullDeploy(
     if (result.paths.length === 0) {
       log.info('No pages to prerender');
     } else if (result.failed.length > 0) {
-      voidWarn(`${result.failed.length} page(s) failed to prerender`);
+      voidWarn(`${formatCount(result.failed.length, 'page')} failed to prerender`);
     }
   }
 
@@ -8579,7 +8659,7 @@ async function runFullDeploy(
   if (rawMigrations.length > 0) {
     try {
       validatedMigrations = validateMigrations(rawMigrations);
-      log.info(`Found ${validatedMigrations.length} migration(s)`);
+      log.info(`Found ${formatCount(validatedMigrations.length, 'migration')}`);
     } catch (err: unknown) {
       log.error(getErrorMessage(err));
       process.exit(1);
@@ -8601,7 +8681,8 @@ async function runFullDeploy(
         (resource: ResourceSummary) => resource.type === 'hyperdrive',
       );
       if (!hasHyperdrive) {
-        const { text: promptText, isCancel: isCancelPrompt } = await import('@clack/prompts');
+        const { text: promptText, isCancel: isCancelPrompt } =
+          await import('@voidzero-dev/vite-plus-prompts');
         const connectionString = await promptText({
           message: `Your project uses ${dialect === 'mysql' ? 'MySQL' : 'PostgreSQL'}. Enter your connection string:`,
           placeholder:
@@ -8802,7 +8883,7 @@ async function runFullDeploy(
   });
 
   if (skipped > 0) {
-    log.info(`Skipping ${skipped} unchanged asset(s)`);
+    log.info(`Skipping ${formatCount(skipped, 'unchanged asset')}`);
   }
 
   s.start('Packaging...');
@@ -8901,38 +8982,24 @@ async function runFullDeploy(
     cliLog,
   );
 
-  const summary = [
-    `${result.workers} worker module(s), ${formatKnownAssetSummary(result, skipped)}`,
-  ];
-  if (result.migrations) {
-    summary.push(`${result.migrations} migration(s) applied`);
-  }
-  if (schedules.length > 0) {
-    summary.push(`${schedules.length} cron job(s) scheduled`);
-  }
-  if (queues.length > 0) {
-    summary.push(`${queues.length} queue(s) configured`);
-  }
-  if (uniquePrerenderPaths.length > 0) {
-    summary.push(`${uniquePrerenderPaths.length} page(s) prerendered`);
-  }
-  if (isSsr) {
-    summary.push('SSR enabled');
-  }
-  if (revalidate) {
-    if (typeof revalidate === 'number') {
-      summary.push(`ISR revalidate: ${revalidate}s`);
-    } else {
-      summary.push(`ISR revalidate: ${Object.keys(revalidate).length} path rule(s)`);
-    }
-  }
-  if (isFrameworkMode) {
-    summary.push('Framework mode');
-  }
-  note(summary.join('\n'), result.url);
+  note(
+    formatDeploySummary({
+      workers: result.workers,
+      assets: result.assets,
+      unchangedAssets: skipped,
+      migrations: result.migrations,
+      cronJobs: schedules.length,
+      queues: queues.length,
+      prerenderedPages: uniquePrerenderPaths.length,
+      ssr: isSsr,
+      revalidate,
+      framework: isFrameworkMode || undefined,
+    }),
+    result.url,
+  );
 
   warnUnpublishedRouting(result);
-  outro('Done!');
+  printDeploySuccess(result.published !== false);
 }
 
 async function createProjectFromSlug(
@@ -8945,7 +9012,9 @@ async function createProjectFromSlug(
   cliLog?.info('project_create_start', { slug });
   const project = await client.createProject(slug);
   const config = { projectId: project.id, slug: project.slug };
-  writeProjectConfig(root, attachSelectedPlatform(root, config, client.apiUrl));
+  if (shouldLinkDeployProject(root, client.apiUrl)) {
+    writeProjectConfig(root, attachSelectedPlatform(root, config, client.apiUrl));
+  }
   log.success(`Project created: ${pc.blue(config.slug)}`);
   reportProjectCreationWarnings(project);
   cliLog?.info('project_create_success', { projectId: config.projectId, slug: config.slug });

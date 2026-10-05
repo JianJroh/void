@@ -1,8 +1,8 @@
 import { execSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { confirm, isCancel, log, note, password } from '@clack/prompts';
 import { parseRootWranglerConfig, readWranglerTopLevelString } from '@void/deploy-cloudflare';
+import { confirm, isCancel, log, note, password } from '@voidzero-dev/vite-plus-prompts';
 import { join } from 'pathslash';
 import { readConfig } from '../config.ts';
 import { readProjectPaths } from '../project-paths.ts';
@@ -623,7 +623,7 @@ export async function emailDomainAdd(
           'Create the token in three clicks: Continue to summary → Create Token → Copy.',
           'Watching the clipboard for it — nothing is read until you copy, and it is cleared afterwards.',
           '(Enter pastes it yourself instead.)',
-          `If the browser didn't open, visit:\n${pc.cyan(url)}`,
+          `If the browser didn't open, visit:\n${pc.blue(url)}`,
         ].join('\n'),
       );
       const spinner = watchSpinner;

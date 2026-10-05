@@ -75,7 +75,7 @@ let originalFetch: typeof globalThis.fetch | undefined;
 const mockConfirm = vi.fn<(opts: { message: string }) => Promise<boolean | symbol>>();
 const mockIsCancel = vi.fn<(value: unknown) => boolean>((v) => typeof v === 'symbol');
 
-vi.mock('@clack/prompts', () => ({
+vi.mock('@voidzero-dev/vite-plus-prompts', () => ({
   intro: vi.fn(),
   outro: vi.fn(),
   confirm: (opts: { message: string }) => mockConfirm(opts),
@@ -159,6 +159,7 @@ describe('void db execute --remote (D1)', () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
     if (originalFetch) {
       globalThis.fetch = originalFetch;
@@ -643,7 +644,8 @@ describe('void db execute --remote (D1)', () => {
     expect(mockConfirm).toHaveBeenCalledTimes(1);
   });
 
-  it('includes CF Access service-token headers for the staging proxy', async () => {
+  it('includes explicitly scoped CF Access service-token headers for the selected proxy', async () => {
+    vi.stubEnv('VOID_ACCESS_ORIGIN', 'https://proxy.staging.void.cloud');
     const root = createProjectRoot();
     mockIsStagingMode.mockReturnValue(true);
     const originalId = process.env.CF_ACCESS_CLIENT_ID;
@@ -774,7 +776,7 @@ describe('void db execute --remote (PostgreSQL)', () => {
     const { PlatformApiError } = await import('../../src/cli/client.ts');
     mockGetDatabaseUrl.mockRejectedValue(new PlatformApiError('test', 404, '{}'));
 
-    const { log: clackLog } = await import('@clack/prompts');
+    const { log: clackLog } = await import('@voidzero-dev/vite-plus-prompts');
 
     await expect(
       runDbCommand(root, {

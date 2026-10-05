@@ -1,21 +1,49 @@
 import { runCloudflareAuthCommand, type CloudflareAuthRunner } from './cloudflare-auth.ts';
+import type { PlatformCloudflareClient } from './platform-cloudflare.ts';
 import type { PlatformInstallPlan } from './platform-plan.ts';
 
 export type PlatformCloudflareCredential = Readonly<{
-  source: 'environment' | 'oauth';
+  source: 'environment' | 'saved' | 'oauth';
   token: string;
 }>;
 
 export type PlatformCloudflareAuthDependencies = Readonly<{
   interactive?: boolean;
   runWrangler?: CloudflareAuthRunner;
+  /** Account management authority recovered for the selected installation. */
+  savedManagementToken?: string;
 }>;
+
+export type PlatformManagementAccess = Readonly<{
+  protection: boolean;
+  readOnly: boolean;
+}>;
+
+/** Check Access inventory permissions before the installer starts provisioning. */
+export async function verifyPlatformManagementAccess(
+  client: Pick<PlatformCloudflareClient, 'request'>,
+  accountId: string,
+  access: PlatformManagementAccess,
+): Promise<void> {
+  const base = `/accounts/${encodeURIComponent(accountId)}/access`;
+  await Promise.all([
+    client.request(`${base}/organizations`),
+    ...[
+      'identity_providers',
+      'groups',
+      'policies',
+      'apps',
+      ...(access.protection ? ['service_tokens'] : []),
+    ].map((resource) => client.request(`${base}/${resource}?per_page=1`)),
+  ]);
+}
 
 export function assertPlatformOperatorCredentialCanApplyPlan(
   credential: PlatformCloudflareCredential,
   plan: Pick<PlatformInstallPlan, 'actions'>,
+  access?: PlatformManagementAccess,
 ): void {
-  if (credential.source !== 'oauth') {
+  if (!platformOperatorNeedsManagementToken(credential, plan, access)) {
     return;
   }
   const createsZone = plan.actions.some(
@@ -24,15 +52,37 @@ export function assertPlatformOperatorCredentialCanApplyPlan(
   const writesDns = plan.actions.some(
     (action) => action.kind === 'dns-record' && action.action !== 'reuse',
   );
-  if (!createsZone && !writesDns) {
-    return;
-  }
   const permissions = [
     ...(createsZone ? ['Account → Zone → Edit'] : []),
     ...(writesDns ? ['Zone → DNS → Edit'] : []),
+    ...(access
+      ? [
+          `Account → Access: Apps and Policies → ${access.readOnly ? 'Read' : 'Edit'}`,
+          'Account → Access: Organizations, Identity Providers, and Groups → Read',
+          ...(access.protection
+            ? [`Account → Access: Service Tokens → ${access.readOnly ? 'Read' : 'Edit'}`]
+            : []),
+        ]
+      : []),
   ];
   throw new Error(
-    `platform: Cloudflare browser OAuth grants Zone Read and cannot apply the planned zone or DNS changes. Set CLOUDFLARE_API_TOKEN with ${permissions.join(' and ')}, scoped to the selected account and application zone, then rerun the command.`,
+    `platform: Cloudflare browser login cannot authorize the planned ${access ? 'Access setup' : 'zone or DNS changes'}. Set CLOUDFLARE_API_TOKEN with ${permissions.join(' and ')}, scoped to the selected account${createsZone || writesDns ? ' and application zone' : ''}, then rerun the command.`,
+  );
+}
+
+export function platformOperatorNeedsManagementToken(
+  credential: PlatformCloudflareCredential,
+  plan: Pick<PlatformInstallPlan, 'actions'>,
+  access?: PlatformManagementAccess,
+): boolean {
+  return (
+    credential.source === 'oauth' &&
+    (!!access ||
+      plan.actions.some(
+        (action) =>
+          (action.kind === 'zone' && action.action === 'create') ||
+          (action.kind === 'dns-record' && action.action !== 'reuse'),
+      ))
   );
 }
 
@@ -112,6 +162,10 @@ async function readExistingCredential(
     process.env.CLOUDFLARE_API_TOKEN?.trim() || process.env.CF_API_TOKEN?.trim() || '';
   if (environmentToken) {
     return { source: 'environment', token: environmentToken };
+  }
+  const savedManagementToken = dependencies.savedManagementToken?.trim();
+  if (savedManagementToken) {
+    return { source: 'saved', token: savedManagementToken };
   }
 
   if (!(dependencies.interactive ?? process.stdin.isTTY === true)) {

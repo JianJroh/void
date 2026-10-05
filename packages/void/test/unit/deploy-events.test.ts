@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vite-plus/test';
 
-vi.mock('@clack/prompts', () => ({
+vi.mock('@voidzero-dev/vite-plus-prompts', () => ({
   intro: vi.fn(),
   outro: vi.fn(),
   log: { success: vi.fn(), warn: vi.fn(), error: vi.fn(), info: vi.fn(), step: vi.fn() },
@@ -11,7 +11,7 @@ vi.mock('@clack/prompts', () => ({
   spinner: () => ({ start: vi.fn(), stop: vi.fn(), message: vi.fn() }),
 }));
 
-import type { SpinnerResult } from '@clack/prompts';
+import type { SpinnerResult } from '@voidzero-dev/vite-plus-prompts';
 import {
   applyDeployEvent,
   streamDeployEvents,
@@ -57,6 +57,7 @@ function createMockSpinner() {
     start: [] as Array<unknown>,
     stop: [] as Array<unknown>,
     message: [] as Array<unknown>,
+    clear: [] as Array<unknown>,
   };
   return {
     spinner: {
@@ -69,12 +70,20 @@ function createMockSpinner() {
       message: (m?: unknown) => {
         calls.message.push(m);
       },
+      clear: () => {
+        calls.clear.push(true);
+      },
     } as unknown as SpinnerResult,
     calls,
   };
 }
 
 describe('applyDeployEvent', () => {
+  it('shows interrupted deployment recovery from a heartbeat', () => {
+    const { spinner, calls } = createMockSpinner();
+    applyDeployEvent({ event: 'heartbeat', step: 'recovery', status: 'recovering' }, spinner);
+    expect(calls.message).toEqual(['Recovering interrupted deployment...']);
+  });
   it('shows queue_setup progress message so the user sees it mid-deploy', async () => {
     const { spinner, calls } = createMockSpinner();
     const result = applyDeployEvent(
@@ -89,7 +98,7 @@ describe('applyDeployEvent', () => {
 
   it('logs a persistent warning for queue_consumer_conflict instead of a transient spinner message', async () => {
     const { spinner, calls } = createMockSpinner();
-    const { log } = await import('@clack/prompts');
+    const { log } = await import('@voidzero-dev/vite-plus-prompts');
     const warnSpy = log.warn as ReturnType<typeof vi.fn>;
     warnSpy.mockClear();
 
@@ -128,7 +137,7 @@ describe('applyDeployEvent', () => {
     expect(calls.message[0]).toBe('Waiting for worker to become reachable...');
   });
 
-  it('returns {kind:"done"} for done event and stops the spinner', () => {
+  it('returns {kind:"done"} and clears the spinner before the summary', () => {
     const { spinner, calls } = createMockSpinner();
     const done: Extract<DeployEvent, { event: 'done' }> = {
       event: 'done',
@@ -140,10 +149,11 @@ describe('applyDeployEvent', () => {
     };
     const result = applyDeployEvent(done, spinner);
     expect(result).toEqual({ kind: 'done', event: done });
-    expect(calls.stop[0]).toBe('Deployed!');
+    expect(calls.clear).toHaveLength(1);
+    expect(calls.stop).toHaveLength(0);
   });
 
-  it('keeps the "Deployed!" message when published is true', () => {
+  it('clears the spinner without a duplicate success message when published is true', () => {
     const { spinner, calls } = createMockSpinner();
     const done: DoneEvent = {
       event: 'done',
@@ -156,7 +166,8 @@ describe('applyDeployEvent', () => {
     };
     const result = applyDeployEvent(done, spinner);
     expect(result).toEqual({ kind: 'done', event: done });
-    expect(calls.stop[0]).toBe('Deployed!');
+    expect(calls.clear).toHaveLength(1);
+    expect(calls.stop).toHaveLength(0);
   });
 
   it('degrades the done message when published is false but still resolves as a committed done', () => {
@@ -187,6 +198,56 @@ describe('applyDeployEvent', () => {
     expect(result).toEqual({ kind: 'error', message: 'bad things' });
     expect(calls.stop[0]).toBe('Deploy failed');
   });
+});
+
+it('explains stalled deployment progress once and reports recovery without claiming completion', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  const { log } = await import('@voidzero-dev/vite-plus-prompts');
+  const warn = log.warn as ReturnType<typeof vi.fn>;
+  const info = log.info as ReturnType<typeof vi.fn>;
+  warn.mockClear();
+  info.mockClear();
+  const { spinner } = createMockSpinner();
+  const { logger, calls } = createMockCliLog();
+  const recoveryAt = new Date(Date.now() + 18 * 60_000).toISOString();
+  async function* events(): AsyncGenerator<DeployEvent> {
+    yield { event: 'start', deploymentId: 'dpl_stalled' };
+    yield { event: 'queue_setup', queues: ['demo-queue'] };
+    vi.setSystemTime(Date.now() + 90_000);
+    yield { event: 'heartbeat', step: 'queue_setup', status: 'running', recoveryAt };
+    yield { event: 'heartbeat', step: 'queue_setup', status: 'running', recoveryAt };
+    yield { event: 'heartbeat', step: 'recovery', status: 'recovering', recoveryAt };
+    yield { event: 'heartbeat', step: 'recovery', status: 'recovering', recoveryAt };
+    yield {
+      event: 'done',
+      deployment: 'dpl_stalled',
+      url: 'https://app.test',
+      urls: [],
+      assets: 0,
+      workers: 1,
+    };
+  }
+  try {
+    expect(await streamDeployEvents('proj_test', events(), spinner, logger)).toMatchObject({
+      deployment: 'dpl_stalled',
+    });
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn.mock.calls[0][0]).toContain('dpl_stalled');
+    expect(warn.mock.calls[0][0]).toContain(recoveryAt);
+    expect(info).toHaveBeenCalledOnce();
+    expect(info.mock.calls[0][0]).toContain('recovering');
+    expect(calls.warn).toContainEqual({
+      msg: 'deploy_progress_stalled',
+      fields: expect.objectContaining({
+        deploymentId: 'dpl_stalled',
+        step: 'queue_setup',
+        status: 'running',
+        recoveryAt,
+      }),
+    });
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 describe('streamDeployEvents', () => {
@@ -261,7 +322,7 @@ describe('warnUnpublishedRouting', () => {
   }
 
   it('warns persistently when routing was not published', async () => {
-    const { log } = await import('@clack/prompts');
+    const { log } = await import('@voidzero-dev/vite-plus-prompts');
     const warnSpy = log.warn as ReturnType<typeof vi.fn>;
     warnSpy.mockClear();
 
@@ -272,7 +333,7 @@ describe('warnUnpublishedRouting', () => {
   });
 
   it('does not warn when published is true or omitted', async () => {
-    const { log } = await import('@clack/prompts');
+    const { log } = await import('@voidzero-dev/vite-plus-prompts');
     const warnSpy = log.warn as ReturnType<typeof vi.fn>;
 
     warnSpy.mockClear();
@@ -288,7 +349,7 @@ describe('warnUnpublishedRouting', () => {
 // without this warning the option looks supported and silently does nothing.
 describe('warnIgnoredNotFoundForFramework', () => {
   it('warns, naming the framework and the pinned value, when routing.notFound is set', async () => {
-    const { log } = await import('@clack/prompts');
+    const { log } = await import('@voidzero-dev/vite-plus-prompts');
     const warnSpy = log.warn as ReturnType<typeof vi.fn>;
     warnSpy.mockClear();
 
@@ -305,7 +366,7 @@ describe('warnIgnoredNotFoundForFramework', () => {
   it('warns for every accepted value, including the pinned one', async () => {
     // Even `'none'` warns: it happens to match what the path pins, but the key
     // is still not read, and staying silent there would teach that it works.
-    const { log } = await import('@clack/prompts');
+    const { log } = await import('@voidzero-dev/vite-plus-prompts');
     const warnSpy = log.warn as ReturnType<typeof vi.fn>;
 
     for (const value of ['single-page-application', '404-page', 'none'] as const) {
@@ -316,7 +377,7 @@ describe('warnIgnoredNotFoundForFramework', () => {
   });
 
   it('does not warn when routing.notFound is unset', async () => {
-    const { log } = await import('@clack/prompts');
+    const { log } = await import('@voidzero-dev/vite-plus-prompts');
     const warnSpy = log.warn as ReturnType<typeof vi.fn>;
     warnSpy.mockClear();
 

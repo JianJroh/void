@@ -17,7 +17,7 @@ Project settings live in `void.config.ts` through `void/config` and `defineConfi
 
 Build-output config translation uses the public `@cloudflare/codemods` API pinned to the version used by `cf`. Migration and generated-config evaluation share one disposable, uncredentialed subprocess; unresolved blocking follow-ups must still fail closed. Keep real `cf` prebuilt dry-run coverage.
 
-Unlinked projects with a root `wrangler.jsonc` or `wrangler.json` get a link-and-deploy prompt from `cli/cloudflare-link.ts` before the hosted fallback in `runDeployInner`. Honor explicit platform/project selections and saved destinations. Acceptance verifies the existing Worker, saves Cloudflare, and continues in the same invocation. `.void/cloudflare-link.json` keeps the handoff guard across failed builds; remove it only after successful activation. The handoff reuses resource IDs and remote secrets, blocks unapproved resource additions and schema/secret changes, and skips trigger/settings publication. `@void/deploy-cloudflare` validates the active and uploaded bindings and handler sets. Because bundled Wrangler inherits secrets from the latest upload, the handoff requires the active version to be latest before upload and verifies that no other candidate appeared during upload. Later deployments with a newer inactive upload use the version-aware API to inherit opaque secrets from the active version, and upload assets explicitly; regular deploys still use pinned `cf`. The first handoff still fails closed. Later code-only deployments carry the opaque trigger-preservation marker forward; adding a trigger requires a known traffic snapshot or explicit root `routes`, `workers_dev`, and `preview_urls`. Older versions without complete trigger metadata use traffic-only rollback, retaining current domains and schedules. Existing TOML configs are detected and rejected before generating a competing config; named environments remain unsupported.
+Unlinked projects with a root `wrangler.jsonc` or `wrangler.json` get a link-and-deploy prompt from `cli/cloudflare-link.ts` before the hosted fallback in `runDeployInner`. Honor explicit platform/project selections and saved destinations. Acceptance verifies the existing Worker, saves Cloudflare, and continues in the same invocation. `.void/cloudflare-link.json` keeps the handoff guard across failed builds; remove it only after successful activation. The handoff reuses resource IDs and remote secrets, blocks unapproved resource additions and schema/secret changes, and skips trigger/settings publication. `@void/deploy-cloudflare` validates the active and uploaded bindings and handler sets. Because bundled Wrangler inherits secrets from the latest upload, the handoff requires the active version to be latest before upload and verifies that no other candidate appeared during upload. Later deployments with a newer inactive upload and ordinary revisions with inherited active secrets use the version-aware API to inherit opaque secrets from the inspected active version, and upload assets explicitly. The active version must still own all traffic before upload. Deployments without remote secrets and explicit secret replacements retain pinned `cf` uploads. The first handoff still fails closed. Later code-only deployments carry the opaque trigger-preservation marker forward; adding a trigger requires a known traffic snapshot or explicit root `routes`, `workers_dev`, and `preview_urls`. Older versions without complete trigger metadata use traffic-only rollback, retaining current domains and schedules. Existing TOML configs are detected and rejected before generating a competing config; named environments remain unsupported.
 
 Assets-only Workers report null or empty handlers alongside `script_runtime.assets`. Accept that shape during handoff; only the static adapter may add its `ASSETS` binding and sole `fetch` handler. Preserve every existing binding and reject name collisions. Missing handler metadata without verified assets must not bypass the handler checks.
 
@@ -71,8 +71,11 @@ generated entries must preserve the module-boundary rules below.
 
 - **Platform test origins**: Domain installations remain the default recommendation. Explicit `platform install --workers-dev` uses schema-v2 application routing and a forwarding Worker per project; normal domain platforms keep schema v1. `platform domain set` checkpoints pending DNS separately, verifies the live runtime token and HTTPS, then hands activation to the authenticated platform API. The service durably prepares Zero Trust destinations and project routing before publishing `PLATFORM_APPLICATION_KEY`; the CLI never publishes that key directly. API and dispatch resolve that configuration into a request-local environment copy. Preserve the original workers.dev identity and API origin. Forwarders share the main slug routing entry, validate its project ID, and honor suspension/disablement. They remain for manual cleanup, and their unpurgeable workers.dev edge-cache layer is bypassed while shared ISR remains enabled.
 
+- **Installation app access**: New installs record `--app-access public|platform|custom` in deployment schema 4. Reuse company selections only within their account; require explicit consent before retaining a setup token for ongoing app management. Keep the setup payload in encrypted recovery, never Worker secrets. Complete the authenticated, resumable Zero Trust handoff before opening traffic, and preserve completed/admin settings during upgrades. Older manifests remain unchanged.
+
 - **Cloudflare session switching**: Explicit `void cloudflare login` forces a fresh browser sign-in, while automatic authentication reuses valid sessions. Adopted OAuth sessions persist the keyring preference so later compatible CLI logins update the same encrypted store. Environment API credentials block explicit browser login rather than masking it. Status reports identity/auth method and the pinned account separately; login never rewrites the project target. Keep credentials out of all diagnostics.
 
+- **Minimum platform version**: `MIN_PLATFORM_VERSION` in `src/cli/client.ts` is the oldest Void platform release the CLI supports. `PlatformClient` checks public discovery once per process and base URL and keeps every outcome. A release version below the minimum, or a 404 from discovery (a platform that predates it), stops the command. `"hosted"` (a hosted deploy without `PLATFORM_VERSION`) and other non-release strings (custom or development builds) pass, as do unusable answers (network errors, a disabled platform, Access login pages, invalid documents), which leave the real request to report its own error. Hosted deploys set `PLATFORM_VERSION` from `packages/platform/package.json` (`platform/scripts/platform-version.ts`). Only login opts out. Operator, installer, and management commands do not use `PlatformClient`, so they keep working on older runtimes. Do not add CLI fallbacks for platforms older than the minimum. When a server change ships in a release, raise the minimum to that release and delete the fallbacks marked for it in the same change.
 - **Authentication commands**: `void auth login|status|logout` follows the saved `.void/project.json` deployment platform, or prompts when unset; headless calls need `--platform` or an explicit command. `void account` always targets a Void platform account, and `void cloudflare` always targets Cloudflare. Keep `void auth whoami|link|token` as compatibility shortcuts; `link` and `token` belong only to Void accounts. Auth selection never changes the deployment preference.
 
 - **Repeatable framework wrappers**: `generateWrapper` recognizes current and legacy wrapper entries and preserves the original application across `--skip-build` runs. Compile handlers before replacing the entry, stage the wrapper for an atomic rename, and copy a new original only after an actual new build. A missing or recursively wrapped original requires a rebuild; readiness alone cannot validate the application entry.
@@ -83,7 +86,9 @@ generated entries must preserve the module-boundary rules below.
 
 - **Remote R2 preconditions**: Conditional uploads use `/r2/put-conditional` through both the proxy and deployed binding handler. Keep this distinct from legacy `/r2/put` so older deployments cannot silently ignore conditions. Restore date/Headers options before calling the native binding, preserve a `null` precondition result, and never fall back to an unconditional REST upload.
 
-- **Deployment connection**: `void connect [url] [--platform cloudflare|void]` is the developer entry point. A URL chooses Void; without arguments the CLI offers both targets. Interactive connection reuses or obtains credentials for the selected origin/account. `--no-login` saves only verified Void connection metadata; headless authenticated connection requires an origin-scoped keychain session or `VOID_TOKEN` with matching `VOID_API_URL`. Existing project links are preserved when connecting elsewhere. Platform installation and administration remain under `void platform`; it has no `connect` subcommand.
+- **Deployment connection**: `void connect [url] [--platform cloudflare|void]` is the developer entry point. A URL chooses Void; without arguments the CLI offers both targets. Interactive connection reuses or obtains credentials for the selected origin/account. `--no-login` saves only verified Void connection metadata; headless authenticated connection requires an origin-scoped keychain session or `VOID_TOKEN` with matching `VOID_API_URL`. Deployment requires a registered connection before reading credentials or exchanging OIDC tokens; environment URLs, legacy config, and unscoped project links never establish one. Fresh CI and managed builds run `void connect <url> --no-login` first. Existing project links are preserved when connecting elsewhere. Platform installation and administration remain under `void platform`; it has no `connect` subcommand.
+
+- **One-time deployment targets**: Scope saved project IDs and implicit OIDC slugs to their recorded platform origin. A different platform needs `--project` or `VOID_PROJECT`. Managed deployment may establish a first project link, but must never overwrite an existing link, another selected platform URL, or a Cloudflare/Skip deployment preference. Apply this to both prompted and explicit creation/selection, including failed deployments. Re-read the link after reauthentication so a first project created earlier in the attempt is reused.
 
 - **Import redirection**: The routing plugin's `resolveId` hook redirects bare `"void"` imports to `void/handler` (the lightweight subpath). Without this, route files pull the entire plugin (vite, @cloudflare/vite-plugin, lightningcss) into the Worker bundle. Uses `import.meta.resolve()` to compute absolute paths at plugin init.
 
@@ -124,27 +129,6 @@ the CLI binary at `dist/cli/cli.mjs`. The
 [API reference](../../docs/reference/api.md#user-facing-imports) documents
 supported imports. Keep Worker-safe runtime subpaths separate from the
 Vite/CLI dependency graph.
-
-### Legacy Void Cloud Staging Selection
-
-Existing Void Cloud projects may select its staging environment with the legacy `.void/project.json` flag below. New installations and forks use `void connect <api-url>` and origin-scoped credentials instead:
-
-```json
-{
-  "projectId": "proj_...",
-  "slug": "my-app",
-  "voidInternalStaging": true
-}
-```
-
-A pre-link file containing only `{ "voidInternalStaging": true }` is valid for Void platform developers who need `void auth login` or `void project link` to target staging before a project is linked.
-
-When `voidInternalStaging` is true:
-
-- **Token**: uses the origin-scoped system-keychain credential for `https://api.staging.void.cloud`. Historical `token`/`stagingToken` credentials select their original destination only and require a new login; never adopt them or infer production from a retired staging login. Keep existing origin-scoped file fallback and environment token binding.
-- **API URL**: the staging flag selects `https://api.staging.void.cloud` unless explicitly overridden by `VOID_API_URL`.
-- **Site domain**: uses `staging.void.app` for generated project URLs
-- **Proxy**: injects staging proxy bindings for local dev AI and prerendering
 
 Build output uses `.mjs` / `.d.mts` extensions (`vp pack` / tsdown default).
 
@@ -192,6 +176,8 @@ Void ships with first-class support for coding agents (Claude Code, Cursor, Code
 Agent instructions use versioned markers (`<!--injected-by-void-v0.0.1-->` / `<!--/injected-by-void-->`) for safe update-in-place across version upgrades.
 
 ## Tests
+
+Keep SvelteKit 2.62+ and 3 in the same integration. Dev hook injection supports both generated hook locations and resolves the official adapter's bindings. Kit 3 uses `$app/tsconfig` with `.void/tsconfig.json`; the shared tsconfig hook emits absolute paths for either generated config location. `test/fixtures/sveltekit-v2` supplies only legacy test dependencies; both integration cases copy the main SvelteKit playground, and their generated `$app` configs must stay isolated.
 
 Tests live in `test/unit` and `test/integration`. Run the affected files
 during development, then follow [TESTING.md](../../TESTING.md) for final

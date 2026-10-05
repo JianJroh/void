@@ -89,6 +89,8 @@ export default defineConfig({
       sortScripts: true,
     },
     ignorePatterns: [
+      'packages/prompts/index.mjs',
+      'packages/prompts/index.d.mts',
       '.svelte-kit/**',
       'packages/void/docs/**',
       'packages/void/skills/void/docs/**',
@@ -124,6 +126,8 @@ export default defineConfig({
     ],
     plugins: ['typescript', 'import', 'react', 'unicorn', 'vitest', 'node', 'jsdoc'],
     ignorePatterns: [
+      'packages/prompts/index.mjs',
+      'packages/prompts/index.d.mts',
       '**/node_modules/**',
       '**/dist/**',
       '**/.void/**',
@@ -455,7 +459,9 @@ export default defineConfig({
         test: {
           name: 'platform-api-integration-threads',
           fsModuleCache: true,
-          pool: 'threads',
+          // Node 24 on Linux can abort while unregistering PGlite's Wasm JIT
+          // allocations across worker threads. Keep each database in its own process.
+          pool: process.platform === 'linux' ? 'forks' : 'threads',
           include: ['platform/packages/api/test/integration/**/*.test.ts'],
           exclude: apiTimezoneTests,
           globalSetup: ['platform/packages/api/test/integration/global-setup.ts'],

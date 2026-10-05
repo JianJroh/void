@@ -1,11 +1,10 @@
-import { intro, outro, log } from '@clack/prompts';
+import { outro, log } from '@voidzero-dev/vite-plus-prompts';
 import { getToken, getSiteDomain } from './auth.ts';
 import { PlatformClient } from './client.ts';
-import { cliTitle, dim, pc, tablePrefix } from './output.ts';
+import { dim, formatCount, pc, tablePrefix } from './output.ts';
 
 export async function runProjectsCommand(root: string): Promise<void> {
   console.log();
-  intro(cliTitle('project list'));
 
   const token = getToken(root);
   if (!token) {
@@ -23,7 +22,7 @@ export async function runProjectsCommand(root: string): Promise<void> {
 
   const rows = projects.map((p) => ({
     slug: p.slug,
-    role: p.role ?? 'owner',
+    role: p.role,
     appType: p.type ?? 'worker',
     url: p.custom_domain
       ? `https://${p.custom_domain}`
@@ -45,5 +44,5 @@ export async function runProjectsCommand(root: string): Promise<void> {
   for (const line of lines) {
     console.log(line);
   }
-  outro(`${projects.length} project(s)`);
+  outro(formatCount(projects.length, 'project'));
 }

@@ -1,6 +1,7 @@
 import type { InstallationResource } from '@void/platform';
 import { describe, expect, it, vi } from 'vite-plus/test';
 import {
+  readPlatformHyperdriveSelection,
   verifyExternalPlatformHyperdrive,
   verifyPlatformAuthenticationDatabase,
 } from '../../src/cli/platform-auth-database.ts';
@@ -28,6 +29,21 @@ const config = {
 };
 
 describe('fresh platform authentication database reads', () => {
+  it('rejects incomplete saved Hyperdrive selections without exposing checkpoint contents', () => {
+    expect(readPlatformHyperdriveSelection(null)).toBeUndefined();
+    for (const externalHyperdriveJson of [
+      'private-value',
+      'null',
+      '[]',
+      '{}',
+      JSON.stringify({ id: 'drive', host: 'db.example.com', user: 1 }),
+      JSON.stringify({ id: 'drive', host: 'db.example.com', user: 'runtime', database: {} }),
+    ]) {
+      expect(() => readPlatformHyperdriveSelection({ externalHyperdriveJson })).toThrow(
+        'platform: The saved Hyperdrive selection is invalid.',
+      );
+    }
+  });
   it('pins an uncached externally managed origin while migrations use the owner connection', async () => {
     const ownerDatabaseUrl = `${databaseUrl}?sslmode=disable`;
     const external = {
@@ -36,6 +52,8 @@ describe('fresh platform authentication database reads', () => {
         ...config.origin,
         host: 'hyperdrive-productiondb.databases.cfdata.org/itdb/primary',
         user: 'hyperdrive_void_platform_service',
+        accessClientId: 'tunnel-client-id',
+        port: null,
       },
     };
     const hash = verifyExternalPlatformHyperdrive({
@@ -77,6 +95,18 @@ describe('fresh platform authentication database reads', () => {
         client,
         'account',
         { ...resource, ownership: 'adopted', configHash: '0'.repeat(64) },
+        ownerDatabaseUrl,
+      ),
+    ).rejects.toThrow('pinned database');
+    client.getHyperdriveConfig.mockResolvedValue({
+      ...external,
+      origin: { ...external.origin, accessClientId: 'different-client-id' },
+    });
+    await expect(
+      verifyPlatformAuthenticationDatabase(
+        client,
+        'account',
+        { ...resource, ownership: 'adopted', configHash: hash },
         ownerDatabaseUrl,
       ),
     ).rejects.toThrow('pinned database');

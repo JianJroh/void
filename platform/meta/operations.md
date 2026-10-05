@@ -41,6 +41,8 @@ These deployment and smoke-test workflows target Void Cloud, from `prod` for pro
 
 Both deploy workflows serialize deployments without cancelling an active rollout. Advancing `prod` requests a production deployment. A failed or interrupted deployment needs inspection before another rollout, particularly when database migrations already ran.
 
+Hosted API and email gateway deploys report the release version from `packages/platform/package.json` as `PLATFORM_VERSION`. The `void` CLI refuses platforms older than its minimum platform version, so release in this order: advance `prod` and wait for the production deployment to succeed, then push the release tag that publishes the npm packages.
+
 Consult the workflow files for their current inputs. Store credentials in the
 selected GitHub environment and the deployment owner's secret manager. Keep
 secret-manager locations, account access assignments and credential-issuance
@@ -191,3 +193,24 @@ void platform system health --connection https://api.staging.void.cloud
 `vp run --filter @voidcloud/platform health` runs the same operator health command against the selected connection. It requires a built SDK and `void platform auth login` or `VOID_OPERATOR_TOKEN`. The `health:staging` shortcut explicitly selects Void Cloud staging.
 
 The [kitchen-sink smoke checklist](../scripts/kitchen-sink-smoke-test.md) works with a disposable deployment on any platform. Its automated script requires `SMOKE_URL` and resets that app's data. The hosted smoke-test workflow provides the staging URL explicitly.
+
+## Documentation Site
+
+The documentation site deploys from `main` through the Void GitHub App using the
+`container` executor. The root [`void.config.ts`](../../void.config.ts) configures the monorepo
+as a static project that builds `docs` and publishes `docs/.vitepress/dist`.
+There is no documentation deploy workflow or `VOID_TOKEN` repository secret.
+
+Connect the repository once with:
+
+```sh
+void github connect void-docs \
+  --repo voidzero-dev/void \
+  --branch main \
+  --executor container
+```
+
+Release publishing still uses the `Release` GitHub environment with an
+`NPM_TOKEN` secret via `.github/workflows/publish.yml`.
+
+CI (`ci.yml`) runs on PRs to `main` and requires no secrets.

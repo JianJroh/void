@@ -23,7 +23,7 @@ import {
   resolveAssetRoutingPolicy,
   type AssetRoutingPolicy,
 } from './asset-routing.ts';
-import { getApiUrl, getProxyUrl, getToken, isStagingMode } from './cli/auth.ts';
+import { getApiUrl, getProxyUrl, getToken } from './cli/auth.ts';
 import { ensurePlatformProxyAccess } from './cli/cf-access.ts';
 import { SEND_EMAIL_BINDING } from './cli/email-cloudflare.ts';
 import { mergeRoutingRules } from './cli/headers.ts';
@@ -621,10 +621,9 @@ type CredentialStatus =
       projectId: string;
       proxyUrl: string;
       accessCredentials?: string;
-      staging?: boolean;
     }
   | { status: 'no-token' }
-  | { status: 'no-project'; apiUrl: string; token: string; staging?: boolean };
+  | { status: 'no-project'; apiUrl: string; token: string };
 
 /**
  * Read Void auth credentials for local dev AI proxy access.
@@ -636,12 +635,11 @@ function readVoidDevCredentials(root: string): CredentialStatus {
   if (!token) {
     return { status: 'no-token' };
   }
-  const staging = isStagingMode(root) || undefined;
   const apiUrl = getApiUrl(root);
 
   const project = readProjectConfig(root);
   if (!project) {
-    return { status: 'no-project', apiUrl, token, staging };
+    return { status: 'no-project', apiUrl, token };
   }
 
   const proxyUrl = getProxyUrl(root);
@@ -652,7 +650,6 @@ function readVoidDevCredentials(root: string): CredentialStatus {
     projectId: project.projectId,
     proxyUrl,
     accessCredentials: scopedAccessCredentials(process.env, proxyUrl),
-    staging,
   };
 }
 
@@ -667,7 +664,7 @@ async function runAiSetupPrompt(
   apiUrl: string,
   server: import('vite').ViteDevServer,
 ): Promise<void> {
-  const { select, text, isCancel, log } = await import('@clack/prompts');
+  const { select, text, isCancel, log } = await import('@voidzero-dev/vite-plus-prompts');
   const { PlatformClient } = await import('./cli/client.ts');
   const { attachSelectedPlatform, writeProjectConfig } = await import('./cli/project.ts');
   const { inferDefaultSlug } = await import('./cli/resolve-project.ts');
@@ -1190,7 +1187,8 @@ export function voidPlugin(options?: {
         : undefined;
 
     // SvelteKit hooks injection: transform get_hooks() to wrap `handle` with
-    // withRuntimeEnv(event.platform.env, ...). This stores the env in
+    // withRuntimeEnv(adapter env, ...). Kit 2 passes event.platform.env;
+    // Kit 3 exposes cloudflare:workers. This stores the env in
     // AsyncLocalStorage so void/db resolves it via envContext.getStore(), and
     // intercepts /__void/scheduled and /__void/queue so cron and queue
     // handlers run with the framework adapter's real bindings.
@@ -1202,7 +1200,10 @@ export function voidPlugin(options?: {
         if (detected.class !== 'b') {
           return;
         }
-        if (!id.includes('.svelte-kit/generated/server/internal')) {
+        if (
+          !id.includes('.svelte-kit/generated/server/internal') &&
+          !id.includes('.svelte-kit/generated/dev/server.js')
+        ) {
           return;
         }
         return injectSvelteKitHooks(code, id, frameworkTriggersDispatchPath(root));
@@ -1773,9 +1774,6 @@ export function voidPlugin(options?: {
         if (credentials.accessCredentials) {
           vars.__VOID_ACCESS_CREDENTIALS = credentials.accessCredentials;
         }
-        if (credentials.staging) {
-          vars.__VOID_STAGING = '1';
-        }
         result.vars = vars;
       }
     }
@@ -1961,7 +1959,7 @@ export function voidPlugin(options?: {
       if (remoteMode && (bindings.needsD1 || bindings.needsKV || bindings.needsR2)) {
         const credentials = readVoidDevCredentials(root);
         if (credentials.status === 'ok') {
-          const lines = ['\x1b[36mRemote bindings active\x1b[39m'];
+          const lines = [pc.blue('Remote bindings active')];
           if (bindings.needsD1) {
             lines.push('  DB      \x1b[2m→ remote D1\x1b[22m');
           }

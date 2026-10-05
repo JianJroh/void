@@ -13,7 +13,12 @@ import {
 } from 'vite-plus/test';
 import { importLegacyAuthentication } from '../../src/auth/configuration.ts';
 import { signDeployToken, signProjectCredentialToken } from '../../src/auth/deploy-token.ts';
-import { cancelDeployment, countUserDeploymentsToday, failStaleDeployments } from '../../src/db.ts';
+import {
+  cancelDeployment,
+  countUserDeploymentsToday,
+  failStaleDeployments,
+  getProject,
+} from '../../src/db.ts';
 import {
   dispatchPendingDeployments,
   getDeploymentOperation,
@@ -506,6 +511,58 @@ describe('durable deployment admission and observation', () => {
     });
   });
 
+  it.each(['queued', 'running', 'recovering'] as const)(
+    'reports %s execution and recovery timing to deployment observers',
+    async (status) => {
+      const id = await admit();
+      const recoveryAt = new Date(Date.now() + 18 * 60_000).toISOString();
+      const started = status !== 'queued';
+      await env.db
+        .update(deploymentOperations)
+        .set({
+          status,
+          lease_expires_at: started
+            ? sql`${recoveryAt}::timestamptz AT TIME ZONE current_setting('TimeZone')`
+            : null,
+          events: started
+            ? [{ seq: 1, event: { event: 'queue_setup', queues: ['demo-queue'] } }]
+            : [],
+          last_seq: started ? 1 : 0,
+        })
+        .where(eq(deploymentOperations.id, id));
+      const page = await (await getEvents(id, started ? 1 : 0)).json();
+      expect(page).toMatchObject({
+        events: [],
+        terminal: false,
+        heartbeat: {
+          event: 'heartbeat',
+          deploymentId: id,
+          status,
+          step: status === 'recovering' ? 'recovery' : started ? 'queue_setup' : 'queued',
+          ...(started && { recoveryAt }),
+        },
+      });
+    },
+  );
+
+  it('reports execution state in a streamed receipt heartbeat', async () => {
+    const id = await admit();
+    const response = execution.deploymentReceiptResponse(env.db, id);
+    const reader = response.body!.getReader();
+    try {
+      const first = await reader.read();
+      expect(JSON.parse(new TextDecoder().decode(first.value))).toEqual({
+        event: 'heartbeat',
+        deploymentId: id,
+        step: 'queued',
+        status: 'queued',
+      });
+    } finally {
+      await reader.cancel();
+      reader.releaseLock();
+    }
+  });
+
   it('protects observation with project authorization and rejects a receipt under another owned project', async () => {
     const id = await admit();
     const other = await createTestUser(env.db, 'other-observer');
@@ -618,6 +675,202 @@ describe('durable execution claim and revocation', () => {
     });
     expect(await countUserDeploymentsToday(env.db, user.id)).toBe(1);
   });
+
+  it.each(['transient', 'persistent', 'lost acknowledgement'])(
+    'settles a queued Worker deployment after a %s intermediate progress failure',
+    async (failure) => {
+      const migrations = {
+        dialect: 'sqlite',
+        pending: 1,
+        protocolVersion: 2,
+        classifierVersion: 1,
+        migrationListHash: `sha256:${'1'.repeat(64)}`,
+        stability: 'stable',
+      };
+      const migrate = vi.fn(() =>
+        Response.json({
+          ok: true,
+          migrations: [{ name: '001_create_table.sql', applied: true, durationMs: 1 }],
+        }),
+      );
+      queuedEnv.DISPATCH = {
+        get: () => ({
+          fetch: async (request: Request) => {
+            const pathname = new URL(request.url).pathname;
+            if (pathname === '/__void/migrate/capabilities') {
+              return Response.json({
+                ...migrations,
+                destructiveValidation: 'passed',
+                endpoints: {
+                  app: '/__void/migrate/app',
+                  reconcile: '/__void/migrate/app/attempt/:attemptId',
+                },
+              });
+            }
+            if (pathname === '/__void/migrate/app') {
+              return migrate();
+            }
+            if (pathname === '/__void/ready') {
+              return Response.json({ ready: true });
+            }
+            return new Response('<h1>durable</h1>', {
+              headers: { 'content-type': 'text/html' },
+            });
+          },
+        }),
+      } as unknown as DispatchNamespace;
+      const response = await post(crypto.randomUUID(), {
+        ...payload(),
+        manifest: {
+          version: 3,
+          assetManifestVersion: 2,
+          bindings: { d1: ['DB'] },
+          type: 'void',
+          queues: [{ name: 'demo-queue', bindingName: 'QUEUE_DEMO_QUEUE' }],
+          revalidate: 60,
+          prerender: ['/'],
+          migrations,
+        },
+        workerFiles: { 'index.js': btoa('export default {};') },
+      });
+      expect(response.status).toBe(200);
+      const id = response.headers.get('x-void-deployment-id')!;
+      const execute = vi.spyOn(deploy, 'executeQueuedDeployment');
+      const originalAppend = execution.appendDeploymentEvent;
+      let failures = 0;
+      vi.spyOn(execution, 'appendDeploymentEvent').mockImplementation(async (...args) => {
+        if (args[3].event === 'prerender' && (failure === 'persistent' || failures === 0)) {
+          failures++;
+          if (failure === 'lost acknowledgement') {
+            await originalAppend(...args);
+          }
+          throw new Error('Intermediate progress write interrupted');
+        }
+        return originalAppend(...args);
+      });
+
+      const first = await run(id);
+      expect(first.ack).toHaveBeenCalledOnce();
+      expect(first.retry).not.toHaveBeenCalled();
+      const operation = await getDeploymentOperation(env.db, id);
+      expect(operation).toMatchObject({ status: 'terminal', inputs_deleted: true });
+      expect(operation?.events.at(-1)?.event).toMatchObject({ event: 'done', deployment: id });
+      expect(operation?.events.some(({ event }) => event.event === 'prerender_done')).toBe(true);
+      if (failure === 'transient') {
+        expect(operation?.events.some(({ event }) => event.event === 'prerender')).toBe(true);
+      }
+      expect(failures).toBeGreaterThan(0);
+      const duplicate = await run(id);
+      expect(duplicate.ack).toHaveBeenCalledOnce();
+      expect(execute).toHaveBeenCalledOnce();
+      expect(migrate).toHaveBeenCalledOnce();
+      expect(await countUserDeploymentsToday(env.db, user.id)).toBe(1);
+    },
+  );
+
+  it.each(['snapshot', 'update'])(
+    'bounds a stalled queue consumer %s and preserves the live deployment',
+    async (stalledAt) => {
+      queuedEnv.DISPATCH = {
+        get: () => ({ fetch: async () => Response.json({ ready: true }) }),
+      } as unknown as DispatchNamespace;
+      const workerPayload = (maxBatchSize: number) => ({
+        ...payload(),
+        manifest: {
+          version: 3,
+          assetManifestVersion: 2,
+          bindings: {},
+          type: 'void',
+          queues: [{ name: 'demo-queue', bindingName: 'QUEUE_DEMO_QUEUE', maxBatchSize }],
+        },
+        workerFiles: { 'index.js': btoa('export default {};') },
+      });
+      const first = await post(crypto.randomUUID(), workerPayload(7));
+      const liveId = first.headers.get('x-void-deployment-id')!;
+      expect((await run(liveId)).ack).toHaveBeenCalledOnce();
+      const queueKey = `queue:${project.id.toLowerCase().replaceAll('_', '-')}-demo-queue`;
+      const liveRoute = await env.ROUTING.get(queueKey);
+      const consumer = {
+        consumer_id: 'consumer',
+        script: 'void-dispatch',
+        type: 'worker',
+        settings: { batch_size: 7 },
+      };
+      mockCfApi({
+        listQueueConsumers: () => cfSuccess([consumer]),
+        addQueueConsumer: () =>
+          Response.json(
+            { success: false, errors: [{ code: 100, message: 'queue already has a consumer' }] },
+            { status: 400 },
+          ),
+        updateQueueConsumer: (_url, init) => {
+          consumer.settings = JSON.parse(String(init!.body)).settings;
+          return cfSuccess(consumer);
+        },
+      });
+      const second = await post(crypto.randomUUID(), workerPayload(1));
+      const id = second.headers.get('x-void-deployment-id')!;
+      const provider = globalThis.fetch;
+      let release: (() => void) | undefined;
+      let notify!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        notify = resolve;
+      });
+      let stalled = false;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (...args: Parameters<typeof fetch>) => {
+          const response = await provider(...args);
+          const method = args[1]?.method ?? 'GET';
+          if (
+            !stalled &&
+            String(args[0]).includes('/consumers') &&
+            method === (stalledAt === 'snapshot' ? 'GET' : 'PUT')
+          ) {
+            stalled = true;
+            return new Promise<Response>((resolve, reject) => {
+              release = () => resolve(response);
+              args[1]?.signal?.addEventListener('abort', () => reject(args[1]!.signal!.reason), {
+                once: true,
+              });
+              notify();
+            });
+          }
+          return response;
+        }),
+      );
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      let settled = false;
+      const processing = run(id).then((result) => {
+        settled = true;
+        return result;
+      });
+      try {
+        await reached;
+        await vi.advanceTimersByTimeAsync(60_000);
+        await vi.waitFor(() => expect(settled).toBe(true));
+        const result = await processing;
+        expect(result.ack).toHaveBeenCalledOnce();
+        expect(result.retry).not.toHaveBeenCalled();
+        expect(await getProject(env.db, project.id)).toMatchObject({
+          active_deployment_id: liveId,
+        });
+        expect(await env.ROUTING.get(queueKey)).toBe(liveRoute);
+        expect(consumer.settings).toEqual({ batch_size: 7 });
+        const operation = await getDeploymentOperation(env.db, id);
+        expect(operation?.status).toBe('terminal');
+        expect(operation?.events.at(-1)?.event).toMatchObject({
+          event: 'error',
+          step: 'queue_setup',
+        });
+        expect((await post(crypto.randomUUID(), workerPayload(1))).status).toBe(200);
+      } finally {
+        vi.useRealTimers();
+        release?.();
+        await processing;
+      }
+    },
+  );
 
   it('stages Worker bytes before acknowledgement and executes the verified modules after disconnect', async () => {
     queuedEnv.DISPATCH = {

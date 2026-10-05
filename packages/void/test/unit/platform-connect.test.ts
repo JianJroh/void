@@ -26,6 +26,7 @@ afterEach(() => {
   delete process.env.CF_ACCESS_CLIENT_ID;
   delete process.env.CF_ACCESS_CLIENT_SECRET;
   delete process.env.CF_ACCESS_TOKEN;
+  delete process.env.VOID_ACCESS_ORIGIN;
 });
 
 describe('platform discovery', () => {
@@ -39,7 +40,7 @@ describe('platform discovery', () => {
     ).resolves.toMatchObject({ displayName: 'Example' });
   });
 
-  it('fills the hosted proxy for older Void Cloud discovery documents', async () => {
+  it('requires a proxy origin even for former hosted discovery documents', async () => {
     const legacyHosted = { ...document, apiUrl: 'https://api.void.cloud' } as Record<
       string,
       unknown
@@ -50,9 +51,9 @@ describe('platform discovery', () => {
       value: 'https://api.void.cloud/.well-known/void-platform',
     });
 
-    await expect(
-      discoverPlatform('https://api.void.cloud', async () => response),
-    ).resolves.toMatchObject({ proxyUrl: 'https://proxy.void.cloud' });
+    await expect(discoverPlatform('https://api.void.cloud', async () => response)).rejects.toThrow(
+      'proxyUrl',
+    );
   });
 
   it('rejects custom discovery documents without a proxy origin', async () => {
@@ -81,6 +82,7 @@ describe('platform discovery', () => {
   it('authenticates discovery for Access-gated Void Cloud staging', async () => {
     process.env.CF_ACCESS_CLIENT_ID = 'client-id';
     process.env.CF_ACCESS_CLIENT_SECRET = 'client-secret';
+    process.env.VOID_ACCESS_ORIGIN = 'https://api.staging.void.cloud';
     const stagingDocument = {
       ...document,
       apiUrl: 'https://api.staging.void.cloud',

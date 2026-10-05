@@ -1,5 +1,5 @@
-import { intro, outro, log, select, isCancel, cancel } from '@clack/prompts';
 import type { PlatformAuthenticationDiscovery } from '@void/platform';
+import { outro, log, select, isCancel, cancel } from '@voidzero-dev/vite-plus-prompts';
 import {
   getToken,
   getApiUrl,
@@ -9,10 +9,9 @@ import {
   runPlatformLogin,
   savePlatformToken,
   saveToken,
-  isStagingMode,
 } from './auth.ts';
 import { isExpiredTokenError, PlatformClient } from './client.ts';
-import { cliTitle, createSpinner, pc } from './output.ts';
+import { createSpinner, pc } from './output.ts';
 
 export type LoginPlatform = {
   apiUrl: string;
@@ -79,7 +78,7 @@ export async function promptForLoginToken(
   try {
     const onUrl = (url: string) => {
       s.message(
-        `Waiting for ${providerName} login. If your browser didn't open, visit:\n${pc.cyan(url)}`,
+        `Waiting for ${providerName} login. If your browser didn't open, visit:\n${pc.blue(url)}`,
       );
     };
     const token = platform
@@ -100,13 +99,13 @@ export async function promptForLoginToken(
 
 export async function runLoginCommand(root: string = process.cwd()): Promise<void> {
   console.log();
-  intro(cliTitle('login'));
 
   const existing = getToken(root);
   let expiredEnvToken = false;
   if (existing) {
     const tokenSource = getTokenSource();
-    const client = new PlatformClient(existing, { root });
+    // Login must work on any platform version.
+    const client = new PlatformClient(existing, { root, checkPlatformVersion: false });
     try {
       await client.whoami();
       if (tokenSource === 'ci') {
@@ -134,10 +133,8 @@ export async function runLoginCommand(root: string = process.cwd()): Promise<voi
 
   await promptForLoginToken(root);
   if (expiredEnvToken) {
-    outro(
-      `${isStagingMode(root) ? 'Staging token saved.' : 'Token saved.'} Unset \`VOID_TOKEN\` to use it.`,
-    );
+    outro('Token saved. Unset `VOID_TOKEN` to use it.');
     return;
   }
-  outro(isStagingMode(root) ? 'Staging token saved.' : 'Token saved.');
+  outro('Token saved.');
 }

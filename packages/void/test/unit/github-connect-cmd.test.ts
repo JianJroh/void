@@ -1,4 +1,4 @@
-import { log } from '@clack/prompts';
+import { log } from '@voidzero-dev/vite-plus-prompts';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import { createCodeChallenge } from '../../src/cli/auth.ts';
 import {
@@ -8,6 +8,7 @@ import {
   type PlatformClient,
   type ProjectResponse,
 } from '../../src/cli/client.ts';
+import * as gitMetadata from '../../src/cli/git-metadata.ts';
 import type { GithubArgs } from '../../src/cli/github-args.ts';
 import { runConnect } from '../../src/cli/github-cmd.ts';
 
@@ -18,12 +19,12 @@ vi.mock('node:child_process', () => ({
   execFile: (...args: Array<unknown>) => mockExecFile(...args),
 }));
 
-// Partial mock of @clack/prompts: only `text` is replaced (for the repo
+// Partial mock of @voidzero-dev/vite-plus-prompts: only `text` is replaced (for the repo
 // prompt); everything else — including `log`, which the spies below target —
 // passes through from the actual module.
 const mockText = vi.fn();
-vi.mock('@clack/prompts', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@clack/prompts')>();
+vi.mock('@voidzero-dev/vite-plus-prompts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@voidzero-dev/vite-plus-prompts')>();
   return { ...actual, text: (...args: Array<unknown>) => mockText(...args) };
 });
 
@@ -42,6 +43,7 @@ function makeProject(): ProjectResponse {
     type: 'void',
     created_at: '2024-01-01T00:00:00Z',
     custom_domain: null,
+    role: 'owner',
   };
 }
 
@@ -66,7 +68,6 @@ function makeConnection(overrides: Partial<GithubConnection> = {}): GithubConnec
     project_id: projectId,
     installation_id: installationId,
     repo_full_name: repoFullName,
-    repository_id: '9876',
     branch: 'main',
     build_executor: 'container',
     workflow_path: '.github/workflows/void-deploy.yml',
@@ -194,6 +195,8 @@ const originalIsTTY = process.stdin.isTTY;
 beforeEach(() => {
   mockExecFile.mockReset();
   mockText.mockReset();
+  // A CI checkout must not supply a default repository for these prompt fixtures.
+  vi.stubEnv('GITHUB_REPOSITORY', undefined);
   // Force the non-interactive (non-TTY) path so tests never hit clack prompts.
   (process.stdin as { isTTY?: boolean }).isTTY = false;
   exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
@@ -213,6 +216,7 @@ afterEach(() => {
   messageSpy.mockRestore();
   infoSpy.mockRestore();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe('runConnect — non-owner member connect-authorization round-trip', () => {
@@ -594,6 +598,56 @@ describe('runConnect — member repo prompt (redacted repository list)', () => {
     // client.connectGithub(projectId, body) — body.repoFullName carries the typed repo
     const body = connectGithub.mock.calls[0]![1] as { repoFullName: string };
     expect(body.repoFullName).toBe(repoFullName);
+  });
+
+  it('accepts inferred repository, branch, and workflow suggestions with Enter', async () => {
+    (process.stdin as { isTTY?: boolean }).isTTY = true;
+    const metadata = vi.spyOn(gitMetadata, 'collectGitDeployMetadata').mockReturnValue({
+      commit: null,
+      commitUrl: null,
+      gitRef: 'release',
+      repositoryUrl: `https://github.com/${repoFullName}`,
+    });
+    mockText.mockImplementation(async ({ defaultValue }) => defaultValue);
+    const connectGithub = vi
+      .fn()
+      .mockResolvedValueOnce(
+        makeConnection({ branch: 'release', build_executor: 'github_actions' }),
+      );
+    try {
+      const { promise } = driveConnect({
+        connectGithub,
+        listGithubInstallations: vi.fn(async () => [memberInstallation()]),
+        args: { executor: 'github_actions', repo: undefined, branch: undefined },
+      });
+      await promise;
+
+      const repoPrompt = mockText.mock.calls[0]![0];
+      expect(repoPrompt.validate('')).toBeUndefined();
+      expect(repoPrompt.validate(' ')).toBe('Enter the repository as owner/repo.');
+      expect(repoPrompt.validate('another/project')).toBeUndefined();
+      for (const [index, suggestion] of [
+        [0, repoFullName],
+        [1, 'release'],
+        [2, '.github/workflows/void-deploy.yml'],
+      ] as const) {
+        expect(mockText.mock.calls[index]![0]).toMatchObject({
+          placeholder: suggestion,
+          defaultValue: suggestion,
+        });
+        expect(mockText.mock.calls[index]![0]).not.toHaveProperty('initialValue');
+      }
+      expect(connectGithub).toHaveBeenCalledWith(
+        projectId,
+        expect.objectContaining({
+          repoFullName,
+          branch: 'release',
+          buildExecutor: 'github_actions',
+        }),
+      );
+    } finally {
+      metadata.mockRestore();
+    }
   });
 
   it('fails closed without a TTY, naming --repo', async () => {

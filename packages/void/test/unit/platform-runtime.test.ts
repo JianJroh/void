@@ -46,6 +46,21 @@ describe('platform runtime manifest', () => {
     expect(compatibility.rollbackSafeFrom).toEqual(manifest.database.rollbackSafeFrom);
   });
 
+  it('omits build-only source maps and their references from packaged Workers', () => {
+    const runtimeDirectory = getPlatformRuntimeDirectory();
+    const manifest = readPlatformRuntimeManifest();
+
+    expect(
+      readdirSync(runtimeDirectory, { recursive: true, encoding: 'utf8' }).filter((path) =>
+        path.endsWith('.map'),
+      ),
+    ).toEqual([]);
+    for (const artifact of Object.values(manifest.artifacts)) {
+      const contents = readFileSync(join(runtimeDirectory, artifact.path), 'utf8');
+      expect(contents.match(/^\/\/# sourceMappingURL=.*$/gm) ?? []).toEqual([]);
+    }
+  });
+
   it('binds every packaged migration and Worker artifact to the manifest', () => {
     const runtimeDirectory = getPlatformRuntimeDirectory();
     const manifest = readPlatformRuntimeManifest();
@@ -211,6 +226,39 @@ describe('platform runtime manifest', () => {
       await miniflare.dispose();
     }
   });
+
+  it.each(['dispatch', 'emailGateway', 'proxy', 'tail'] as const)(
+    'starts the packaged %s Worker in the bundled local runtime',
+    async (name) => {
+      const runtimeDirectory = getPlatformRuntimeDirectory();
+      const runtime = readPlatformRuntimeManifest();
+      const miniflare = new Miniflare(
+        convertV4MiniflareOptions({
+          bindings: {
+            PLATFORM_HEALTH_PROBE_TOKEN: 'probe',
+            PLATFORM_TRAFFIC_STATE: 'staging',
+          },
+          compatibilityDate: '2026-02-24',
+          compatibilityFlags: name === 'proxy' || name === 'emailGateway' ? ['nodejs_compat'] : [],
+          modules: true,
+          scriptPath: join(runtimeDirectory, runtime.artifacts[name]!.path),
+        }),
+      );
+
+      try {
+        await miniflare.ready;
+        if (name !== 'tail') {
+          const response = await miniflare.dispatchFetch('http://localhost/health', {
+            headers: { 'X-Void-Platform-Probe': 'probe' },
+          });
+          expect(response.status).toBe(200);
+          expect(await response.json()).toMatchObject({ ok: true });
+        }
+      } finally {
+        await miniflare.dispose();
+      }
+    },
+  );
 
   it('rejects a custom runtime whose artifacts changed after its manifest was built', () => {
     const temporary = mkdtempSync(join(tmpdir(), 'void-custom-runtime-test-'));

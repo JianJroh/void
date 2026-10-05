@@ -28,6 +28,13 @@ existing gate, verify that its service policy admits the installation token and
 that the application covers the printed API and proxy origins. A Cloudflare
 management API token does not authenticate an Access-protected HTTP request.
 
+For automatic setup, resuming also creates or verifies an Access exception
+limited to `/health` on the reserved dispatch health hostname. Void still requires
+its private probe token on that endpoint; requests without it cannot reach an
+application. This lets installation check routing while employee protection and
+account-wide Default-Deny remain enabled. It does not bypass Access for an entire
+Worker or for deployed apps.
+
 For externally supplied credentials, set `VOID_ACCESS_CREDENTIALS` from your
 secret manager to an object keyed by each exact API/proxy origin, with
 `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` in each entry. Then rerun
@@ -56,7 +63,7 @@ Repair recreates missing infrastructure that the installer owns. It does not res
 
 ### Upgrade the platform
 
-Keep the platform runtime current when updating the Void CLI. If a developer's CLI reports that project lookup requires an upgrade, upgrade the platform before retrying.
+Keep the platform runtime current when updating the Void CLI.
 
 Use the installed CLI's packaged runtime to upgrade:
 
@@ -79,10 +86,6 @@ and complete project-encryption keyring. Keep current credentials in your secret
 manager so they can also restore a missing Worker during repair.
 
 Database migrations only move forward. Void checks compatibility before upgrading and tells you if an intermediate release is needed. If deployment fails, it attempts to restore the previous Workers against the compatible database schema. Retrying does not repeat completed migrations.
-
-Upgrades automatically enable managed Sandboxes. The platform runtime token needs Account / Containers: Edit and Account / Cloudchamber: Edit, and the Cloudflare account must use Workers Paid before its first Sandbox application deploy. The upgrade itself does not probe Containers access, so platforms that do not deploy Sandbox applications need no additional plan or permissions.
-
-When upgrading from a release that used tenant-owned Sandbox containers, the upgrade may first ask you to finish the legacy cleanup. Follow the [`sandbox-drain` instructions](../../../reference/cli/platform-operations.md#operator-system), then rerun the upgrade. Administrator login remains available during that maintenance step.
 
 After a successful upgrade, you can restore a declared-compatible earlier runtime without reversing migrations:
 

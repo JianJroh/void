@@ -90,8 +90,10 @@ or hanging tests when they occur instead of routinely increasing timeouts.
 Subprocess and provisioning-lock unit tests start alongside the platform projects so their real
 process deadlines can overlap database work. The remaining SDK unit and integration files then
 share a scheduling phase. `vp run test:unit` includes both `unit` and `cli-unit`; CI does the same.
-Unit files and most API integration files use isolated worker threads to reduce startup time. API tests that
-change the process timezone use forks, because threads cannot change Node's timezone. Select every
+Unit files and most API integration files use isolated worker threads to reduce startup time. On Linux,
+API integration files use forks to isolate PGlite's WebAssembly JIT allocations after native Node 24
+cleanup crashes in shared worker processes. API tests that change the process timezone also use forks,
+because threads cannot change Node's timezone. Select every
 API file with `vp test run --project 'platform-api-integration*'`. SDK integration files use forks.
 This keeps database engines from competing with all framework compilers at startup. Keep module
 isolation enabled: these suites mock globals, keep database state, and exercise real process/lock boundaries.
@@ -162,7 +164,21 @@ real subprocess/lock deadline tests retain their actual timing semantics.
 
 API integration fixtures reset their tables with one ordered SQL block. Use `clearTables` rather
 than repeating per-table cleanup; it keeps foreign-key delete behavior and migration history
-intact in both PGlite and the shared PostgreSQL compatibility run.
+intact in PGlite and PostgreSQL.
+
+Staging CI on main also runs the production schema-compatibility gate, so its failures are caught
+before tagging a release. The job copies the candidate's `.github/scripts/schema-compat-tests.ts` runner
+before checking out the deployed revision. It runs every deployed API test file against its own
+clone of the upgraded PostgreSQL database, with two files in flight. Separate databases
+prevent cross-project cleanup races and leaked fixture tables while preserving real multi-connection
+tests within each file. The original upgraded database and its seeded compatibility records remain
+untouched. The runner accepts only the disposable loopback `void_schema_compat` database as `void_ci`.
+It also repairs two legacy fixtures, each gated by its full file checksum: the email concurrency
+fixture must return the same zone ID for both lookups and model DNS for whichever request wins,
+and the oversized deploy-body fixture must
+consume its response before the next test clears its tables. Deployed runtime source and all test
+assertions stay intact. Unknown revisions are left untouched, so a new failure cannot silently
+inherit an old fixture exception.
 
 CLI and deploy tests that stub their network boundary and call production functions directly run
 in the unit project. The integration project is reserved for real builds, subprocesses, servers,

@@ -194,7 +194,7 @@ export default extendConfig(
 
       nav: [
         {
-          text: 'SDK',
+          text: 'Guide',
           link: '/guide/',
           activeMatch:
             '^/guide/(?!platform/|self-hosted-platform|platform-administration|platform-development)',
@@ -207,7 +207,6 @@ export default extendConfig(
         },
         referenceLinks,
         integrationLinks,
-        // { text: "Dashboard", link: "https://dash.void.cloud" },
       ],
 
       socialLinks,
@@ -224,8 +223,8 @@ export default extendConfig(
             collapsed: false,
             items: [
               { text: 'Introduction', link: '/guide/' },
-              { text: 'Supported App Types', link: '/guide/app-types' },
               { text: 'Quickstart', link: '/guide/quickstart' },
+              { text: 'Supported App Types', link: '/guide/app-types' },
             ],
           },
           {
@@ -286,7 +285,6 @@ export default extendConfig(
               { text: 'Object Storage', link: '/guide/storage' },
               { text: 'Durable State', link: '/guide/durable-state' },
               { text: 'Environment Variables', link: '/guide/env-vars' },
-              { text: 'Environment Migration', link: '/guide/env-migration' },
             ],
           },
           {

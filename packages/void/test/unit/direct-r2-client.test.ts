@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import { PlatformClient, type ManifestOnlyDeployPayload } from '../../src/cli/client.ts';
 import type { DeployManifest } from '../../src/cli/types.ts';
+import { withPlatformDiscovery } from '../helpers/platform-discovery.ts';
 
 const spawnSyncMock = vi.hoisted(() => vi.fn());
 const accessKeyring = vi.hoisted(() => ({
@@ -21,11 +22,12 @@ let originalFetch: typeof globalThis.fetch | undefined;
 
 beforeEach(() => {
   originalFetch = globalThis.fetch;
-  globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+  globalThis.fetch = withPlatformDiscovery(fetchMock);
   fetchMock.mockReset();
 });
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   if (originalFetch) {
     globalThis.fetch = originalFetch;
   }
@@ -46,6 +48,17 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+/** The platform names the accepted deployment in a receipt header before streaming. */
+function receiptFor(events: Array<unknown>): string {
+  for (const event of events as Array<{ deploymentId?: unknown; deployment?: unknown }>) {
+    const id = event.deploymentId ?? event.deployment;
+    if (typeof id === 'string') {
+      return id;
+    }
+  }
+  return 'dpl_durable';
+}
+
 function ndjsonStreamResponse(events: Array<unknown>, status = 200): Response {
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
@@ -56,7 +69,13 @@ function ndjsonStreamResponse(events: Array<unknown>, status = 200): Response {
       controller.close();
     },
   });
-  return new Response(stream, { status, headers: { 'content-type': 'application/x-ndjson' } });
+  return new Response(stream, {
+    status,
+    headers: {
+      'content-type': 'application/x-ndjson',
+      'x-void-deployment-id': receiptFor(events),
+    },
+  });
 }
 
 describe('PlatformClient.requestUploadUrls', () => {
@@ -226,7 +245,10 @@ describe('PlatformClient.finalizeDeploy', () => {
       },
     });
     fetchMock.mockResolvedValueOnce(
-      new Response(stream, { status: 200, headers: { 'content-type': 'application/x-ndjson' } }),
+      new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'application/x-ndjson', 'x-void-deployment-id': 'd1' },
+      }),
     );
 
     const client = makeClient();
@@ -300,6 +322,7 @@ describe('PlatformClient.finalizeDeploy', () => {
       // No client-side dedupe GET — the server's precheck is authoritative.
       expect(deploymentListCalls()).toHaveLength(0);
       expect(events).toEqual([
+        { event: 'start', deploymentId: 'd1' },
         { event: 'done', deployment: 'd1', url: 'https://x', urls: [], assets: 0, workers: 0 },
       ]);
       expect(cliLog.warn).toHaveBeenCalledWith(
@@ -661,11 +684,13 @@ describe('PlatformClient.finalizeDeploy', () => {
     }
   });
 
-  it('keeps EOF behavior on an older platform without a durable receipt', async () => {
-    fetchMock.mockResolvedValueOnce(
-      ndjsonStreamResponse([{ event: 'start', deploymentId: 'dpl_legacy' }]),
-    );
-    expect(await collectDeploy()).toEqual([{ event: 'start', deploymentId: 'dpl_legacy' }]);
+  it('rejects a deployment stream without a receipt and does not observe or retry it', async () => {
+    const response = ndjsonStreamResponse([{ event: 'start', deploymentId: 'dpl_unknown' }]);
+    response.headers.delete('x-void-deployment-id');
+    const cancel = vi.spyOn(response.body!, 'cancel');
+    fetchMock.mockResolvedValueOnce(response);
+    await expect(collectDeploy()).rejects.toThrow('Platform returned no deployment receipt.');
+    expect(cancel).toHaveBeenCalledOnce();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -699,6 +724,130 @@ describe('PlatformClient.finalizeDeploy', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('bounds an open deployment stream even while heartbeats continue', async () => {
+    vi.useFakeTimers();
+    const cancel = vi.fn();
+    let reads = 0;
+    const startedAt = Date.now();
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          vi.setSystemTime(startedAt + reads++ * 15 * 60_000);
+          controller.enqueue(
+            new TextEncoder().encode('{"event":"heartbeat","step":"queue_setup"}\n'),
+          );
+          // Close this finite fixture so a missing deadline produces a failed
+          // assertion instead of hanging the regression test indefinitely.
+          if (reads === 4) {
+            controller.close();
+          }
+        },
+        cancel,
+      },
+      { highWaterMark: 0 },
+    );
+    fetchMock.mockResolvedValueOnce(
+      new Response(stream, { headers: { 'x-void-deployment-id': 'dpl_durable' } }),
+    );
+    fetchMock.mockResolvedValueOnce(eventPage([{ seq: 1, event: durableDone }]));
+    try {
+      await expect(collectDeploy()).rejects.toThrow('Timed out observing deployment dpl_durable');
+      expect(deployPostCalls()).toHaveLength(1);
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the original observation deadline when reconnecting after a long stream', async () => {
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    const response = new Response(
+      new ReadableStream(
+        {
+          pull(controller) {
+            vi.setSystemTime(startedAt + 29 * 60_000);
+            controller.close();
+          },
+        },
+        { highWaterMark: 0 },
+      ),
+      { headers: { 'x-void-deployment-id': 'dpl_durable' } },
+    );
+    let polls = 0;
+    fetchMock.mockResolvedValueOnce(response).mockImplementation(async () => {
+      vi.setSystemTime(startedAt + 30 * 60_000);
+      return polls++ === 0 ? eventPage([], false) : eventPage([{ seq: 1, event: durableDone }]);
+    });
+    try {
+      const assertion = expect(collectDeploy()).rejects.toThrow(
+        'Timed out observing deployment dpl_durable',
+      );
+      await vi.runAllTimersAsync();
+      await assertion;
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(deployPostCalls()).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports recovery heartbeats after reconnecting to a deployment receipt', async () => {
+    vi.useFakeTimers();
+    const heartbeat = {
+      event: 'heartbeat',
+      deploymentId: 'dpl_durable',
+      status: 'recovering',
+      step: 'recovery',
+      recoveryAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    fetchMock
+      .mockResolvedValueOnce(durableResponse([]))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          deploymentId: 'dpl_durable',
+          events: [],
+          lastSeq: 0,
+          terminal: false,
+          heartbeat,
+        }),
+      )
+      .mockResolvedValueOnce(eventPage([{ seq: 1, event: durableDone }]));
+    try {
+      const result = collectDeploy();
+      await vi.runAllTimersAsync();
+      expect(await result).toEqual([
+        { event: 'start', deploymentId: 'dpl_durable' },
+        heartbeat,
+        durableDone,
+      ]);
+      expect(deployPostCalls()).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    { event: 'done' },
+    { event: 'heartbeat', step: 'recovery', deploymentId: 'dpl_other' },
+    { event: 'heartbeat', step: 'recovery', status: 'invalid' },
+    { event: 'heartbeat', step: 'recovery', recoveryAt: 'invalid' },
+  ])('rejects invalid recovery metadata without resubmitting deployment: %j', async (heartbeat) => {
+    fetchMock.mockResolvedValueOnce(durableResponse([])).mockResolvedValueOnce(
+      jsonResponse({
+        deploymentId: 'dpl_durable',
+        events: [],
+        lastSeq: 0,
+        terminal: false,
+        heartbeat,
+      }),
+    );
+    await expect(collectDeploy()).rejects.toThrow(/Invalid deployment/);
+    expect(deployPostCalls()).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('cancels and releases an open response after terminal delivery', async () => {
@@ -803,6 +952,7 @@ describe('PlatformClient.finalizeDeploy', () => {
 // process.env; this test deletes them itself to assert the capture invariant.)
 describe('PlatformClient CF Access header capture (survives a later env scrub)', () => {
   it('keeps sending CF-Access headers after CF_ACCESS_* are deleted from process.env', async () => {
+    vi.stubEnv('VOID_ACCESS_ORIGIN', 'https://api.staging.void.cloud');
     const savedId = process.env.CF_ACCESS_CLIENT_ID;
     const savedSecret = process.env.CF_ACCESS_CLIENT_SECRET;
     try {
@@ -881,11 +1031,18 @@ describe('PlatformClient CF Access header capture (survives a later env scrub)',
       delete process.env.CF_ACCESS_CLIENT_ID;
       delete process.env.CF_ACCESS_CLIENT_SECRET;
       delete process.env.VOID_ACCESS_CREDENTIALS;
-      delete process.env.VOID_ACCESS_ORIGIN;
-      process.env.CF_ACCESS_TOKEN = 'initial-user-token';
+      process.env.VOID_ACCESS_ORIGIN = 'https://api.staging.void.cloud';
+      const tokenFor = (label: string) =>
+        'header.' +
+        Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600, label })).toString(
+          'base64url',
+        ) +
+        '.signature';
+      process.env.CF_ACCESS_TOKEN = tokenFor('initial');
       const client = new PlatformClient(token, { apiUrl: 'https://api.staging.void.cloud' });
 
-      process.env.CF_ACCESS_TOKEN = 'renewed-user-token';
+      const renewedToken = tokenFor('renewed');
+      process.env.CF_ACCESS_TOKEN = renewedToken;
       fetchMock.mockResolvedValueOnce(jsonResponse({ urls: {} }));
       await client.requestUploadUrls(projectId, [
         { blake3: 'a'.repeat(32), md5: 'b'.repeat(32), size: 1, contentType: 'text/plain' },
@@ -893,7 +1050,7 @@ describe('PlatformClient CF Access header capture (survives a later env scrub)',
 
       const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
       const headers = init.headers as Record<string, string>;
-      expect(headers['cf-access-token']).toBe('renewed-user-token');
+      expect(headers['cf-access-token']).toBe(renewedToken);
       expect(headers['CF-Access-Client-Id']).toBeUndefined();
     } finally {
       for (const [name, value] of [

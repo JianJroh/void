@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { cancel, confirm, isCancel, log, select, text } from '@clack/prompts';
+import { cancel, confirm, isCancel, log, select, text } from '@voidzero-dev/vite-plus-prompts';
 import {
   awaitBrowserCallback,
   createCodeChallenge,
@@ -250,7 +250,7 @@ export async function runInstall(
     }
   }
 
-  log.message(`Open this URL to install the Void GitHub App:\n${pc.cyan(url)}`);
+  log.message(`Open this URL to install the Void GitHub App:\n${pc.blue(url)}`);
   const { execFile } = await import('node:child_process');
   openBrowser(url, execFile);
   log.message('After installing, run `void github connect` to link a repository to your project.');
@@ -289,7 +289,7 @@ export async function runGithubLink(root: string, client: PlatformClient): Promi
         return url;
       },
       describeError: (p) => (p.get('error') ? 'GitHub authorization failed.' : null),
-      onUrl: (url) => log.message(`Open this URL to link your GitHub account:\n${pc.cyan(url)}`),
+      onUrl: (url) => log.message(`Open this URL to link your GitHub account:\n${pc.blue(url)}`),
       finalize: async (params) => {
         const linkCode = params.get('link_code');
         if (!linkCode) {
@@ -349,7 +349,7 @@ export async function performGithubJoin(client: PlatformClient): Promise<number>
     describeError: (p) => (p.get('error') ? 'GitHub authorization failed.' : null),
     onUrl: (url) =>
       log.message(
-        `Open this URL to join your organization's shared GitHub App installations:\n${pc.cyan(url)}`,
+        `Open this URL to join your organization's shared GitHub App installations:\n${pc.blue(url)}`,
       ),
     finalize: async (params) => {
       const joinCode = params.get('join_code');
@@ -452,7 +452,7 @@ async function runGithubConnectAuthorize(
       return e ? 'GitHub authorization failed.' : null;
     },
     onUrl: (url) =>
-      log.message(`Open this URL to authorize access to ${repoFullName}:\n${pc.cyan(url)}`),
+      log.message(`Open this URL to authorize access to ${repoFullName}:\n${pc.blue(url)}`),
     finalize: async (params) => {
       const grant = params.get('connect_grant');
       if (!grant) {
@@ -476,9 +476,9 @@ async function promptRepoFullName(root: string): Promise<string> {
   const input = await text({
     message: 'Repository (owner/repo):',
     placeholder: gitDefault ?? 'owner/repo',
-    initialValue: gitDefault ?? '',
+    defaultValue: gitDefault ?? undefined,
     validate: (value) =>
-      /^[^/\s]+\/[^/\s]+$/.test((value ?? '').trim())
+      /^[^/\s]+\/[^/\s]+$/.test((value || gitDefault || '').trim())
         ? undefined
         : 'Enter the repository as owner/repo.',
   });
@@ -691,7 +691,7 @@ export async function runConnect(
     const input = await text({
       message: 'Branch to deploy from:',
       placeholder: branchDefault,
-      initialValue: branchDefault,
+      defaultValue: branchDefault,
     });
     if (isCancel(input)) {
       cancel('Cancelled.');
@@ -732,16 +732,14 @@ export async function runConnect(
   //
   //    Only carry a prompted value forward when it DIFFERS from the default, so
   //    accepting the default leaves `workflowPath` undefined → the field is not
-  //    sent → the server applies its own (identical) default. This keeps the
-  //    fail-closed echo check below from firing against an older platform that
-  //    silently drops the field and returns its default.
+  //    sent → the server applies its own (identical) default.
   // -------------------------------------------------------------------------
   let workflowPath = args.workflowPath;
   if (executor === 'github_actions' && args.workflowPath === undefined && isTTY) {
     const input = await text({
       message: 'Deploy workflow file:',
       placeholder: DEFAULT_WORKFLOW_PATH,
-      initialValue: DEFAULT_WORKFLOW_PATH,
+      defaultValue: DEFAULT_WORKFLOW_PATH,
       validate(value) {
         const v = (value ?? '').trim();
         if (v.length === 0 || isValidWorkflowPath(v)) {
@@ -773,9 +771,8 @@ export async function runConnect(
       ...extra,
     });
 
-  let connection: GithubConnection;
   try {
-    connection = await attemptConnect();
+    await attemptConnect();
   } catch (err) {
     if (!(err instanceof PlatformApiError)) {
       throw err;
@@ -800,7 +797,7 @@ export async function runConnect(
         repoFullName,
       );
       try {
-        connection = await attemptConnect({
+        await attemptConnect({
           connectGrant: grant.connectGrant,
           codeVerifier: grant.codeVerifier,
         });
@@ -828,19 +825,6 @@ export async function runConnect(
       }
       throw err;
     }
-  }
-
-  // Fail closed when a custom workflow path (from --workflow or the prompt) was
-  // not applied. An older platform that predates workflow_path silently drops
-  // the field and returns success while staying pinned to the default, so the
-  // user would wrongly believe their custom workflow is authorized to deploy.
-  // Verify the server echoed it back. (Accepting the default leaves workflowPath
-  // undefined, so this check is skipped — see step 6.)
-  if (workflowPath !== undefined && connection.workflow_path !== workflowPath) {
-    log.error(
-      `connect: server did not apply workflow path ${workflowPath} (got ${connection.workflow_path ?? 'none'}). The platform may be too old to support a custom workflow path.`,
-    );
-    process.exit(1);
   }
 
   log.success(`Connected ${repoFullName} (${branch}) → project. Push to ${branch} to deploy.`);
@@ -1058,17 +1042,6 @@ export async function runGithubUpdate(
       throw err;
     }
     throw err;
-  }
-
-  // Fail closed when a custom workflow path (from --workflow or the prompt) was
-  // not applied — same old-platform compatibility hazard as connect: the server
-  // could return success while ignoring the unknown field, leaving the workflow
-  // pin unchanged.
-  if (patch.workflowPath !== undefined && updated.workflow_path !== patch.workflowPath) {
-    log.error(
-      `update: server did not apply workflow path ${patch.workflowPath} (got ${updated.workflow_path ?? 'none'}). The platform may be too old to support a custom workflow path.`,
-    );
-    process.exit(1);
   }
 
   log.success(

@@ -1,5 +1,5 @@
-import { isCancel, log, select } from '@clack/prompts';
 import type { PlatformDiscoveryDocument } from '@void/platform';
+import { isCancel, log, select } from '@voidzero-dev/vite-plus-prompts';
 import { readPlatformToken } from './auth.ts';
 import { isExpiredTokenError, PlatformClient } from './client.ts';
 import { connectCloudflare } from './cloudflare-connect.ts';
@@ -53,7 +53,11 @@ export async function authenticateConnection(
   const token = matchingEnv ? envToken : readPlatformToken(discovery.apiUrl);
   if (token) {
     try {
-      await new PlatformClient(token, { apiUrl: discovery.apiUrl }).whoami();
+      // Login must work on any platform version.
+      await new PlatformClient(token, {
+        apiUrl: discovery.apiUrl,
+        checkPlatformVersion: false,
+      }).whoami();
       log.success(`Authenticated with ${discovery.displayName}.`);
       return;
     } catch (error) {
@@ -113,8 +117,7 @@ export async function runConnectCommand(
   saveDiscoveredPlatform(discovery);
   const envUrl = process.env.VOID_API_URL;
   const environmentOverrides = Boolean(
-    (envUrl && normalizePlatformApiUrl(envUrl) !== discovery.apiUrl) ||
-    (process.env.VOID_TOKEN && !envUrl),
+    envUrl && normalizePlatformApiUrl(envUrl) !== discovery.apiUrl,
   );
   const selected = environmentOverrides ? false : writePlatformSelection(root, discovery);
   log.success(`Connected to ${discovery.displayName} at ${discovery.apiUrl}.`);

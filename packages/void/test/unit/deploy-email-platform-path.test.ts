@@ -33,7 +33,8 @@ const { emailModule, mockConfirm, mockPreflight, mockProjectLookup, mockClientCt
 
 vi.mock('../../src/cli/email-cloudflare.ts', () => emailModule);
 
-vi.mock('@clack/prompts', () => ({
+vi.mock('@voidzero-dev/vite-plus-prompts', () => ({
+  settings: { accessible: false },
   intro: vi.fn(),
   outro: vi.fn(),
   note: vi.fn(),

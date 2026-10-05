@@ -71,12 +71,17 @@ import type {
 import { dirname, join, resolve } from 'pathslash';
 import { cfAccessHeaders } from '../shared/cf-access.ts';
 import { ensurePlatformAccessToken } from './cf-access.ts';
+import { ensurePlatformAccessHealthChecks } from './platform-access-health.ts';
 import { verifyInstalledPlatformAccessProtection } from './platform-access-preflight.ts';
 import {
   activatePlatformAccessCredentials,
   checkpointPlatformAccessResources,
   isPlatformAuthenticationPreparationKey,
 } from './platform-access-setup.ts';
+import {
+  initializeInstalledAppAccess,
+  PlatformAppAccessCredentialError,
+} from './platform-app-access.ts';
 import {
   initializeInstalledPlatformAuthentication,
   resumeInstalledPlatformAuthentication,
@@ -89,6 +94,7 @@ import {
   hyperdriveOriginConfigHash,
   hyperdriveOriginFromConnectionString,
   parsePostgresConnectionString,
+  PlatformCloudflareApiError,
   PlatformWorkerCustomDomainsChangedError,
   PlatformWorkerRoutesChangedError,
   type CloudflareNamedResource,
@@ -130,8 +136,15 @@ import { createDefaultRunWrangler, resolvePinnedApiBaseUrl } from './provision.t
 export const REMOTE_INSTALLATION_MANIFEST_KEY: string = PLATFORM_REMOTE_INSTALLATION_MANIFEST_KEY;
 
 export type PlatformInstallationSecrets = Readonly<{
+  appAccessSetupJson?: string;
+  appAccessSetupToken?: string;
+  /** Local operator credential, never included in Worker secrets. */
+  managementApiToken?: string;
+  /** Retain external selection details until an adoption receipt can identify the resource. */
+  externalHyperdriveJson?: string;
   authenticationPreparation?: Readonly<Record<string, string>>;
   accessProvisioningJson?: string;
+  accessHealthProvisioningJson?: string;
   accessCredentialsJson?: string;
   authenticationSetupJson?: string;
   authSetupToken?: string;
@@ -311,6 +324,11 @@ export class PlatformWorkerRecoveryIncompleteError extends Error {
 }
 
 export type PlatformInstallerDependencies = Readonly<{
+  prepareAppAccess?: (
+    manifest: PlatformInstallationManifest,
+    secrets: PlatformInstallationSecrets,
+  ) => Promise<string>;
+  initializeAppAccess?: typeof initializeInstalledAppAccess;
   prepareAuthentication?: (
     manifest: PlatformInstallationManifest,
     secrets: PlatformInstallationSecrets,
@@ -328,6 +346,7 @@ export type PlatformInstallerDependencies = Readonly<{
   >;
   initializeAuthentication?: typeof initializeInstalledPlatformAuthentication;
   verifyAccessProtection?: typeof verifyInstalledPlatformAccessProtection;
+  prepareHealthAccess?: typeof ensurePlatformAccessHealthChecks;
   acquireDatabaseLifecycleLock: (
     databaseUrl: string,
     installationId: string,
@@ -538,9 +557,20 @@ export function createPlatformInstallationSecrets(input: {
     authenticationPreparation: Object.fromEntries(
       Object.entries(checkpoint).filter(([name]) => isPlatformAuthenticationPreparationKey(name)),
     ),
+    ...(checkpoint.appAccessSetupToken
+      ? { appAccessSetupToken: checkpoint.appAccessSetupToken }
+      : {}),
+    ...(checkpoint.appAccessSetupJson ? { appAccessSetupJson: checkpoint.appAccessSetupJson } : {}),
+    ...(checkpoint.managementApiToken ? { managementApiToken: checkpoint.managementApiToken } : {}),
+    ...(checkpoint.externalHyperdriveJson
+      ? { externalHyperdriveJson: checkpoint.externalHyperdriveJson }
+      : {}),
     ...(modernAuthentication ? { authenticationSetupJson, authSetupToken, authBootstrapCode } : {}),
     ...(checkpoint.accessProvisioningJson
       ? { accessProvisioningJson: checkpoint.accessProvisioningJson }
+      : {}),
+    ...(checkpoint.accessHealthProvisioningJson
+      ? { accessHealthProvisioningJson: checkpoint.accessHealthProvisioningJson }
       : {}),
     ...(checkpoint.accessCredentialsJson
       ? { accessCredentialsJson: checkpoint.accessCredentialsJson }
@@ -731,6 +761,12 @@ function secretCheckpoint(
   workerSecretUpdateIntent?: PlatformWorkerSecretUpdateIntent | null,
 ): Record<string, string> {
   return {
+    ...(secrets.appAccessSetupToken ? { appAccessSetupToken: secrets.appAccessSetupToken } : {}),
+    ...(secrets.appAccessSetupJson ? { appAccessSetupJson: secrets.appAccessSetupJson } : {}),
+    ...(secrets.managementApiToken ? { managementApiToken: secrets.managementApiToken } : {}),
+    ...(secrets.externalHyperdriveJson
+      ? { externalHyperdriveJson: secrets.externalHyperdriveJson }
+      : {}),
     ...Object.fromEntries(
       Object.entries(secrets.authenticationPreparation ?? {}).filter(([name]) =>
         isPlatformAuthenticationPreparationKey(name),
@@ -745,6 +781,9 @@ function secretCheckpoint(
       : {}),
     ...(secrets.accessProvisioningJson
       ? { accessProvisioningJson: secrets.accessProvisioningJson }
+      : {}),
+    ...(secrets.accessHealthProvisioningJson
+      ? { accessHealthProvisioningJson: secrets.accessHealthProvisioningJson }
       : {}),
     ...(secrets.accessCredentialsJson
       ? { accessCredentialsJson: secrets.accessCredentialsJson }
@@ -1296,6 +1335,9 @@ export async function installPlatform(
   const resolvedRuntime = dependencies.runtime ?? resolvePlatformRuntime();
   const runtimeDirectory = resolvedRuntime.directory;
   const runtime = resolvedRuntime.manifest;
+  if (plan.deployment.appAccess && runtime.appAccessSetup !== 1) {
+    throw new Error('platform: This runtime does not support the installation’s app access setup.');
+  }
   const hasEmailGatewayArtifact = runtime.artifacts.emailGateway !== undefined;
   if (runtime.emailProtocolVersion !== 1 && plan.deployment.capabilities.email) {
     throw new Error(
@@ -1433,6 +1475,9 @@ export async function installPlatform(
     parsePostgresConnectionString(secrets.databaseUrl);
     assertVoidCreatedHyperdriveTrustsDatabase(secrets.databaseUrl);
   }
+  if (plan.externalHyperdrive) {
+    secrets = { ...secrets, externalHyperdriveJson: JSON.stringify(plan.externalHyperdrive) };
+  }
   const pendingSecrets = secretCheckpoint(secrets, workerSecretUpdateIntent);
   writePendingInstallationSecrets(manifest, {
     ...pendingSecrets,
@@ -1501,10 +1546,6 @@ export async function installPlatform(
   ) {
     workerSecretUpdateIntent = null;
   }
-  let workerDeploymentSecrets: PlatformInstallationSecrets = {
-    ...secrets,
-    workerSecretUpdates: workerSecretUpdateIntent?.updates ?? {},
-  };
   try {
     assertPlatformRuntimeSafety(
       runtime,
@@ -1675,16 +1716,65 @@ export async function installPlatform(
           'platform: Prepared authentication does not match its administrator setup code.',
         );
       }
-      workerDeploymentSecrets = {
-        ...secrets,
-        workerSecretUpdates: workerSecretUpdateIntent?.updates ?? {},
-      };
       writePendingInstallationSecrets(manifest, {
         ...secretCheckpoint(secrets, workerSecretUpdateIntent),
         databaseClaimState: 'claimed',
       });
     }
 
+    const appAccessSetupRequired =
+      !!plan.deployment.appAccess &&
+      !manifest.steps.some((step) => step.key === 'app-access-initialized:v1');
+    if (appAccessSetupRequired) {
+      if (dependencies.prepareAppAccess) {
+        try {
+          const appAccessSetupJson = await dependencies.prepareAppAccess(manifest, secrets);
+          const latest = readPendingInstallationSecrets(manifest) ?? {};
+          secrets = {
+            ...secrets,
+            appAccessSetupJson,
+            authenticationPreparation: Object.fromEntries(
+              Object.entries(latest).filter(([key]) => isPlatformAuthenticationPreparationKey(key)),
+            ),
+          };
+          writePendingInstallationSecrets(manifest, {
+            ...secretCheckpoint(secrets, workerSecretUpdateIntent),
+            databaseClaimState: 'claimed',
+          });
+        } catch (error) {
+          const latest = readPendingInstallationSecrets(manifest) ?? {};
+          secrets = {
+            ...secrets,
+            appAccessSetupJson: latest.appAccessSetupJson || secrets.appAccessSetupJson,
+            authenticationPreparation: Object.fromEntries(
+              Object.entries(latest).filter(([key]) => isPlatformAuthenticationPreparationKey(key)),
+            ),
+          };
+          throw error;
+        }
+      }
+      if (!secrets.appAccessSetupJson) {
+        throw new Error(
+          'platform: Restore the encrypted app access setup checkpoint before resuming.',
+        );
+      }
+      if (!secrets.appAccessSetupToken) {
+        if (
+          manifest.resources.some(
+            (resource) => resource.key === 'api-worker' && resource.state === 'ready',
+          )
+        ) {
+          throw new Error(
+            'platform: Restore the encrypted app access setup authority before resuming.',
+          );
+        }
+        secrets = { ...secrets, appAccessSetupToken: randomBytes(32).toString('hex') };
+        writePendingInstallationSecrets(manifest, {
+          ...secretCheckpoint(secrets, workerSecretUpdateIntent),
+          databaseClaimState: 'claimed',
+        });
+      }
+    }
     if (plan.deployment.authentication.accessProtection) {
       const protection = liveAuthentication
         ? liveAuthentication.protection
@@ -1705,6 +1795,57 @@ export async function installPlatform(
         protection,
         checkpoint: secretCheckpoint(secrets, workerSecretUpdateIntent),
       });
+    }
+    if (
+      plan.deployment.authentication.accessProtection ||
+      (appAccessSetupRequired &&
+        secrets.appAccessSetupJson &&
+        JSON.parse(secrets.appAccessSetupJson).managed === true)
+    ) {
+      dependencies.onProgress?.('Preparing Access for authenticated platform health checks');
+      try {
+        await (dependencies.prepareHealthAccess ?? ensurePlatformAccessHealthChecks)({
+          client: dependencies.client,
+          manifest,
+          plan,
+          checkpoint: secretCheckpoint(secrets, workerSecretUpdateIntent),
+          save: (accessHealthProvisioningJson) => {
+            secrets = { ...secrets, accessHealthProvisioningJson };
+            manifest = checkpointAuthenticationResources(manifest!, secrets, now());
+            writePendingInstallationSecrets(manifest, {
+              ...secretCheckpoint(secrets, workerSecretUpdateIntent),
+              databaseClaimState: 'claimed',
+            });
+            writeInstallationManifest(manifest);
+          },
+        });
+      } catch (error) {
+        if (
+          appAccessSetupRequired &&
+          secrets.appAccessSetupJson &&
+          JSON.parse(secrets.appAccessSetupJson).managed &&
+          error instanceof PlatformCloudflareApiError &&
+          [401, 403].includes(error.status)
+        ) {
+          secrets = {
+            ...secrets,
+            authenticationPreparation: {
+              ...secrets.authenticationPreparation,
+              appAccessTokenRejected: 'true',
+            },
+          };
+          writePendingInstallationSecrets(
+            manifest,
+            secretCheckpoint(secrets, workerSecretUpdateIntent),
+          );
+          throw new PlatformAppAccessCredentialError(
+            'platform: App access token rejected while preparing health checks. Resume installation to provide a replacement.',
+          );
+        }
+        throw error;
+      } finally {
+        await releaseDatabaseLock.checkpoint?.(manifest);
+      }
     }
 
     // Establish the durable installation checkpoint before creating any
@@ -1930,7 +2071,9 @@ export async function installPlatform(
       manifest.usageProtocolVersion !== targetUsageProtocolVersion ||
       authenticationProtocolTransition ||
       shouldBootstrapSharedEmail ||
-      requiresSandboxDrain;
+      requiresSandboxDrain ||
+      (!!plan.deployment.appAccess &&
+        !manifest.steps.some((step) => step.key === 'app-access-initialized:v1'));
     if (requiresTrafficGuard) {
       await dependencies.client.putKvValue(
         plan.account.id,
@@ -1956,6 +2099,7 @@ export async function installPlatform(
     }
     const configInput = {
       authenticationDatabaseUncached: true,
+      proxyHealthBinding: true,
       accountId: plan.account.id,
       apiUrl: plan.apiUrl,
       deployment: plan.deployment,
@@ -1979,6 +2123,12 @@ export async function installPlatform(
             runtimeApiAssetsDirectory: join(runtimeDirectory, PLATFORM_ADMIN_ASSETS_DIRECTORY),
           }
         : {}),
+    };
+    // Preparation can generate new setup credentials. Snapshot only after all
+    // preparation has completed so the deployed API can verify the handoff.
+    const workerDeploymentSecrets: PlatformInstallationSecrets = {
+      ...secrets,
+      workerSecretUpdates: workerSecretUpdateIntent?.updates ?? {},
     };
     const requiresStagedCommit = !preserveDisabled && requiresTrafficGuard;
     const enabledConfigs = createPlatformWorkerConfigs({
@@ -2448,6 +2598,47 @@ export async function installPlatform(
       writeInstallationManifest(manifest);
       await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
     }
+    if (
+      plan.deployment.appAccess &&
+      !manifest.steps.some((step) => step.key === 'app-access-initialized:v1')
+    ) {
+      dependencies.onProgress?.('Configuring and verifying deployed-app access');
+      try {
+        await (dependencies.initializeAppAccess ?? initializeInstalledAppAccess)({
+          apiUrl: plan.apiUrl,
+          installationId: manifest.id,
+          probeToken: createPlatformHealthProbeToken(manifest.ownershipNonce),
+          setupJson: secrets.appAccessSetupJson!,
+          setupToken: secrets.appAccessSetupToken!,
+        });
+      } catch (error) {
+        if (error instanceof PlatformAppAccessCredentialError) {
+          secrets = {
+            ...secrets,
+            authenticationPreparation: {
+              ...secrets.authenticationPreparation,
+              appAccessTokenRejected: 'true',
+            },
+          };
+          writePendingInstallationSecrets(
+            manifest,
+            secretCheckpoint(secrets, workerSecretUpdateIntent),
+          );
+        }
+        throw error;
+      }
+      manifest = recordInstallationStep(
+        manifest,
+        {
+          key: 'app-access-initialized:v1',
+          completedAt: now(),
+          resultHash: hash(secrets.appAccessSetupJson!),
+        },
+        now(),
+      );
+      writeInstallationManifest(manifest);
+      await writeRemoteInstallationCheckpoint(dependencies.client, plan, manifest);
+    }
     dependencies.onProgress?.('Verifying platform health');
     const emailGatewayUrl =
       hasEmailGatewayArtifact && plan.deployment.capabilities.email
@@ -2459,6 +2650,7 @@ export async function installPlatform(
     }
     const healthCheckContext: PlatformHealthCheckContext = {
       accountName: plan.account.name,
+      ...(plan.deployment.authentication.accessProtection ? { accessProtected: true } : {}),
       workers: [
         plan.deployment.resources.apiWorker,
         plan.deployment.resources.proxyWorker,
@@ -2836,7 +3028,11 @@ function checkpointAuthenticationResources(
   secrets: PlatformInstallationSecrets,
   updatedAt: string,
 ): PlatformInstallationManifest {
-  return checkpointPlatformAccessResources(manifest, secrets.accessProvisioningJson, updatedAt);
+  return checkpointPlatformAccessResources(
+    checkpointPlatformAccessResources(manifest, secrets.accessProvisioningJson, updatedAt),
+    secrets.accessHealthProvisioningJson,
+    updatedAt,
+  );
 }
 
 async function writeR2OwnershipMarkerIfNeeded(
@@ -3333,6 +3529,7 @@ export function apiWorkerSecrets(
     JWT_SECRET: secrets.jwtSecret,
     PLATFORM_BOOTSTRAP_GITHUB_ID: secrets.bootstrapGitHubId,
     PLATFORM_AUTH_SETUP_TOKEN: secrets.authSetupToken ?? '',
+    PLATFORM_APP_ACCESS_SETUP_TOKEN: secrets.appAccessSetupToken ?? '',
     ...(secrets.projectSecretKeysJson && secrets.projectSecretActiveKeyVersion
       ? {
           PROJECT_SECRET_ACTIVE_KEY_VERSION: secrets.projectSecretActiveKeyVersion,
@@ -6403,6 +6600,7 @@ function errorMessage(error: unknown): string {
 
 export type PlatformHealthCheckContext = Readonly<{
   accountName: string;
+  accessProtected?: boolean;
   workers: ReadonlyArray<string>;
   resumeCommand?: string;
   emailGatewayUrl?: string;
@@ -6411,27 +6609,37 @@ export type PlatformHealthCheckContext = Readonly<{
 export class PlatformAccessBlockedError extends Error {
   constructor(url: string, context?: PlatformHealthCheckContext) {
     super(
-      [
-        'platform: Cloudflare Access blocked the platform health checks (Default-Deny, error 1050).',
-        `Blocked URL: ${url}`,
-        '',
-        'To make this test platform publicly reachable:',
-        '',
-        `1. In ${context ? `account ${JSON.stringify(context.accountName)}` : 'your Cloudflare account'}, open:`,
-        '   Zero Trust → Access controls → Applications → Create new application.',
-        '2. Choose Self-hosted. When adding destinations, choose Worker and select:',
-        `   ${context ? context.workers.join(', ') + '.' : "This installation's API, proxy, and dispatch Workers."}`,
-        '3. Add a policy: Action → Bypass; Include → Everyone.',
-        context?.resumeCommand
-          ? `4. Save the policy and application, then resume:\n\n   ${context.resumeCommand}`
-          : '4. Save the policy and application, then rerun your platform command.',
-        '',
-        'This removes Cloudflare Access protection for these Workers.',
-        'Void’s own authentication stays enabled. Keep account-wide Default-Deny on.',
-        '',
-        'For platforms that must remain Access-protected:',
-        'https://void.cloud/guide/platform/installation/maintenance#cloudflare-access',
-      ].join('\n'),
+      context?.accessProtected
+        ? [
+            'platform: Cloudflare Access blocked a protected platform health check (Default-Deny, error 1050).',
+            `Blocked URL: ${url}`,
+            'Keep employee Access protection and account-wide Default-Deny enabled.',
+            'The reserved dispatch /health endpoint uses a path-only Access exception and still requires Void’s private probe token.',
+            'Resume to verify the health exceptions and saved installer credentials.',
+            ...(context.resumeCommand ? [`Resume: ${context.resumeCommand}`] : []),
+            'https://void.cloud/guide/platform/installation/maintenance#cloudflare-access',
+          ].join('\n')
+        : [
+            'platform: Cloudflare Access blocked the platform health checks (Default-Deny, error 1050).',
+            `Blocked URL: ${url}`,
+            '',
+            'To make this test platform publicly reachable:',
+            '',
+            `1. In ${context ? `account ${JSON.stringify(context.accountName)}` : 'your Cloudflare account'}, open:`,
+            '   Zero Trust → Access controls → Applications → Create new application.',
+            '2. Choose Self-hosted. When adding destinations, choose Worker and select:',
+            `   ${context ? context.workers.join(', ') + '.' : "This installation's API, proxy, and dispatch Workers."}`,
+            '3. Add a policy: Action → Bypass; Include → Everyone.',
+            context?.resumeCommand
+              ? `4. Save the policy and application, then resume:\n\n   ${context.resumeCommand}`
+              : '4. Save the policy and application, then rerun your platform command.',
+            '',
+            'This removes Cloudflare Access protection for these Workers.',
+            'Void’s own authentication stays enabled. Keep account-wide Default-Deny on.',
+            '',
+            'For platforms that must remain Access-protected:',
+            'https://void.cloud/guide/platform/installation/maintenance#cloudflare-access',
+          ].join('\n'),
     );
   }
 }
@@ -6489,10 +6697,15 @@ export async function verifyPlatformHealth(
     context?.emailGatewayUrl ? request(`${context.emailGatewayUrl}/health`) : undefined,
   ]);
   if (!health.ok) {
-    throw await platformProbeFailure('Health check', apiUrl, health, context);
+    throw await platformProbeFailure('Health check', `${apiUrl}/health`, health, context);
   }
   if (!discovery.ok) {
-    throw await platformProbeFailure('Discovery check', apiUrl, discovery, context);
+    throw await platformProbeFailure(
+      'Discovery check',
+      `${apiUrl}/.well-known/void-platform`,
+      discovery,
+      context,
+    );
   }
   const body = (await discovery.json()) as {
     installationId?: unknown;
@@ -6511,16 +6724,21 @@ export async function verifyPlatformHealth(
     );
   }
   if (!proxy.ok) {
-    throw await platformProbeFailure('Proxy health check', proxyUrl, proxy, context);
+    throw await platformProbeFailure('Proxy health check', `${proxyUrl}/health`, proxy, context);
   }
   if (!dispatch.ok) {
-    throw await platformProbeFailure('Dispatch health check', dispatchUrl, dispatch, context);
+    throw await platformProbeFailure(
+      'Dispatch health check',
+      `${dispatchUrl}/health`,
+      dispatch,
+      context,
+    );
   }
   if (emailGateway) {
     if (!emailGateway.ok) {
       throw await platformProbeFailure(
         'Email gateway health check',
-        context!.emailGatewayUrl!,
+        `${context!.emailGatewayUrl!}/health`,
         emailGateway,
         context,
       );

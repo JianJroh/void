@@ -1,15 +1,32 @@
 import { randomBytes } from 'node:crypto';
-import { confirm, intro, isCancel, log, note, outro, password, select, text } from '@clack/prompts';
 import {
   createPlatformResourceNames,
   normalizeApplicationDomain,
   normalizeInstallationSlug,
   type PlatformInstallationManifest,
 } from '@void/platform';
-import { cliCommandName, cliTitle, createSpinner, pc } from './output.ts';
+import {
+  confirm,
+  isCancel,
+  log,
+  note,
+  outro,
+  password,
+  select,
+  text,
+} from '@voidzero-dev/vite-plus-prompts';
+import { resolve } from 'pathslash';
+import { cliCommandName, createSpinner, pc } from './output.ts';
+import {
+  selectInstallationAppAccess,
+  prepareInstallationAppAccess,
+} from './platform-app-access.ts';
 import type { PlatformArgs } from './platform-args.ts';
+import { readPlatformHyperdriveSelection } from './platform-auth-database.ts';
 import {
   assertPlatformOperatorCredentialCanApplyPlan,
+  platformOperatorNeedsManagementToken,
+  verifyPlatformManagementAccess,
   resolvePlatformCloudflareCredential,
   resolvePlatformCloudflareCredentialWithInput,
 } from './platform-auth.ts';
@@ -22,6 +39,7 @@ import {
 import {
   selectInstallationAuthentication,
   collectInstallationAuthentication,
+  platformManagementAccessForAuthentication,
 } from './platform-install-auth.ts';
 import {
   acquirePlatformDatabaseLifecycleLock,
@@ -49,6 +67,11 @@ import {
   writePendingInstallationSecrets,
 } from './platform-registry.ts';
 import {
+  listSavedPlatformInstallPlans,
+  savePlatformInstallChoices,
+  removeSavedPlatformInstallPlan,
+} from './platform-saved-plans.ts';
+import {
   completePlatformSetupDraft,
   isPlatformSetupDraft,
   isPlatformInstallInProgress,
@@ -58,6 +81,8 @@ import {
   formatPlatformInstallCommand,
   formatPlatformSetupPlan,
   openPlatformSetupPage,
+  platformManagementSetupPage,
+  platformInstallCommandArguments,
   platformSetupPages,
   platformSetupFieldHelp,
 } from './platform-setup.ts';
@@ -105,23 +130,23 @@ export function resolvePlatformInstallDatabaseUrl(
   return explicit || recorded;
 }
 
-export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<void> {
-  if (args.subcommand === 'domain') {
+export async function runPlatformLifecycleCommand(commandArgs: PlatformArgs): Promise<void> {
+  if (commandArgs.subcommand === 'domain') {
     const { runPlatformDomainCommand } = await import('./platform-domain.ts');
-    await runPlatformDomainCommand(args);
+    await runPlatformDomainCommand(commandArgs);
     return;
   }
-  if (args.subcommand === 'discover') {
+  if (commandArgs.subcommand === 'discover') {
     const credential = await resolvePlatformCloudflareCredential();
     const client = new PlatformCloudflareClient(credential.token);
     const accounts = await readAccounts(client);
-    const accountId = await selectAccount(accounts, args.account);
+    const accountId = await selectAccount(accounts, commandArgs.account);
     const { recoverPlatformInstallations } = await import('./platform-recovery.ts');
     const recovered = await recoverPlatformInstallations(
       client,
       accountId,
       undefined,
-      args.selector,
+      commandArgs.selector,
     );
     if (recovered.length === 0) {
       log.info(`No recoverable Void platform installations were found in ${accountId}.`);
@@ -134,21 +159,22 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
     }
     return;
   }
-  if (args.subcommand !== 'install') {
+  if (commandArgs.subcommand !== 'install') {
     const { runInstalledPlatformCommand } = await import('./platform-management.ts');
-    await runInstalledPlatformCommand(args);
+    await runInstalledPlatformCommand(commandArgs);
     return;
   }
 
-  const runtime = loadPlatformRuntime(args.runtime);
+  let args: Extract<PlatformArgs, { subcommand: 'install' }> = commandArgs;
+  let runtime = loadPlatformRuntime(args.runtime);
 
   assertNoninteractivePlatformMutationAcknowledged(args, process.stdin.isTTY === true);
 
   console.log();
-  intro(cliTitle('platform install'));
   let existing = args.resume ? resolveInstallationManifest(args.name) : null;
   let selectedInstall = false;
   let selectedDraft = false;
+  let installationName = args.name;
   const { input: installationSlug, credential: operatorCredential } =
     await resolvePlatformCloudflareCredentialWithInput(async () => {
       let requestedName = args.name;
@@ -183,7 +209,37 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
             !args.name ||
             manifest.deployment.installationSlug === normalizeInstallationSlug(args.name),
         );
-        if (installs.length > 0) {
+        const manifests = listInstallationManifests();
+        const savedPlans =
+          !args.applicationDomain &&
+          !args.workersDev &&
+          !args.zone &&
+          !args.displayName &&
+          !args.hyperdrive &&
+          !args.controlPlaneDomain &&
+          !args.noControlPlaneDomain &&
+          !args.authConfig &&
+          !args.loginMethods &&
+          !args.runtime &&
+          args.accessProtection === undefined &&
+          args.appAccess === undefined &&
+          !args.dedicatedZoneSpecified &&
+          args.dashboardUrl === undefined
+            ? listSavedPlatformInstallPlans().filter(
+                (saved) =>
+                  (!args.name || saved.args.name === normalizeInstallationSlug(args.name)) &&
+                  (!args.account ||
+                    saved.args.account === args.account ||
+                    saved.accountName.toLowerCase() === args.account.toLowerCase()) &&
+                  !manifests.some(
+                    (manifest) =>
+                      manifest.status !== 'uninstalled' &&
+                      manifest.account.id === saved.args.account &&
+                      manifest.deployment.installationSlug === saved.args.name,
+                  ),
+              )
+            : [];
+        if (installs.length > 0 || savedPlans.length > 0) {
           const choice = await select({
             message: 'Continue a previous platform install?',
             options: [
@@ -191,6 +247,11 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
                 value: install.id,
                 label: `Continue setup for ${install.deployment.displayName} (${install.deployment.installationSlug})`,
                 hint: install.account.name,
+              })),
+              ...savedPlans.map((saved) => ({
+                value: `plan:${saved.id}`,
+                label: `Use saved plan for ${saved.args.displayName} (${saved.args.name})`,
+                hint: `${saved.accountName} · ${saved.args.workersDev ? 'workers.dev' : saved.args.applicationDomain}`,
               })),
               { value: 'new', label: 'Start a new platform install' },
             ],
@@ -201,6 +262,15 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
           if (choice === 'new') {
             // Do not let --name silently reselect the draft the user just declined.
             requestedName = '';
+          } else if (choice.startsWith('plan:')) {
+            const saved = savedPlans.find((plan) => `plan:${plan.id}` === choice);
+            if (!saved) {
+              throw new Error('platform: The selected plan is no longer available.');
+            }
+            args = { ...saved.args, plan: args.plan, yes: args.yes };
+            runtime = loadPlatformRuntime(args.runtime);
+            installationName = args.name;
+            requestedName = args.name;
           } else {
             const selected = installs.find((install) => install.id === choice);
             if (!selected) {
@@ -264,6 +334,7 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
           continue;
         }
         assertNewNameAvailable(slug);
+        installationName = name.trim();
         return slug;
       }
       if (existing.endpoints.apiUrl && !readPendingInstallationSecrets(existing)) {
@@ -327,7 +398,8 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
     (workersDev
       ? ''
       : normalizeApplicationDomain(
-          args.applicationDomain || (await promptText('Application base domain:', 'example.app')),
+          args.applicationDomain ||
+            (await promptText('Application base domain:', { placeholder: 'example.com' })),
         ));
   const zoneName =
     recorded?.application.zoneName ??
@@ -338,12 +410,17 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
         ));
   const displayName =
     recorded?.displayName ??
-    (args.displayName || (await promptText('Platform display name:', `${installationSlug} Void`)));
-  const controlPlaneDomain = recorded
+    (args.displayName ||
+      (await promptText('Platform display name:', `${installationName || installationSlug} Void`)));
+  let controlPlaneDomain = recorded
     ? (recorded.controlPlane.apiHostname ?? '')
     : args.controlPlaneDomain ||
       (process.stdin.isTTY && !args.noControlPlaneDomain
-        ? await promptText('Custom API hostname. Leave empty for workers.dev:', '', true)
+        ? await promptText(
+            'Where do you want to host the Void Platform API? Leave empty for a workers.dev fallback.',
+            { placeholder: applicationDomain || 'platform.example.com' },
+            true,
+          )
         : '');
   let dedicatedZone = recorded?.application.dedicatedZone ?? args.dedicatedZone;
   if (
@@ -396,123 +473,6 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
     }
     const checkpoint = existing ? readPendingInstallationSecrets(existing) : null;
     const databaseUrl = resolvePlatformInstallDatabaseUrl(checkpoint, existing);
-    const externalHyperdriveId = process.env.VOID_PLATFORM_HYPERDRIVE_ID?.trim() || '';
-    const externalHyperdriveHost = process.env.VOID_PLATFORM_HYPERDRIVE_ORIGIN_HOST?.trim() || '';
-    const externalHyperdriveUser = process.env.VOID_PLATFORM_HYPERDRIVE_ORIGIN_USER?.trim() || '';
-    if (
-      [externalHyperdriveId, externalHyperdriveHost, externalHyperdriveUser].some(Boolean) &&
-      ![externalHyperdriveId, externalHyperdriveHost, externalHyperdriveUser].every(Boolean)
-    ) {
-      throw new Error(
-        'platform: VOID_PLATFORM_HYPERDRIVE_ID, VOID_PLATFORM_HYPERDRIVE_ORIGIN_HOST, and VOID_PLATFORM_HYPERDRIVE_ORIGIN_USER must be set together.',
-      );
-    }
-    let externalHyperdrive: PlatformExternalHyperdrive | undefined = externalHyperdriveId
-      ? {
-          id: externalHyperdriveId,
-          host: externalHyperdriveHost,
-          user: externalHyperdriveUser,
-        }
-      : undefined;
-    if (args.hyperdrive && externalHyperdrive && args.hyperdrive !== externalHyperdrive.id) {
-      throw new Error('platform: --hyperdrive conflicts with VOID_PLATFORM_HYPERDRIVE_ID.');
-    }
-    if (
-      !externalHyperdrive &&
-      args.hyperdrive !== 'create' &&
-      (process.stdin.isTTY || args.hyperdrive) &&
-      (!existing || isPlatformSetupDraft(existing)) &&
-      !existing?.resources.some((resource) => resource.key === 'hyperdrive')
-    ) {
-      const suggestedName =
-        existing?.deployment.resources.hyperdrive ??
-        createPlatformResourceNames(installationSlug).hyperdrive;
-      const configurations = await client.listHyperdriveConfigs(accountId);
-      const suggestedNameAvailable = !configurations.some(
-        (resource) => resource.name === suggestedName,
-      );
-      const choice = args.hyperdrive
-        ? 'existing'
-        : await select({
-            message: 'How should Void set up Hyperdrive?',
-            options: [
-              ...(configurations.length > 0
-                ? [{ value: 'existing', label: 'Use an existing Hyperdrive' }]
-                : []),
-              ...(suggestedNameAvailable
-                ? [{ value: 'create', label: 'Let Void create Hyperdrive', hint: 'recommended' }]
-                : []),
-              { value: 'setup', label: 'Set up a separately managed Hyperdrive' },
-            ],
-          });
-      if (isCancel(choice)) {
-        throw new Error('platform: Cancelled.');
-      }
-      if (choice === 'setup') {
-        note(
-          `Create a Hyperdrive in account ${accountId} with any unused name${suggestedNameAvailable ? ` such as ${suggestedName}` : ''}. Point it at the same dedicated PostgreSQL database you will give Void, use a runtime database user, and disable SQL result caching. If your organization manages Hyperdrive, ask its administrator to create it. Then rerun this command and select it from the list.\nSetup: https://developers.cloudflare.com/hyperdrive/get-started/`,
-          'Set up Hyperdrive first',
-        );
-        outro('No Cloudflare or local installation state was changed.');
-        return;
-      }
-      if (choice === 'existing') {
-        const selectedId =
-          args.hyperdrive ??
-          (await select({
-            message: 'Which Hyperdrive should Void use?',
-            options: [...configurations]
-              .sort(
-                (a, b) =>
-                  Number(b.name === suggestedName) - Number(a.name === suggestedName) ||
-                  a.name.localeCompare(b.name) ||
-                  a.id.localeCompare(b.id),
-              )
-              .map((resource) => ({
-                value: resource.id,
-                label: resource.name,
-                hint: resource.name === suggestedName ? `suggested · ${resource.id}` : resource.id,
-              })),
-          }));
-        if (isCancel(selectedId)) {
-          throw new Error('platform: Cancelled.');
-        }
-        const selected = configurations.find((resource) => resource.id === selectedId);
-        if (!selected) {
-          throw new Error('platform: The selected Hyperdrive is no longer available.');
-        }
-        const live = await client.getHyperdriveConfig(accountId, selected.id);
-        if (live.id !== selected.id || live.name !== selected.name || !live.origin.user) {
-          throw new Error(
-            `platform: Could not verify the database user for existing Hyperdrive ${selected.name}.`,
-          );
-        }
-        note(
-          `Database: ${live.origin.database}\nHost: ${live.origin.host}\nPort: ${live.origin.port}\nUser: ${live.origin.user}\nSQL result caching: ${live.cachingDisabled ? 'disabled' : 'enabled'}`,
-          `Existing Hyperdrive ${live.name}`,
-        );
-        if (!live.cachingDisabled) {
-          throw new Error(
-            `platform: Disable SQL result caching on existing Hyperdrive ${live.name} before installing.`,
-          );
-        }
-        const confirmed = args.hyperdrive
-          ? true
-          : await confirm({
-              message: `Use ${live.name} for this platform?`,
-              initialValue: true,
-            });
-        if (isCancel(confirmed) || !confirmed) {
-          throw new Error('platform: Cancelled.');
-        }
-        externalHyperdrive = {
-          id: live.id,
-          name: live.name,
-          host: live.origin.host,
-          user: live.origin.user,
-        };
-      }
-    }
     let authoritativeProvisionIntents = false;
     if (existing && !isPlatformSetupDraft(existing)) {
       if (!databaseUrl) {
@@ -543,12 +503,210 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
         }
       }
     }
+    const savedHyperdrive = readPlatformHyperdriveSelection(checkpoint);
+    const requestedHyperdriveId = args.hyperdrive || savedHyperdrive?.id;
+    const recordedHyperdrive = existing?.resources.find(
+      (resource) => resource.key === 'hyperdrive',
+    );
+    if (
+      (savedHyperdrive && requestedHyperdriveId !== savedHyperdrive.id) ||
+      (recordedHyperdrive &&
+        requestedHyperdriveId &&
+        (requestedHyperdriveId === 'create'
+          ? recordedHyperdrive.ownership === 'adopted'
+          : recordedHyperdrive.id !== requestedHyperdriveId)) ||
+      (savedHyperdrive &&
+        recordedHyperdrive &&
+        (recordedHyperdrive.ownership !== 'adopted' ||
+          recordedHyperdrive.id !== savedHyperdrive.id))
+    ) {
+      throw new Error(
+        'platform: The selected Hyperdrive differs from the saved installation. Resume with its original Hyperdrive.',
+      );
+    }
+    const externalHyperdriveId = process.env.VOID_PLATFORM_HYPERDRIVE_ID?.trim() || '';
+    const externalHyperdriveHost = process.env.VOID_PLATFORM_HYPERDRIVE_ORIGIN_HOST?.trim() || '';
+    const externalHyperdriveUser = process.env.VOID_PLATFORM_HYPERDRIVE_ORIGIN_USER?.trim() || '';
+    if (
+      [externalHyperdriveId, externalHyperdriveHost, externalHyperdriveUser].some(Boolean) &&
+      ![externalHyperdriveId, externalHyperdriveHost, externalHyperdriveUser].every(Boolean)
+    ) {
+      throw new Error(
+        'platform: VOID_PLATFORM_HYPERDRIVE_ID, VOID_PLATFORM_HYPERDRIVE_ORIGIN_HOST, and VOID_PLATFORM_HYPERDRIVE_ORIGIN_USER must be set together.',
+      );
+    }
+    let externalHyperdrive: PlatformExternalHyperdrive | undefined = externalHyperdriveId
+      ? {
+          id: externalHyperdriveId,
+          host: externalHyperdriveHost,
+          user: externalHyperdriveUser,
+        }
+      : undefined;
+    if (
+      requestedHyperdriveId &&
+      externalHyperdrive &&
+      requestedHyperdriveId !== externalHyperdrive.id
+    ) {
+      throw new Error('platform: --hyperdrive conflicts with VOID_PLATFORM_HYPERDRIVE_ID.');
+    }
+    if (
+      savedHyperdrive &&
+      externalHyperdrive &&
+      (savedHyperdrive.host.toLowerCase() !== externalHyperdrive.host.toLowerCase() ||
+        savedHyperdrive.user !== externalHyperdrive.user)
+    ) {
+      throw new Error('platform: The Hyperdrive origin differs from the saved installation.');
+    }
+    if (savedHyperdrive) {
+      externalHyperdrive = recordedHyperdrive ? savedHyperdrive : undefined;
+    }
+    if (
+      !externalHyperdrive &&
+      requestedHyperdriveId !== 'create' &&
+      (process.stdin.isTTY || requestedHyperdriveId) &&
+      (!existing || isPlatformSetupDraft(existing) || requestedHyperdriveId) &&
+      !recordedHyperdrive
+    ) {
+      const suggestedName =
+        existing?.deployment.resources.hyperdrive ??
+        createPlatformResourceNames(installationSlug).hyperdrive;
+      const configurations = await client.listHyperdriveConfigs(accountId);
+      const suggestedNameAvailable = !configurations.some(
+        (resource) => resource.name === suggestedName,
+      );
+      const choice = requestedHyperdriveId
+        ? 'existing'
+        : await select({
+            message: 'How should Void set up Hyperdrive?',
+            options: [
+              ...(configurations.length > 0
+                ? [{ value: 'existing', label: 'Use an existing Hyperdrive' }]
+                : []),
+              ...(suggestedNameAvailable
+                ? [{ value: 'create', label: 'Let Void create Hyperdrive', hint: 'recommended' }]
+                : []),
+              { value: 'setup', label: 'Set up a separately managed Hyperdrive' },
+            ],
+          });
+      if (isCancel(choice)) {
+        throw new Error('platform: Cancelled.');
+      }
+      if (choice === 'setup') {
+        note(
+          `Create a Hyperdrive in account ${accountId} with any unused name${suggestedNameAvailable ? ` such as ${suggestedName}` : ''}. Point it at the same dedicated PostgreSQL database you will give Void, use a runtime database user, and disable SQL result caching. If your organization manages Hyperdrive, ask its administrator to create it. Then rerun this command and select it from the list.\nSetup: https://developers.cloudflare.com/hyperdrive/get-started/`,
+          pc.bold('Set up Hyperdrive first'),
+        );
+        outro('No Cloudflare or local installation state was changed.');
+        return;
+      }
+      if (choice === 'existing') {
+        const selectedId =
+          requestedHyperdriveId ??
+          (await select({
+            message: 'Which Hyperdrive should Void use?',
+            options: [...configurations]
+              .sort(
+                (a, b) =>
+                  Number(b.name === suggestedName) - Number(a.name === suggestedName) ||
+                  a.name.localeCompare(b.name) ||
+                  a.id.localeCompare(b.id),
+              )
+              .map((resource) => ({
+                value: resource.id,
+                label: resource.name,
+                hint: resource.name === suggestedName ? `suggested · ${resource.id}` : resource.id,
+              })),
+          }));
+        if (isCancel(selectedId)) {
+          throw new Error('platform: Cancelled.');
+        }
+        const selected = configurations.find((resource) => resource.id === selectedId);
+        if (!selected) {
+          throw new Error('platform: The selected Hyperdrive is no longer available.');
+        }
+        const live = await client.getHyperdriveConfig(accountId, selected.id);
+        if (live.id !== selected.id || live.name !== selected.name || !live.origin.user) {
+          throw new Error(
+            `platform: Could not verify the database user for existing Hyperdrive ${selected.name}.`,
+          );
+        }
+        if (
+          (savedHyperdrive &&
+            (live.origin.host !== savedHyperdrive.host.toLowerCase() ||
+              live.origin.user !== savedHyperdrive.user ||
+              (savedHyperdrive.name && live.name !== savedHyperdrive.name) ||
+              (savedHyperdrive.database && live.origin.database !== savedHyperdrive.database))) ||
+          (existing &&
+            !isPlatformSetupDraft(existing) &&
+            live.name !== existing.deployment.resources.hyperdrive)
+        ) {
+          throw new Error(
+            'platform: The Hyperdrive origin or name differs from the saved installation.',
+          );
+        }
+        if (!requestedHyperdriveId) {
+          note(
+            [
+              `${pc.bold('Database:')} ${live.origin.database}`,
+              `${pc.bold('Host:')} ${live.origin.host}`,
+              `${pc.bold('Port:')} ${live.origin.port ?? 'configured by Cloudflare Tunnel'}`,
+              `${pc.bold('User:')} ${live.origin.user}`,
+              `${pc.bold('SQL result caching:')} ${live.cachingDisabled ? 'disabled' : 'enabled'}`,
+            ].join('\n'),
+            pc.bold(`Existing Hyperdrive ${live.name}`),
+          );
+        }
+        if (!live.cachingDisabled) {
+          throw new Error(
+            `platform: Disable SQL result caching on existing Hyperdrive ${live.name} before installing.`,
+          );
+        }
+        externalHyperdrive = {
+          id: live.id,
+          name: live.name,
+          database: live.origin.database,
+          host: live.origin.host,
+          user: live.origin.user,
+        };
+      }
+    }
     const authenticationSelection = await selectInstallationAuthentication(
       args.authConfig,
       existing?.deployment.authentication,
       args,
     );
+    const appAccess = await selectInstallationAppAccess(
+      authenticationSelection,
+      existing?.deployment,
+      args.appAccess,
+    );
+    while (
+      !existing &&
+      process.stdin.isTTY &&
+      !args.controlPlaneDomain &&
+      appAccess &&
+      appAccess !== 'public' &&
+      controlPlaneDomain
+        .toLowerCase()
+        .replace(/\.$/, '')
+        .endsWith(`.${applicationDomain.toLowerCase()}`)
+    ) {
+      log.info(
+        'App Access covers subdomains. Use the domain apex or workers.dev for the platform API.',
+      );
+      controlPlaneDomain = await promptText(
+        'Platform API hostname. Leave empty for workers.dev:',
+        { placeholder: applicationDomain },
+        true,
+      );
+    }
+    if (appAccess && runtime.manifest.appAccessSetup !== 1) {
+      throw new Error(
+        'platform: This runtime does not support guided app access. Use the current packaged runtime.',
+      );
+    }
     const planInput = {
+      appAccess,
       authentication: authenticationSelection.authentication,
       accountId,
       applicationDomain,
@@ -567,63 +725,175 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
       zoneName,
       ...(workersDev ? { workersDev: true } : {}),
     };
-    let plan = await createPlatformInstallPlan(client, planInput, existing, {
+    const planOptions = {
       authoritativeProvisionIntents,
       allowUnverifiedAiGateway: true,
       includeEmailGateway: runtime.manifest.artifacts.emailGateway !== undefined,
       enableSandbox: runtime.manifest.safetyProtocols.sandboxDrain >= 3,
       deploymentExecution: runtime.manifest.deploymentExecution === 1,
-    });
+    };
+    let plan = await createPlatformInstallPlan(client, planInput, existing, planOptions);
+    const commandOptions = {
+      commandName: cliCommandName(),
+      accountId,
+      installationSlug,
+      displayName,
+      applicationDomain,
+      zoneName,
+      controlPlaneDomain,
+      ...(args.dashboardUrl !== undefined ? { dashboardUrl: args.dashboardUrl } : {}),
+      dedicatedZone,
+      workersDev,
+      authConfig: args.authConfig,
+      appAccess,
+      authentication: authenticationSelection.authentication,
+      hyperdrive:
+        !existing || isPlatformSetupDraft(existing) || (externalHyperdrive && !recordedHyperdrive)
+          ? (externalHyperdrive?.id ?? 'create')
+          : undefined,
+      runtime: args.runtime,
+      ...(existing ? { resumeId: existing.id } : {}),
+      yes: args.yes || process.stdin.isTTY !== true,
+    };
+    if (!existing) {
+      savePlatformInstallChoices(
+        platformInstallCommandArguments({
+          ...commandOptions,
+          runtime: args.runtime ? resolve(args.runtime) : '',
+          ...(args.authConfig ? { authConfig: resolve(args.authConfig) } : {}),
+          yes: false,
+        }).slice(2),
+        plan.account.name,
+      );
+    }
     note(
       formatPlatformInstallPlan(plan),
-      args.plan ? 'Read-only installation plan' : 'Installation plan',
+      pc.bold(args.plan ? 'Read-only installation plan' : 'Installation plan'),
     );
-    note(formatPlatformRuntime(runtime), 'Platform runtime');
+    note(formatPlatformRuntime(runtime), pc.bold('Platform runtime'));
+    const managementAccess = process.env.VOID_PLATFORM_ACCESS_SETUP_TOKEN
+      ? undefined
+      : platformManagementAccessForAuthentication(authenticationSelection, accountId, checkpoint);
+    const needsManagementToken = platformOperatorNeedsManagementToken(
+      operatorCredential,
+      plan,
+      managementAccess,
+    );
     if (args.plan) {
-      console.log(formatPlatformSetupPlan(plan));
-      outro('Plan complete. No installation changes were made.');
+      note(
+        formatPlatformSetupPlan(plan, {
+          managementToken: needsManagementToken,
+          managementAccess: !!managementAccess,
+        }),
+        pc.bold('Required Credentials'),
+      );
+      if (!existing) {
+        log.info('Plan saved locally for your next install.');
+      }
+      outro('Plan complete and ready to execute.');
       console.log(
-        `\n${pc.bold(pc.cyan(existing ? 'Next step: run this command to resume' : 'Next step: run this command to install'))}\n\n${pc.cyan(
-          formatPlatformInstallCommand({
-            commandName: cliCommandName(),
-            accountId,
-            installationSlug,
-            displayName,
-            applicationDomain,
-            zoneName,
-            controlPlaneDomain,
-            ...(args.dashboardUrl !== undefined ? { dashboardUrl: args.dashboardUrl } : {}),
-            dedicatedZone,
-            workersDev,
-            authConfig: args.authConfig,
-            authentication: authenticationSelection.authentication,
-            hyperdrive:
-              !existing || isPlatformSetupDraft(existing)
-                ? (externalHyperdrive?.id ?? 'create')
-                : undefined,
-            runtime: args.runtime,
-            ...(existing ? { resumeId: existing.id } : {}),
-            yes: args.yes || process.stdin.isTTY !== true,
-          }),
+        `\n${pc.bold(existing ? 'Next step: run this command to resume' : 'Next, run this command to install the platform')}\n\n${pc.blue(
+          formatPlatformInstallCommand(commandOptions),
         )}\n`,
       );
       return;
     }
-    assertPlatformOperatorCredentialCanApplyPlan(operatorCredential, plan);
+    if (!process.stdin.isTTY) {
+      assertPlatformOperatorCredentialCanApplyPlan(operatorCredential, plan, managementAccess);
+    }
     if (process.stdin.isTTY && !args.yes) {
-      const proceed = await confirm({ message: 'Apply this plan?', initialValue: false });
+      const proceed = await confirm({ message: 'Apply this plan?', initialValue: true });
       if (isCancel(proceed) || !proceed) {
         outro('No changes made.');
         return;
       }
     }
 
+    let managementApiToken =
+      operatorCredential.source === 'oauth' ? checkpoint?.managementApiToken || '' : '';
+    if (needsManagementToken || managementApiToken) {
+      let token = managementApiToken;
+      let openedManagementPage = false;
+      const forgetRejectedManagementToken = () => {
+        managementApiToken = '';
+        if (existing && checkpoint?.managementApiToken) {
+          delete checkpoint.managementApiToken;
+          writePendingInstallationSecrets(existing, checkpoint);
+        }
+        token = '';
+      };
+      while (true) {
+        if (!token) {
+          if (!openedManagementPage) {
+            openPlatformSetupPage(
+              platformManagementSetupPage(plan, { access: managementAccess ?? false }),
+            );
+            openedManagementPage = true;
+          }
+          token = (
+            await promptSecret('Paste management API token:', true, (value) =>
+              value.trim() ? undefined : 'A value is required.',
+            )
+          ).trim();
+        }
+        const management = new PlatformCloudflareClient(token, { apiBase: client.apiBaseUrl });
+        try {
+          const authorizedAccounts = await management.listAccounts();
+          if (!authorizedAccounts.some((account) => account.id === accountId)) {
+            forgetRejectedManagementToken();
+            log.warn(
+              `This token cannot access ${plan.account.name}. Check its account scope and try again.`,
+            );
+            continue;
+          }
+          const verified = await createPlatformInstallPlan(
+            management,
+            planInput,
+            existing,
+            planOptions,
+          );
+          assertPlatformInstallPlanUnchanged(plan, verified, 'management API token');
+          if (managementAccess) {
+            await verifyPlatformManagementAccess(management, accountId, managementAccess);
+          }
+          client = management;
+          plan = verified;
+          managementApiToken = token;
+          break;
+        } catch (error) {
+          if (!isPlatformTokenAuthorizationError(error)) {
+            throw error;
+          }
+          forgetRejectedManagementToken();
+          log.warn(
+            'Cloudflare rejected this token. Check its permissions and account/zone scope, then paste a replacement.',
+          );
+        }
+      }
+    } else if (managementAccess) {
+      await verifyPlatformManagementAccess(client, accountId, managementAccess);
+    }
+
     if (!existing) {
       existing = savePlatformSetupDraft(plan, runtime.manifest.platformVersion);
     }
+    removeSavedPlatformInstallPlan({ ...args, account: accountId, name: installationSlug });
     const setupManifest = existing;
     const credentialSetup = isPlatformSetupDraft(existing);
     const values: Record<string, string> = { ...checkpoint };
+    if (managementAccess) {
+      // A verified management token replaces an older, separately collected Access token.
+      delete values.accessManagementToken;
+    }
+    if (managementApiToken) {
+      values.managementApiToken = managementApiToken;
+    }
+    if (externalHyperdrive) {
+      values.externalHyperdriveJson = JSON.stringify(externalHyperdrive);
+    }
+    if (managementApiToken || externalHyperdrive || managementAccess) {
+      writePendingInstallationSecrets(setupManifest, values);
+    }
     const saveValues = (updates: Record<string, string>) => {
       Object.assign(values, updates);
       if (credentialSetup) {
@@ -700,7 +970,7 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
         if (
           credentialSetup &&
           token === values.cloudflareApiToken &&
-          isRuntimeTokenAuthorizationError(
+          isPlatformTokenAuthorizationError(
             error,
             checkingRuntimePermissions ? undefined : '/ai-gateway/',
           )
@@ -918,6 +1188,26 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
             },
           }
         : {}),
+      ...(appAccess
+        ? {
+            prepareAppAccess: async () => {
+              progress?.stop('Preparing deployed-app access.');
+              progress = undefined;
+              const setupJson = await prepareInstallationAppAccess({
+                plan,
+                authentication: authenticationSelection,
+                client,
+                managementToken:
+                  values.managementApiToken ||
+                  (operatorCredential.source !== 'oauth' ? operatorCredential.token : undefined),
+                checkpoint: values,
+                save: saveAuthenticationValues,
+              });
+              progress = startProgress('Continuing platform installation');
+              return setupJson;
+            },
+          }
+        : {}),
       replanWorkers: async (manifest) =>
         (
           await createPlatformInstallPlan(client, planInput, manifest, {
@@ -958,7 +1248,7 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
         result.zoneNameServers.length > 0
           ? `Update the domain at your registrar to use:\n${result.zoneNameServers.join('\n')}\n\nThen rerun: void platform install --resume --name ${result.manifest.id}`
           : `Wait for ${zoneName} to become active, then rerun:\nvoid platform install --resume --name ${result.manifest.id}`,
-        'Waiting for nameservers',
+        pc.bold('Waiting for nameservers'),
       );
       outro(`Installation ${result.manifest.id} is safely checkpointed.`);
       return;
@@ -966,7 +1256,7 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
     if (result.waitingForSandboxDrain) {
       note(
         "The compatible candidate runtime is live in sandbox-drain maintenance mode and application traffic remains disabled. Preview bounded work with `void platform system sandbox-drain --plan`. Follow any returned `nextCursor` with `--cursor '<value>'`. Then apply with `void platform system sandbox-drain --yes` and rerun until it reports DB-backed `complete: true`. Rerun this install command afterward to enable traffic.",
-        'Waiting for managed Sandbox drain',
+        pc.bold('Waiting for managed Sandbox drain'),
       );
       outro(`Installation ${result.manifest.id} is safely checkpointed.`);
       return;
@@ -1010,7 +1300,7 @@ export async function runPlatformLifecycleCommand(args: PlatformArgs): Promise<v
   }
 }
 
-function isRuntimeTokenAuthorizationError(error: unknown, requestPathIncludes?: string): boolean {
+function isPlatformTokenAuthorizationError(error: unknown, requestPathIncludes?: string): boolean {
   for (let depth = 0; depth < 5 && error instanceof Error; depth++, error = error.cause) {
     if (
       error instanceof PlatformCloudflareApiError &&
@@ -1060,6 +1350,15 @@ export async function verifyPlatformAiGatewayPlan(
     }
     throw error;
   }
+  assertPlatformInstallPlanUnchanged(preview, verified, 'AI Gateway access');
+  return verified;
+}
+
+function assertPlatformInstallPlanUnchanged(
+  preview: Awaited<ReturnType<typeof createPlatformInstallPlan>>,
+  verified: Awaited<ReturnType<typeof createPlatformInstallPlan>>,
+  check: string,
+): void {
   const infrastructure = (plan: typeof preview) =>
     plan.actions
       .filter((action) => action.kind !== 'ai-gateway')
@@ -1070,10 +1369,9 @@ export async function verifyPlatformAiGatewayPlan(
     JSON.stringify(infrastructure(verified)) !== JSON.stringify(infrastructure(preview))
   ) {
     throw new Error(
-      'platform: Resources changed while checking AI Gateway access. Rerun the command to review the updated plan. No platform resources were created.',
+      `platform: Resources changed while checking ${check}. Rerun the command to review the updated plan. No platform resources were created.`,
     );
   }
-  return verified;
 }
 
 export function assertNoninteractivePlatformMutationAcknowledged(
@@ -1116,9 +1414,14 @@ async function selectAccount(
     const matches = accounts.filter(
       (account) => account.id === selector || account.name.toLowerCase() === selector.toLowerCase(),
     );
-    if (matches.length !== 1) {
+    if (matches.length === 0) {
       throw new Error(
-        `platform: Cloudflare account ${JSON.stringify(selector)} is ambiguous or unavailable.`,
+        `platform: Cloudflare account ${JSON.stringify(selector)} is unavailable through the current access token. Run ${pc.blue('void cloudflare status')} to see which accounts have access, and re-authenticate if necessary.`,
+      );
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `platform: Cloudflare account ${JSON.stringify(selector)} is ambiguous. Use --account <id> to select a specific account.`,
       );
     }
     return matches[0]!.id;
@@ -1157,11 +1460,14 @@ async function promptText(
     }
     throw new Error(`platform: ${message.replace(/:$/, '')} is required in non-interactive mode.`);
   }
+  const defaultValue = typeof value === 'string' ? value : undefined;
   const input = await text({
     message,
-    ...(typeof value === 'string' ? { initialValue: value } : value),
-    validate: (input) =>
-      input ? validate?.(input) : optional ? undefined : 'A value is required.',
+    ...(typeof value === 'string' ? { placeholder: value, defaultValue } : value),
+    validate: (input) => {
+      const candidate = input || defaultValue;
+      return candidate ? validate?.(candidate) : optional ? undefined : 'A value is required.';
+    },
   });
   if (isCancel(input) || typeof input === 'symbol') {
     throw new Error('platform: Cancelled.');

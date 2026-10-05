@@ -16,17 +16,22 @@ import {
   type IsolatedPlayground,
 } from '../../../../test/integration-helpers.ts';
 import type { ProjectRole } from '../../src/cli/client.ts';
+import { savePlatformConnection } from '../../src/cli/platform-registry.ts';
 import type { DetectedFramework } from '../../src/plugin-inference.ts';
+import { withPlatformDiscovery } from '../helpers/platform-discovery.ts';
 
-// @clack/prompts + the output-spinner wrapper are TTY-bound; noop them (same as
+// @voidzero-dev/vite-plus-prompts + the output-spinner wrapper are TTY-bound; noop them (same as
 // direct-r2-deploy.test.ts) so runDeploy's interactive UI doesn't render here.
 const noopSpinner = {
   start: vi.fn(),
   stop: vi.fn(),
   message: vi.fn(),
+  clear: vi.fn(),
 };
-vi.mock('@clack/prompts', async () => {
-  const actual = await vi.importActual<typeof import('@clack/prompts')>('@clack/prompts');
+vi.mock('@voidzero-dev/vite-plus-prompts', async () => {
+  const actual = await vi.importActual<typeof import('@voidzero-dev/vite-plus-prompts')>(
+    '@voidzero-dev/vite-plus-prompts',
+  );
   return {
     ...actual,
     intro: vi.fn(),
@@ -111,7 +116,13 @@ function installPlatformMocks(role: ProjectRole = 'owner'): Captured {
     const reqInit = init ?? {};
     const method = (reqInit.method ?? 'GET').toUpperCase();
 
-    if (url.endsWith('/projects/proj_named_layouts_test') && method === 'GET') {
+    if (url.endsWith('/projects/resolve?slug=named-layouts-test') && method === 'GET') {
+      return json({ project: null });
+    }
+    if (
+      (url.endsWith('/projects/proj_named_layouts_test') && method === 'GET') ||
+      (url.endsWith('/projects') && method === 'POST')
+    ) {
       return json({
         id: 'proj_named_layouts_test',
         user_id: 'user_owner',
@@ -176,7 +187,7 @@ function ndjson(events: Array<unknown>): Response {
   });
   return new Response(stream, {
     status: 200,
-    headers: { 'content-type': 'application/x-ndjson' },
+    headers: { 'content-type': 'application/x-ndjson', 'x-void-deployment-id': 'dep_test' },
   });
 }
 
@@ -209,7 +220,11 @@ describe('runFullDeploy emits manifest.pages (Void pages app, end-to-end)', () =
     mkdirSync(join(fixture, '.void'), { recursive: true });
     writeFileSync(
       projectJson,
-      JSON.stringify({ projectId: 'proj_named_layouts_test', slug: 'named-layouts-test' }),
+      JSON.stringify({
+        projectId: 'proj_named_layouts_test',
+        slug: 'named-layouts-test',
+        platformUrl: 'https://platform.example.test',
+      }),
     );
   }, 180_000);
 
@@ -232,7 +247,7 @@ describe('runFullDeploy emits manifest.pages (Void pages app, end-to-end)', () =
     mockDetectFramework.mockReset().mockReturnValue(undefined);
 
     originalFetch = globalThis.fetch;
-    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch;
+    globalThis.fetch = withPlatformDiscovery(fetchMock);
     fetchMock.mockReset();
     mockCollectPrerenderPaths.mockClear();
 
@@ -240,11 +255,23 @@ describe('runFullDeploy emits manifest.pages (Void pages app, end-to-end)', () =
     savedProject = process.env.VOID_PROJECT;
     // Explicit token bypasses getToken() + the GitHub-Actions OIDC branch.
     process.env.VOID_TOKEN = 'test-token-do-not-use';
+    vi.stubEnv('VOID_API_URL', 'https://platform.example.test');
+    vi.stubEnv('VOID_PLATFORM_REGISTRY_DIR', join(fixture, 'registry'));
+    savePlatformConnection({
+      accountId: null,
+      apiUrl: 'https://platform.example.test',
+      applicationDomain: 'apps.example.test',
+      displayName: 'Test platform',
+      installationId: null,
+      kind: 'connected',
+      proxyUrl: 'https://proxy.example.test',
+    });
     // Select the saved project; runDeploy verifies its current role through the API.
     delete process.env.VOID_PROJECT;
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     if (originalFetch) {
       globalThis.fetch = originalFetch;
     }
@@ -328,6 +355,37 @@ describe('runFullDeploy emits manifest.pages (Void pages app, end-to-end)', () =
     // the `isFrameworkMode ? undefined :` gate in assembleVoidManifest turns
     // this RED (pages becomes the populated array instead of undefined).
     expect(captured.finalizeBody!.manifest?.pages).toBeUndefined();
+  });
+
+  it('uses the alternate project for Worker packaging and prerendering while retaining the saved link', async () => {
+    const original = readFileSync(projectJson, 'utf8');
+    const saved = JSON.stringify({
+      projectId: 'project-on-original-platform',
+      slug: 'named-layouts-test',
+      platformUrl: 'https://original.example.test',
+      platform: 'void',
+    });
+    writeFileSync(projectJson, saved);
+    try {
+      const captured = installPlatformMocks();
+      await runDeploy(fixture, { projectSlug: 'named-layouts-test', skipBuild: true });
+      expect(readFileSync(projectJson, 'utf8')).toBe(saved);
+      expect(mockCollectPrerenderPaths).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: 'proj_named_layouts_test',
+          voidToken: 'scoped-prerender-token',
+        }),
+      );
+      expect(captured.finalizeBody?.manifest?.pages).toBeDefined();
+      const urls = fetchMock.mock.calls.map(([url]) => String(url));
+      expect(urls.every((url) => url.startsWith('https://platform.example.test/'))).toBe(true);
+      expect(urls.some((url) => url.includes('project-on-original-platform'))).toBe(false);
+      expect(urls).toContain(
+        'https://platform.example.test/projects/proj_named_layouts_test/deploy',
+      );
+    } finally {
+      writeFileSync(projectJson, original);
+    }
   });
 
   it('rejects a saved reader project before building or uploading', async () => {

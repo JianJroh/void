@@ -1,16 +1,23 @@
 import { readFileSync } from 'node:fs';
-import { intro, outro, log, note, cancel, isCancel, password, confirm } from '@clack/prompts';
+import {
+  outro,
+  log,
+  note,
+  cancel,
+  isCancel,
+  password,
+  confirm,
+} from '@voidzero-dev/vite-plus-prompts';
 import { getToken } from './auth.ts';
 import { PlatformClient } from './client.ts';
 import { validateSecretValues } from './env-validation.ts';
-import { cliTitle } from './output.ts';
+import { formatCount } from './output.ts';
 import { readDeploymentPlatform, readProjectConfig } from './project.ts';
 import { getRequestedProjectSlug, resolveProjectBySlug } from './resolve-project.ts';
 import type { SecretArgs } from './secret-args.ts';
 
 export async function runSecretCommand(root: string, args: SecretArgs): Promise<void> {
   console.log();
-  intro(cliTitle('secret'));
 
   const platform = readDeploymentPlatform(root);
   if (platform === 'cloudflare') {
@@ -53,7 +60,7 @@ export async function runSecretCommand(root: string, args: SecretArgs): Promise<
       return;
     }
     note(secrets.map((s) => `  ${s.name}`).join('\n'), 'Secrets');
-    outro(`${secrets.length} secret(s)`);
+    outro(formatCount(secrets.length, 'secret'));
     return;
   }
 
@@ -75,13 +82,13 @@ export async function runSecretCommand(root: string, args: SecretArgs): Promise<
 
     await validateSecretValues(root, secrets);
 
-    log.info(`Found ${secrets.length} secret(s):`);
+    log.info(`Found ${formatCount(secrets.length, 'secret')}:`);
     for (const s of secrets) {
       log.message(`  ${s.name}`);
     }
 
     const proceed = await confirm({
-      message: `This will overwrite ${secrets.length} secret(s) in the remote environment. Continue?`,
+      message: `This will overwrite ${formatCount(secrets.length, 'secret')} in the remote environment. Continue?`,
     });
     if (isCancel(proceed) || !proceed) {
       cancel('Secret sync cancelled.');
@@ -92,7 +99,7 @@ export async function runSecretCommand(root: string, args: SecretArgs): Promise<
       await client.setSecret(projectId, s.name, s.value);
       log.success(`Set ${s.name}`);
     }
-    outro(`Synced ${secrets.length} secret(s).`);
+    outro(`Synced ${formatCount(secrets.length, 'secret')}.`);
     return;
   }
 
@@ -122,7 +129,7 @@ async function runCloudflareSecretCommand(root: string, args: SecretArgs): Promi
       return;
     }
     note(secrets.map((name) => `  ${name}`).join('\n'), 'Secrets');
-    outro(`${secrets.length} secret(s)`);
+    outro(formatCount(secrets.length, 'secret'));
     return;
   }
   if (args.action === 'put') {
@@ -140,19 +147,19 @@ async function runCloudflareSecretCommand(root: string, args: SecretArgs): Promi
       return;
     }
     await validateSecretValues(root, secrets);
-    log.info(`Found ${secrets.length} secret(s):`);
+    log.info(`Found ${formatCount(secrets.length, 'secret')}:`);
     for (const secret of secrets) {
       log.message(`  ${secret.name}`);
     }
     const proceed = await confirm({
-      message: `This will overwrite ${secrets.length} secret(s) in the Cloudflare Worker. Continue?`,
+      message: `This will overwrite ${formatCount(secrets.length, 'secret')} in the Cloudflare Worker. Continue?`,
     });
     if (isCancel(proceed) || !proceed) {
       cancel('Secret sync cancelled.');
       process.exit(0);
     }
     await syncCloudflareSecrets(context, secrets);
-    outro(`Synced ${secrets.length} secret(s).`);
+    outro(`Synced ${formatCount(secrets.length, 'secret')}.`);
     return;
   }
   await deleteCloudflareSecret(context, args.name);

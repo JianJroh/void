@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { log } from '@clack/prompts';
+import { log } from '@voidzero-dev/vite-plus-prompts';
 import { getApiUrl, getToken, openBrowser, runPlatformLogin, savePlatformToken } from './auth.ts';
 import { PlatformClient } from './client.ts';
 import { selectPlatformLoginMethod } from './login.ts';
@@ -17,9 +17,6 @@ export async function runAuthLink(root: string, connectionId?: string): Promise<
   }
   const target = await selectPlatformLoginMethod(platform, connectionId);
   const existing = await new PlatformClient(token, apiUrl).whoami();
-  if (!existing.id) {
-    throw new Error('auth: This platform does not support account linking.');
-  }
   log.info(`Sign in again to ${existing.login} using an already linked login method.`);
   const source = await selectPlatformLoginMethod(platform);
   const freshToken = await runPlatformLogin(apiUrl, source.id, (url) =>

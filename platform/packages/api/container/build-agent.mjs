@@ -19,6 +19,7 @@
  *                       Scrubbed from the install + any untrusted child env and
  *                       re-injected ONLY for the trusted `void deploy` spawn.
  *   VOID_API_URL        https://api.void.cloud (or staging)
+ *   VOID_PROXY_URL      Explicit platform resource proxy used for prerendering
  *   VOID_PROJECT        project slug passed to `void deploy --project`
  *   CF_ACCESS_CLIENT_ID     staging CF Access service-token id (staging builds
  *   CF_ACCESS_CLIENT_SECRET only). Like VOID_TOKEN: scrubbed from untrusted
@@ -1960,6 +1961,7 @@ export const SCRUBBED_ENV_VARS = [
   'VOID_TOKEN',
   'CF_ACCESS_CLIENT_ID',
   'CF_ACCESS_CLIENT_SECRET',
+  'VOID_ACCESS_CREDENTIALS',
 ];
 
 /**
@@ -2113,7 +2115,8 @@ export async function runBuild(deps = {}) {
     const cfAccessClientSecret = process.env.CF_ACCESS_CLIENT_SECRET;
     delete process.env.CF_ACCESS_CLIENT_ID;
     delete process.env.CF_ACCESS_CLIENT_SECRET;
-    requireEnv('VOID_API_URL');
+    const apiUrl = requireEnv('VOID_API_URL');
+    const proxyUrl = process.env.VOID_PROXY_URL;
     const project = requireEnv('VOID_PROJECT');
 
     if (cancelled) {
@@ -2239,11 +2242,49 @@ export async function runBuild(deps = {}) {
         agentLog(`no local void CLI found; falling back to npx void@${fallbackVersion}`);
       }
     }
+    // Register the explicitly selected platform in this fresh build environment.
+    const connectArgs = [
+      ...deployArgs.slice(0, deployArgs.indexOf('deploy')),
+      'connect',
+      apiUrl,
+      '--no-login',
+    ];
+    const connectCode = await run(deployCmd, connectArgs, {
+      env: sanitizeChildEnv(process.env, {
+        ...nonInteractiveEnv(),
+        ...builderCacheEnv(),
+        CF_ACCESS_CLIENT_ID: cfAccessClientId,
+        CF_ACCESS_CLIENT_SECRET: cfAccessClientSecret,
+        VOID_ACCESS_ORIGIN: apiUrl,
+      }),
+    });
+    if (connectCode !== 0) {
+      agentLog(`void connect exited with code ${connectCode}`);
+      return connectCode;
+    }
+    // The API and resource proxy are independently protected origins. Scope
+    // the platform-provided pair explicitly; never infer a proxy hostname.
+    const accessCredentials =
+      cfAccessClientId && cfAccessClientSecret
+        ? JSON.stringify(
+            Object.fromEntries(
+              [apiUrl, proxyUrl].filter(Boolean).map((url) => [
+                new URL(url).origin,
+                {
+                  CF_ACCESS_CLIENT_ID: cfAccessClientId,
+                  CF_ACCESS_CLIENT_SECRET: cfAccessClientSecret,
+                },
+              ]),
+            ),
+          )
+        : undefined;
     const deployCode = await run(deployCmd, deployArgs, {
       env: sanitizeChildEnv(process.env, {
         ...nonInteractiveEnv(),
         ...builderCacheEnv(),
         VOID_TOKEN: voidToken,
+        VOID_ACCESS_ORIGIN: apiUrl,
+        VOID_ACCESS_CREDENTIALS: accessCredentials,
         // Re-inject the staging CF Access service token (undefined off staging,
         // which sanitizeChildEnv drops) so `void deploy` can pass CF Access.
         CF_ACCESS_CLIENT_ID: cfAccessClientId,
