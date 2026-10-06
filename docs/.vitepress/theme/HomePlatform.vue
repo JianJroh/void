@@ -1,6 +1,9 @@
 <script setup>
+import RiveAnimation from '@components/shared/RiveAnimation.vue';
 import { Icon } from '@iconify/vue';
 import { useData } from 'vitepress';
+import controlPlaneAnimation from './assets/animations/640_x_320_void_platform_light.riv';
+import HomePlatformResourceCode from './HomePlatformResourceCode.vue';
 
 const { frontmatter } = useData();
 </script>
@@ -31,9 +34,27 @@ const { frontmatter } = useData();
         </a>
       </div>
       <div
-        class="bg-white border-t border-stroke md:border-t-0 min-h-[22rem] sm:min-h-[30rem] min-w-0 p-5 sm:p-10 flex items-center justify-center"
+        class="border-t border-stroke md:border-t-0 min-h-[22rem] sm:min-h-[30rem] min-w-0 flex items-center justify-center"
+        :class="
+          feature.visual === 'resources' ? 'platform-resources-background' : 'bg-white p-5 sm:p-10'
+        "
       >
+        <HomePlatformResourceCode v-if="feature.visual === 'resources'" />
+        <div
+          v-else-if="feature.visual === 'rive'"
+          class="platform-feature-animation"
+          role="img"
+          :aria-label="feature.image_alt"
+        >
+          <RiveAnimation
+            :desktop-src="controlPlaneAnimation"
+            :desktop-width="640"
+            :desktop-height="320"
+            canvas-class="w-full h-auto"
+          />
+        </div>
         <img
+          v-else
           :src="feature.image"
           :alt="feature.image_alt"
           width="640"
@@ -50,6 +71,16 @@ const { frontmatter } = useData();
 .platform-features {
   background: var(--color-white);
   color: var(--color-primary);
+}
+
+.platform-feature-animation {
+  width: 100%;
+  max-width: 40rem;
+}
+
+.platform-resources-background {
+  background: var(--color-wine) url('./assets/backgrounds/viteplus.jpg') center / cover;
+  overflow: hidden;
 }
 
 .platform-features .checkmark-list li {

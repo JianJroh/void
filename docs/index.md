@@ -4,7 +4,7 @@ theme: dark
 
 hero:
   name: Void
-  text: Ship Vite Apps with Ease
+  text: Build with Vite. Deploy with Void.
   tagline: Void is a full-stack SDK, platform and CLI that unifies building & deploying apps
   actions:
     - theme: brand
@@ -50,7 +50,7 @@ features:
 platform_features:
   - id: platform-ai-coding
     iconify: lucide:bot
-    title: Secure Vibe Coding for All
+    title: Secure Vibe Coding for Your Team
     details: Let your team build and deploy with coding agents while admins retain control of Cloudflare access.
     highlights:
       - Keep Cloudflare credentials with your admin team
@@ -63,6 +63,7 @@ platform_features:
     image_alt: Placeholder image for AI coding and team deployments
   - id: platform-control-plane
     iconify: lucide:panels-top-left
+    visual: resources
     title: Control Plane for Managing Apps
     details: Manage users, projects, deployments, and platform health from the admin UI or CLI.
     highlights:
@@ -72,8 +73,7 @@ platform_features:
     guide:
       text: Platform administration
       link: /guide/platform-administration
-    image: /platform-feature-placeholder.svg
-    image_alt: Placeholder image for the Void Platform control plane
+    image_alt: List of Void platform commands for access, builds, invitations, and administration
   - id: platform-security
     iconify: lucide:shield-check
     title: Bring your Own Security
@@ -85,8 +85,8 @@ platform_features:
     guide:
       text: Configure platform access
       link: /guide/platform/administration/access
-    image: /platform-feature-placeholder.svg
-    image_alt: Placeholder image for authentication and platform security
+    visual: rive
+    image_alt: Animated illustration of self-hosted platform security
 footer_heading: Build with Vite. Deploy with Void.
 footer_subheading: Server code, resources, and deployment in one workflow.
 ---
