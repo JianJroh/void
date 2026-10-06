@@ -27,13 +27,40 @@ export default function Blog({ posts }: Props) {
   );
 }`,
   },
+  {
+    name: 'api/decide.ts',
+    source: `import { defineHandler } from 'void';
+import { ai } from 'void/ai';
+
+export const POST = defineHandler(async (c) => {
+  const { question } = await c.req.json();
+  return ai
+    .run('@cf/cloudflare/clef', {
+      model: 'clef',
+      state: {},
+      questions: {
+        decision: { type: 'noul', instructions: question },
+      },
+    })
+    .match({
+      ok: (result) => {
+        const probability = result.answers.decision.noul;
+        return c.json({
+          answer: probability >= 0.5 ? 'yes' : 'no',
+          probability,
+        });
+      },
+      limited: (limit) => limit.response(),
+    });
+});`,
+  },
 ].map((file) => ({ ...file, tokens: highlight(file.source) }));
 
 // A small display-only palette for these two snippets keeps a code highlighter
 // and its language grammars out of the homepage bundle.
 function highlight(source: string) {
   const pattern =
-    /(?<string>'[^'\n]*')|(?<keyword>\b(?:import|from|type|typeof|export|const|async|await|default|function|return)\b)|(?<type>\b(?:Props|InferProps)\b)|(?<function>\b(?:defineHandler|select|map|Blog)\b)/g;
+    /(?<comment>\/\/[^\n]*)|(?<string>'[^'\n]*')|(?<keyword>\b(?:import|from|type|typeof|export|const|async|await|default|function|return)\b)|(?<type>\b(?:Props|InferProps)\b)|(?<function>\b(?:defineHandler|select|map|Blog|run|match|json)\b)/g;
   const tokens: Array<{ text: string; tone?: string }> = [];
   let position = 0;
   for (const match of source.matchAll(pattern)) {
@@ -126,7 +153,8 @@ function highlight(source: string) {
 }
 
 .resource-code-panel {
-  overflow-x: auto;
+  height: 18rem;
+  overflow: auto;
   scrollbar-width: thin;
   scrollbar-color: #51475f #111111;
 }
@@ -153,6 +181,10 @@ function highlight(source: string) {
 
 .syntax-keyword {
   color: #b39aff;
+}
+
+.syntax-comment {
+  color: #777280;
 }
 
 .syntax-string {

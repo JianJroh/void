@@ -115,8 +115,10 @@ onBeforeUnmount(() => {
       <a href="/reference/cli" class="cli-wordmark" aria-label="Void CLI reference">
         <img src="/void-cli.svg" alt="" width="536" height="113" />
       </a>
-      <h2 id="cli-heading" class="text-white">From Your Terminal to the World</h2>
-      <p>Deploy your app, set up your platform, and roll back a release. All from your terminal.</p>
+      <h2 id="cli-heading" class="text-white">Deploy with One Command</h2>
+      <p>
+        Handle the full lifecycle of your project: building, deploying and managing your resources
+      </p>
     </div>
 
     <div ref="stage" class="wrapper border-t border-nickel terminal-background cli-stage">

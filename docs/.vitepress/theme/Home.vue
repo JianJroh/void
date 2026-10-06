@@ -28,8 +28,7 @@ const { frontmatter } = useData();
     </a>
     <h2 id="features-heading" class="text-white">Turn Vite Apps Full-Stack</h2>
     <p class="max-w-md text-white/70 text-balance sm:text-pretty">
-      Use your favorite Vite framework, add the backend features you need, and deploy with one
-      command.
+      Use your favorite Vite framework, add the backend features you need, and infer your resources.
     </p>
   </section>
 
@@ -51,8 +50,7 @@ const { frontmatter } = useData();
         Deploy with your Security Built-In
       </h2>
       <p class="max-w-md text-pretty text-primary/70">
-        Self-host your team's Void Platform and customize it to fit your security needs. Unlock fast
-        deployment for your team.
+        Self-host your team's Void Platform & customize it to fit your security needs.
       </p>
     </section>
 

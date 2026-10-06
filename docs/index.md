@@ -4,7 +4,7 @@ theme: dark
 
 hero:
   name: Void
-  text: Launch Vite Apps at Warp Speed
+  text: Ship Vite Apps with Ease
   tagline: Void is a full-stack SDK, platform and CLI that unifies building & deploying apps
   actions:
     - theme: brand
@@ -17,10 +17,10 @@ features:
   - iconify: lucide:layers
     visual: stack
     title: Full-Stack Features
-    details: Use a database, KV, object storage, AI, authentication, queues, and cron jobs as your app needs them.
+    details: Add full-stack features to your app as you need them without having to wire it all together yourself.
     highlights:
-      - Server routes and pages
-      - Database, KV, and object storage
+      - Server routes, edge routing and pages
+      - Authentication
       - AI, queues, and scheduled jobs
     guide:
       text: Explore app types
@@ -47,6 +47,46 @@ features:
     guide:
       text: Framework integrations
       link: /integrations/frameworks/overview
+platform_features:
+  - id: platform-ai-coding
+    iconify: lucide:bot
+    title: Secure Vibe Coding for All
+    details: Let your team build and deploy with coding agents while admins retain control of Cloudflare access.
+    highlights:
+      - Keep Cloudflare credentials with your admin team
+      - Enable non-technical teammates to build their own apps
+      - Deploy prototypes fast and share apps for feedback
+    guide:
+      text: Explore team deployments
+      link: /guide/self-hosted-platform
+    image: /platform-feature-placeholder.svg
+    image_alt: Placeholder image for AI coding and team deployments
+  - id: platform-control-plane
+    iconify: lucide:panels-top-left
+    title: Control Plane for Managing Apps
+    details: Manage users, projects, deployments, and platform health from the admin UI or CLI.
+    highlights:
+      - Manage users and project access & resources
+      - Inspect deployments, logs, and rollbacks
+      - Monitor platform health and usage
+    guide:
+      text: Platform administration
+      link: /guide/platform-administration
+    image: /platform-feature-placeholder.svg
+    image_alt: Placeholder image for the Void Platform control plane
+  - id: platform-security
+    iconify: lucide:shield-check
+    title: Bring your Own Security
+    details: Fork and customize your own Void platform based on your team's security standards.
+    highlights:
+      - Manage access through Cloudflare Access, Google, GitHub, or OIDC
+      - Control who can sign in and deploy
+      - Protect projects with your access policies
+    guide:
+      text: Configure platform access
+      link: /guide/platform/administration/access
+    image: /platform-feature-placeholder.svg
+    image_alt: Placeholder image for authentication and platform security
 footer_heading: Build with Vite. Deploy with Void.
 footer_subheading: Server code, resources, and deployment in one workflow.
 ---
