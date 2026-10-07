@@ -18,10 +18,10 @@ import { resolve as resolvePosixPath } from 'node:path/posix';
 import { resolve as resolveWindowsPath } from 'node:path/win32';
 import { types as utilTypes } from 'node:util';
 import type { CloudflareOperation } from '@void/deploy-cloudflare';
+import { isRecord } from '@void/deploy-core';
 import { parse, type ParseError } from 'jsonc-parser';
 import { basename, dirname, join, normalize, resolve } from 'pathslash';
 import lockfile from 'proper-lockfile';
-import { MATERIALIZED_CLOUDFLARE_FILE, persistCloudflareConfig } from '../cloudflare-config.ts';
 import { voidLog, voidWarn } from '../log.ts';
 import { scanWranglerDotenvKeys } from '../shared/dotenv.ts';
 import {
@@ -31,6 +31,7 @@ import {
 import { resolveCloudflareOperationArgv } from './preset.ts';
 import {
   assertNoDuplicateMembers,
+  persistMaterializedWranglerConfig,
   readProvisionedBindingEntry,
   writeProvisionedWranglerConfig,
   type WriteProvisionedWranglerResult,
@@ -38,7 +39,7 @@ import {
 
 /**
  * The set of Cloudflare resources an app needs, computed by the deploy
- * orchestrator (Task 6) from inferred bindings + config. The provisioner
+ * orchestrator from inferred bindings + config. The provisioner
  * consumes this as-is; it never computes the set itself.
  *
  * `binding` values are the pre-validated uppercase names the app already uses
@@ -163,7 +164,6 @@ export type RunWranglerResult = {
   error?: string | null;
 };
 
-/** Typed provider operations; public targets use argv JSON and secrets use stdin. */
 /**
  * The transport context threaded into EVERY wrangler invocation (default AND
  * injected). Its `accountId` is the ONE reconciled effective account this whole
@@ -182,6 +182,8 @@ export interface WranglerCallContext {
    * lister uses. An injected seam may ignore it (it owns its own transport).
    */
   apiBaseUrl?: string;
+  /** Pin the operator credential selected by the caller for every subprocess. */
+  apiToken?: string;
   cwd?: string;
   input?: string;
   /** Keep borrowed OAuth bearer values out of Wrangler's on-disk logs. */
@@ -521,12 +523,6 @@ function resolveComplianceRegion(
   return envRegion ?? configRegion ?? 'public';
 }
 
-// `scanWranglerDotenvKeys` lives in the leaf `../shared/dotenv.ts` (no lifecycle
-// side effects) so the deploy orchestrator can read wrangler dotenv keys without
-// importing this provision module. Re-exported here to keep the historical
-// `provision.ts` import surface stable for existing callers.
-export { scanWranglerDotenvKeys };
-
 /**
  * Mirror wrangler 4.131's `getDefaultEnvFiles(env)`: base `.env`/`.env.local`, then —
  * when the environment argument is DEFINED (we always pass `--env=`, so wrangler sees
@@ -627,21 +623,6 @@ export function assertNoTransportRedirectInProjectDotenv(
 }
 
 /**
- * Child-process env with every CF Access credential scrubbed. Mirrors `buildEnv`
- * in `deploy.ts`: Access credentials are needed only by this CLI's own guarded
- * HTTP requests and must never leak into the spawned wrangler process (which may
- * in turn run user hooks). This includes the short-lived cloudflared
- * `CF_ACCESS_TOKEN` JWT used by local readiness probes.
- *
- * Pins ONE transport context: scrubs every {@link TRANSPORT_REDIRECT_ENV_VARS}
- * from the child env, then re-sets `CLOUDFLARE_API_BASE_URL` to the SINGLE resolved
- * `apiBaseUrl` so the spawned wrangler and the Hyperdrive REST lister hit the exact same
- * endpoint. Scrubbing the compliance/staging/env selectors makes the explicit base
- * authoritative (they can no longer re-derive a different base). Combined with
- * {@link assertNoTransportRedirectInProjectDotenv} (which blocks a project dotenv from
- * repopulating any of them via wrangler's per-command reload), the pin cannot be moved.
- */
-/**
  * Delete `name` from `env` IN PLACE, honoring the platform's env-key case rule.
  * Windows environment keys are CASE-INSENSITIVE: a spawned child's `process.env`
  * resolves `WRANGLER_OUTPUT_FILE_PATH` from an ambient `Wrangler_Output_File_Path`
@@ -668,9 +649,25 @@ export function deleteEnvVarCaseAware(
   }
 }
 
+/**
+ * Child-process env with every CF Access credential scrubbed. Mirrors `buildEnv`
+ * in `deploy.ts`: Access credentials are needed only by this CLI's own guarded
+ * HTTP requests and must never leak into the spawned wrangler process (which may
+ * in turn run user hooks). This includes the short-lived cloudflared
+ * `CF_ACCESS_TOKEN` JWT used by local readiness probes.
+ *
+ * Pins ONE transport context: scrubs every {@link TRANSPORT_REDIRECT_ENV_VARS}
+ * from the child env, then re-sets `CLOUDFLARE_API_BASE_URL` to the SINGLE resolved
+ * `apiBaseUrl` so the spawned wrangler and the Hyperdrive REST lister hit the exact same
+ * endpoint. Scrubbing the compliance/staging/env selectors makes the explicit base
+ * authoritative (they can no longer re-derive a different base). Combined with
+ * {@link assertNoTransportRedirectInProjectDotenv} (which blocks a project dotenv from
+ * repopulating any of them via wrangler's per-command reload), the pin cannot be moved.
+ */
 export function provisionEnv(ctx?: {
   accountId?: string;
   apiBaseUrl?: string;
+  apiToken?: string;
   /** Test seam for the win32 case rule; production always uses the real platform. */
   platform?: NodeJS.Platform;
 }): NodeJS.ProcessEnv {
@@ -728,6 +725,19 @@ export function provisionEnv(ctx?: {
   if (ctx?.accountId) {
     scrub('CLOUDFLARE_ACCOUNT_ID');
     env.CLOUDFLARE_ACCOUNT_ID = ctx.accountId;
+  }
+  if (ctx?.apiToken) {
+    for (const name of [
+      'CLOUDFLARE_API_TOKEN',
+      'CF_API_TOKEN',
+      'CLOUDFLARE_API_KEY',
+      'CF_API_KEY',
+      'CLOUDFLARE_EMAIL',
+      'CF_EMAIL',
+    ]) {
+      scrub(name);
+    }
+    env.CLOUDFLARE_API_TOKEN = ctx.apiToken;
   }
   return env;
 }
@@ -817,7 +827,7 @@ export interface QuarantineInfo {
 
 // --- AT MOST ONE active provision per process --------------------------
 // THE structural invariant the signal coordinator (below) relies on: a single CLI
-// process runs AT MOST ONE provision at a time — the deploy orchestrator (Task 6)
+// process runs AT MOST ONE provision at a time — the deploy orchestrator
 // calls `provisionCloudflareResources` exactly once per process, and CROSS-process
 // concurrency is what the on-disk whole-provision lock serializes. Because every
 // wrangler call inside a provision is awaited sequentially, this guard means the
@@ -1263,7 +1273,7 @@ function armRetentionWatchdog(lock: ProvisionLock, info: QuarantineInfo): void {
       try {
         process.kill(process.platform === 'win32' ? info.pid : -info.pid, 0);
       } catch (error) {
-        dead = (error as NodeJS.ErrnoException).code === 'ESRCH';
+        dead = isAlreadyGoneKillError(error);
       }
       if (dead) {
         lock.release().then(
@@ -1400,7 +1410,11 @@ export function createDefaultRunWrangler(
         // Hyperdrive REST path use (no split-brain between the config pin and the
         // ambient/dotenv env).
         env: {
-          ...provisionEnv({ accountId: opts.accountId, apiBaseUrl: opts.apiBaseUrl }),
+          ...provisionEnv({
+            accountId: opts.accountId,
+            apiBaseUrl: opts.apiBaseUrl,
+            apiToken: opts.apiToken,
+          }),
           ...(opts.suppressLogs ? { WRANGLER_WRITE_LOGS: 'false' } : {}),
         },
         stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
@@ -1520,18 +1534,14 @@ export function createDefaultRunWrangler(
           try {
             process.kill(child.pid, 0);
           } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
-              groupGone = true;
-            }
+            groupGone = isAlreadyGoneKillError(error);
           }
           return groupGone;
         }
         try {
           process.kill(-child.pid, 0);
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
-            groupGone = true;
-          }
+          groupGone = isAlreadyGoneKillError(error);
           // EPERM → some group member exists but we cannot signal it — treat as ALIVE
           // (fail safe: never confirm on a probe we could not perform).
         }
@@ -2348,9 +2358,7 @@ function assertQuarantineClearedOrClear(lockTarget: string, onBeforeClear?: () =
       process.kill(probeTarget, 0);
       // Signal 0 succeeded — some member of the recorded group still exists → alive.
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
-        confirmedDead = true;
-      }
+      confirmedDead = isAlreadyGoneKillError(error);
       // EPERM/other — the probe could not be performed → treat as possibly alive.
     }
   }
@@ -2896,16 +2904,12 @@ function parseJsonObject(value: unknown): Record<string, unknown> | undefined {
   return isRecord(value) ? value : undefined;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 /**
  * Read the single provisioned binding entry for `field`/`binding` from the resolved
  * config, delegating to the STRICT canonical reader in `wrangler.ts`
  * ({@link readProvisionedBindingEntry}). Unlike the old loose first-match `.find()`, this
  * validates the target field's outer shape, fails closed on a DUPLICATE binding, and runs
- * the worker-wide CROSS-TYPE collision check (reusing the Task-3 collector) — so a
+ * the worker-wide CROSS-TYPE collision check — so a
  * duplicate/collision config can never be reported `reused` or pass a create postcondition.
  */
 function readBindingEntry(
@@ -2918,8 +2922,8 @@ function readBindingEntry(
 
 /**
  * Read + parse the root wrangler config (fresh each call — wrangler mutates it).
- * BOM-aware (wrangler + the Task 3 writer strip a leading BOM before parsing, so
- * we must too, else a BOM-prefixed config would look unparseable). FAILS CLOSED
+ * BOM-aware (wrangler + `writeProvisionedWranglerConfig` strip a leading BOM before
+ * parsing, so we must too, else a BOM-prefixed config would look unparseable). FAILS CLOSED
  * on a genuine parse error or a non-object root: never silently treat a real
  * config as `{}`, which would miss existing ids (re-provision/orphan) and mask a
  * corrupt file. A missing file is fine (nothing to read-first → `{}`).
@@ -3001,7 +3005,7 @@ interface ResourceListSpec {
 /**
  * STRICT list validator shared by KV + D1. Rejects the ENTIRE list (throws) if ANY
  * member is not a well-formed object carrying a non-empty name AND a
- * FORMAT-VALID id (per {@link ResourceListSpec.idValidator}). A member is NEVER
+ * FORMAT-VALID id (per {@link ResourceListSpec.hasValidId}). A member is NEVER
  * silently filtered, and a member with a malformed id is NEVER accepted, because
  * either could BE the requested target (or signal a corrupt list) and treating it as
  * "absent" would mint a duplicate. Validates EVERY member up front — BEFORE any
@@ -3107,7 +3111,7 @@ function reconcileD1IdAliases(entry: Record<string, unknown>): D1ReconciledId {
  * exact-match rule so no sibling gap remains.
  */
 function normalizeD1(entry: Record<string, unknown> | undefined, requestedName: string): D1Match {
-  if (!isRecord(entry)) {
+  if (entry === undefined) {
     return { kind: 'other' };
   }
   const names = [entry.name, entry.database_name].filter(
@@ -3168,19 +3172,15 @@ function isAlreadyExistsError(result: RunWranglerResult): boolean {
 }
 
 /**
- * EXACT, name-aware not-found classifier shared by R2 + queues. Given a
- * already-NON-zero `<res> info`-by-name probe, returns `true` (confirmed absent →
- * safe to create) ONLY on wrangler's exact, resource-specific not-found signal
- * for THIS name (regex-escaped). Everything else returns `false` so the caller
+ * Not-found classifier shared by R2 + queues. Given an `<res> info`-by-name probe,
+ * returns `true` (confirmed absent → safe to create) ONLY on a clean non-zero exit
+ * with the provider's typed not-found result (R2 error code 10006; the queue
+ * operation's `not-found` failure). Everything else returns `false` so the caller
  * fails closed — a signal/spawn failure, an auth/network/metrics error, or a
  * GENERIC "not found" (e.g. `Account not found`) is NEVER treated as absence,
  * which would mint a duplicate resource.
  */
-function isConfirmedAbsent(
-  result: RunWranglerResult,
-  kind: 'r2' | 'queue',
-  _name: string,
-): boolean {
+function isConfirmedAbsent(result: RunWranglerResult, kind: 'r2' | 'queue'): boolean {
   return (
     isCleanFailure(result) &&
     (kind === 'r2' ? result.errorCode === 10006 : result.failure === 'not-found')
@@ -3188,8 +3188,8 @@ function isConfirmedAbsent(
 }
 
 /** Only a completed, typed not-found response confirms queue absence. */
-export function isQueueConfirmedAbsent(result: RunWranglerResult, name: string): boolean {
-  return isConfirmedAbsent(result, 'queue', name);
+export function isQueueConfirmedAbsent(result: RunWranglerResult, _name: string): boolean {
+  return isConfirmedAbsent(result, 'queue');
 }
 
 /** Reuse and post-create verification require clean success and the exact returned name. */
@@ -3867,8 +3867,8 @@ function redactRejection(error: unknown, redactText: (text: string) => string): 
  * `wrangler <res> create --update-config` write real ids into the root config.
  * For resources that already exist (adopt path) — where `create` cannot run —
  * the real id is captured from `wrangler <res> list/info` (or, for Hyperdrive,
- * the account-list existence seam) and written through the Task 3 writer's adopt
- * fields. Pure provisioning: NO build, deploy, or drift-check. Idempotent +
+ * the account-list existence seam) and written through `writeProvisionedWranglerConfig`'s
+ * adopt fields. Pure provisioning: NO build, deploy, or drift-check. Idempotent +
  * read-first: a binding already pointing at a real id is left untouched.
  */
 export async function provisionCloudflareResources(
@@ -3927,7 +3927,7 @@ async function provisionWithProcessSlot(
   // serializes provisions of the same config on ONE machine; two different HOSTS
   // provisioning the same project can still race and create duplicates. Accepted by
   // design: provision is a single-operator dev-machine action, so no remote coordination
-  // is built. (Documented in the Task 7 docs.)
+  // is built.
   const lock = await acquireProvisionLock(configPath, opts?.lockOptions);
   // While this provision runs, a fatal-signal death under an
   // UNCONFIRMED wrangler child must RETAIN the mutex: publish the lock's quarantine as
@@ -4402,7 +4402,7 @@ async function reconcileR2(
         log.info(`adopted existing R2 bucket ${bucketName}`);
         write({ r2: { binding, bucketName } });
         resources.push({ kind: 'r2', binding, name: bucketName, action: 'adopted' });
-      } else if (isConfirmedAbsent(info, 'r2', bucketName)) {
+      } else if (isConfirmedAbsent(info, 'r2')) {
         // CONFIRMED not-found (clean non-zero + exact signal) → create.
         // `--update-config` upserts by binding.
         const created = await runWrangler({
@@ -4616,10 +4616,10 @@ async function reconcileQueues(
 ): Promise<void> {
   // --- Queues (resource only; NEVER writes queue config entries) -----------
   // `wrangler queues list` is a human table, not JSON, and `queues create` has
-  // no `--update-config`. So probe each queue by name: `queues info` exits
-  // non-zero (`Queue "x" does not exist`) when absent. Task 4 only ensures the
-  // queue RESOURCE exists — binding the producers/consumers into the config is
-  // app-class-aware and belongs to Task 6.
+  // no `--update-config`. So probe each queue by name: `queues info` reports a
+  // typed not-found failure when absent. This step only ensures the queue RESOURCE
+  // exists — the deploy orchestrator binds producers/consumers into the config
+  // (app-class-aware) through `writeProvisionedWranglerConfig`.
   for (const name of desired.queues) {
     const info = await runWrangler({ type: 'queues.info', name: name, configPath });
     // "Exists → reuse" ONLY when the probe POSITIVELY names THIS queue. A bare
@@ -4631,11 +4631,10 @@ async function reconcileQueues(
       continue;
     }
     // Not confirmed-present. It is "absent" (→ create) ONLY on a CLEAN non-zero exit
-    // carrying the EXACT, name-aware not-found signal (`Queue "<name>" does not
-    // exist`). Everything else — a signal/spawn failure, an auth error, a generic
+    // carrying the typed not-found failure. Everything else — a signal/spawn failure, an auth error, a generic
     // `Account not found`, OR a masked-kill clean-0 that did NOT positively identify
     // the queue — fails closed (never a blind create, never a false reuse).
-    if (!isConfirmedAbsent(info, 'queue', name)) {
+    if (!isConfirmedAbsent(info, 'queue')) {
       throw new Error(
         `provision: "wrangler queues info ${name}" failed or did not confirm the queue exists: ` +
           `${info.stderr || info.stdout || 'no output'}`,
@@ -4679,8 +4678,8 @@ async function provisionCloudflareResourcesLocked(
 ): Promise<ProvisionResult> {
   // --- Strict duplicate-member guard at the PROVISIONER BOUNDARY --------
   // `jsonc-parser.parse()` (used by `readRootConfig`) does NOT flag duplicate object
-  // members, and the Task 3 writer's duplicate-member guard only runs when the writer
-  // is invoked — which is SKIPPED when `account_id` is already correct. So without
+  // members, and `writeProvisionedWranglerConfig`'s duplicate-member guard only runs when
+  // the writer is invoked — which is SKIPPED when `account_id` is already correct. So without
   // this, a config with duplicated members (e.g. two `kv_namespaces` arrays) could
   // reach `kv namespace create` (orphan) or be falsely "reused". Run the SAME strict
   // detection the writer uses (reused, not re-implemented) at the boundary — before
@@ -4762,11 +4761,7 @@ async function provisionCloudflareResourcesLocked(
   const write = (
     patch: Parameters<typeof writeProvisionedWranglerConfig>[1],
   ): WriteProvisionedWranglerResult => writeProvisionedWranglerConfig(root, patch, { configPath });
-  const persistCreatedConfig = (): void => {
-    if (basename(configPath) === MATERIALIZED_CLOUDFLARE_FILE) {
-      persistCloudflareConfig(dirname(configPath));
-    }
-  };
+  const persistCreatedConfig = (): void => persistMaterializedWranglerConfig(configPath);
 
   // Any resource to ensure implies remote work (list/info/create/REST).
   const hasRemoteWork =

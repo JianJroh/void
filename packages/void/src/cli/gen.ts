@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { outro, log, select, isCancel, cancel } from '@voidzero-dev/vite-plus-prompts';
+import { log, select, isCancel, cancel } from '@voidzero-dev/vite-plus-prompts';
 import { join, dirname, relative } from 'pathslash';
 import { ensureProjectTsconfig } from '../codegen/project-tsconfig.ts';
 import { readConfig, getDatabaseDialect } from '../config.ts';
@@ -17,6 +17,7 @@ import { collectMigrations, readJournal } from '../migrations/collect.ts';
 import { assertJournalCoherence, listDrizzleArtifacts } from '../migrations/validate.ts';
 import { readProjectPaths } from '../project-paths.ts';
 import type { GenArgs } from './gen-args.ts';
+import { printSuccess } from './output.ts';
 import { buildDrizzleKitSpawnEnv } from './yarn-pnp.ts';
 
 const drizzleKitBin = join(fileURLToPath(import.meta.resolve('drizzle-kit')), '..', 'bin.cjs');
@@ -52,7 +53,7 @@ function writeIfNotExists(filePath: string, content: string): boolean {
   }
   mkdirSync(dirname(filePath), { recursive: true });
   writeFileSync(filePath, content);
-  log.success(`Created ${filePath}`);
+  log.step(`Created ${filePath}`);
   return true;
 }
 
@@ -106,16 +107,17 @@ type ColumnSpec = {
 
 function drizzleColumnDef(col: ColumnSpec): string {
   const { name, type } = col;
+  const notNull = col.nullable ? '' : '.notNull()';
   switch (type) {
     case 'string':
     case 'text':
-      return `  ${name}: text("${name}").notNull(),`;
+      return `  ${name}: text("${name}")${notNull},`;
     case 'integer':
-      return `  ${name}: integer("${name}").notNull(),`;
+      return `  ${name}: integer("${name}")${notNull},`;
     case 'boolean':
-      return `  ${name}: integer("${name}", { mode: "boolean" }).notNull().default(false),`;
+      return `  ${name}: integer("${name}", { mode: "boolean" })${notNull}.default(false),`;
     case 'real':
-      return `  ${name}: real("${name}").notNull(),`;
+      return `  ${name}: real("${name}")${notNull},`;
     default:
       return `  ${name}: text("${name}"),`;
   }
@@ -147,16 +149,17 @@ function drizzleImportsForColumns(columns: Array<ColumnSpec>): Array<string> {
 
 function drizzleColumnDefPg(col: ColumnSpec): string {
   const { name, type } = col;
+  const notNull = col.nullable ? '' : '.notNull()';
   switch (type) {
     case 'string':
     case 'text':
-      return `  ${name}: text("${name}").notNull(),`;
+      return `  ${name}: text("${name}")${notNull},`;
     case 'integer':
-      return `  ${name}: integer("${name}").notNull(),`;
+      return `  ${name}: integer("${name}")${notNull},`;
     case 'boolean':
-      return `  ${name}: boolean("${name}").notNull().default(false),`;
+      return `  ${name}: boolean("${name}")${notNull}.default(false),`;
     case 'real':
-      return `  ${name}: doublePrecision("${name}").notNull(),`;
+      return `  ${name}: doublePrecision("${name}")${notNull},`;
     default:
       return `  ${name}: text("${name}"),`;
   }
@@ -188,16 +191,17 @@ function drizzleImportsForColumnsPg(columns: Array<ColumnSpec>): Array<string> {
 
 function drizzleColumnDefMySql(col: ColumnSpec): string {
   const { name, type } = col;
+  const notNull = col.nullable ? '' : '.notNull()';
   switch (type) {
     case 'string':
     case 'text':
-      return `  ${name}: text("${name}").notNull(),`;
+      return `  ${name}: text("${name}")${notNull},`;
     case 'integer':
-      return `  ${name}: int("${name}").notNull(),`;
+      return `  ${name}: int("${name}")${notNull},`;
     case 'boolean':
-      return `  ${name}: boolean("${name}").notNull().default(false),`;
+      return `  ${name}: boolean("${name}")${notNull}.default(false),`;
     case 'real':
-      return `  ${name}: double("${name}").notNull(),`;
+      return `  ${name}: double("${name}")${notNull},`;
     default:
       return `  ${name}: text("${name}"),`;
   }
@@ -420,22 +424,7 @@ function generateIndexRoute(
   const insertFields = columns.map((c) => `${c.name}: body.${c.name}`).join(', ');
 
   if (columns.length === 0 || validator === 'none') {
-    if (columns.length > 0) {
-      return `import { defineHandler } from "void";
-import { db } from "void/db";
-import { ${name} } from "@schema";
-
-export const GET = defineHandler(async () => {
-  return db.select().from(${name});
-});
-
-export const POST = defineHandler(async (c) => {
-  const body = await c.req.json();
-  await db.insert(${name}).values({ ${insertFields} });
-  return { created: true };
-});
-`;
-    }
+    const values = columns.length > 0 ? `{ ${insertFields} }` : 'body';
     return `import { defineHandler } from "void";
 import { db } from "void/db";
 import { ${name} } from "@schema";
@@ -446,7 +435,7 @@ export const GET = defineHandler(async () => {
 
 export const POST = defineHandler(async (c) => {
   const body = await c.req.json();
-  await db.insert(${name}).values(body);
+  await db.insert(${name}).values(${values});
   return { created: true };
 });
 `;
@@ -598,8 +587,8 @@ async function runModel(root: string, name: string, columns: Array<ColumnSpec>):
   // 3. Regenerate .void/tsconfig.json and db.d.ts
   ensureProjectTsconfig(root, undefined, true, true, { paths });
 
-  log.success(`Created ${relative(root, modelPath)}`);
-  log.success(`Updated ${relative(root, barrelPath)}`);
+  log.step(`Created ${relative(root, modelPath)}`);
+  log.step(`Updated ${relative(root, barrelPath)}`);
 
   // 4. Routes: routes/api/<name>/index.ts
   const routeIndexPath = join(paths.routesDir, 'api', name, 'index.ts');
@@ -609,7 +598,7 @@ async function runModel(root: string, name: string, columns: Array<ColumnSpec>):
   const routeIdPath = join(paths.routesDir, 'api', name, '[id].ts');
   writeIfNotExists(routeIdPath, generateIdRoute(name, validator));
 
-  outro('Model scaffolding complete. Run `void db push` to apply.');
+  printSuccess('Model scaffolding complete. Run `void db push` to apply.');
 }
 
 function runMigration(root: string, name: string): void {
@@ -686,26 +675,22 @@ function runMigration(root: string, name: string): void {
   // in-process without re-implementing a schema compiler:
   //
   //   1. A fresh `<timestamp>_<name>.sql` stub under `db/migrations/`
-  //      (drizzle-kit writes an empty `.sql` for `--custom`, exactly the
-  //      `-- <name>\n` shape `void gen migration` produced before).
+  //      (drizzle-kit writes an empty `.sql` for `--custom`).
   //   2. An updated `_journal.json` with a new entry appended (new idx,
   //      new timestamp, inherited version/breakpoints).
   //   3. A new `meta/<prefix>_snapshot.json` that is a snapshot of the
   //      **current** `db/schema.ts`, NOT a clone of the previous
   //      snapshot.
   //
-  // Bullet 3 is the whole reason we delegate. An earlier in-process
-  // implementation cloned the previous snapshot (re-issuing `id`/
-  // `prevId` to chain the drizzle history correctly) and wrote that
-  // clone as the new snapshot. That left the new journal entry pointing
-  // at a stale schema state: if the user had changed `db/schema.ts`
-  // before running `void gen migration` to hand-write the matching DDL,
-  // the next `void db generate` / `drizzle-kit generate` would diff the
-  // current schema against the stale snapshot and re-emit the same DDL
-  // the custom migration had already applied. Shelling out to
-  // drizzle-kit's own `generate --custom` path uses drizzle-kit's
-  // schema-compilation pipeline, so the emitted snapshot always matches
-  // what drizzle-kit would produce on the next invocation.
+  // Bullet 3 is the whole reason we delegate. Cloning the previous
+  // snapshot in-process would leave the new journal entry pointing at a
+  // stale schema state: if the user had changed `db/schema.ts` before
+  // running `void gen migration` to hand-write the matching DDL, the next
+  // `void db generate` / `drizzle-kit generate` would diff the current
+  // schema against the stale snapshot and re-emit the same DDL the custom
+  // migration had already applied. drizzle-kit's own `generate --custom`
+  // path uses its schema-compilation pipeline, so the emitted snapshot
+  // always matches what drizzle-kit would produce on the next invocation.
   //
   // We still verify up front that the snapshot matching the last journal
   // entry is on disk. Without it drizzle-kit would fail with its own
@@ -767,7 +752,7 @@ function runMigration(root: string, name: string): void {
     );
     const sqlFilesBefore = new Set(readdirSync(migrationsDir).filter((f) => f.endsWith('.sql')));
 
-    // Round 40: the journal is authoritative once it exists. `existingJournal.
+    // The journal is authoritative once it exists. `existingJournal.
     // dialect` is the dialect drizzle-kit committed to when the first migration
     // was generated; every subsequent snapshot under `meta/` is chained off
     // that same dialect. Reading the dialect from `void.config.ts` and passing it
@@ -827,7 +812,7 @@ function runMigration(root: string, name: string): void {
       { additionalSchemas },
     );
 
-    // Round 38: under Yarn Berry PnP, there is no `node_modules` tree —
+    // Under Yarn Berry PnP, there is no `node_modules` tree —
     // dependencies live inside ZIP archives (`.yarn/cache/*.zip`) and are
     // resolved through `.pnp.cjs`, which patches `fs` +
     // `Module._resolveFilename` to handle the virtual paths. Plain `node
@@ -901,10 +886,10 @@ function runMigration(root: string, name: string): void {
       .filter((f) => f.endsWith('.sql'))
       .find((f) => !sqlFilesBefore.has(f));
     if (newSqlFile) {
-      log.success(`Created db/migrations/${newSqlFile}`);
+      log.step(`Created db/migrations/${newSqlFile}`);
     }
 
-    outro('Migration created and journal updated.');
+    printSuccess('Migration created and journal updated.');
     return;
   }
 
@@ -931,9 +916,9 @@ function runMigration(root: string, name: string): void {
   const tag = `${timestamp}_${name}`;
   const filePath = join(migrationsDir, `${tag}.sql`);
 
-  writeIfNotExists(filePath, `-- ${name}\n`);
-
-  outro('Migration created.');
+  if (writeIfNotExists(filePath, `-- ${name}\n`)) {
+    printSuccess('Migration created.');
+  }
 }
 
 function runRoute(root: string, routePath: string, methods: Array<string>): void {
@@ -951,9 +936,9 @@ function runRoute(root: string, routePath: string, methods: Array<string>): void
 
 ${exports}
 `;
-  writeIfNotExists(filePath, content);
-
-  outro('Route created.');
+  if (writeIfNotExists(filePath, content)) {
+    printSuccess('Route created.');
+  }
 }
 
 function runMiddleware(root: string, name: string): void {
@@ -969,9 +954,9 @@ export default defineMiddleware(async (c, next) => {
   await next();
 });
 `;
-  writeIfNotExists(filePath, content);
-
-  outro('Middleware created.');
+  if (writeIfNotExists(filePath, content)) {
+    printSuccess('Middleware created.');
+  }
 }
 
 function runCron(root: string, name: string): void {
@@ -984,9 +969,9 @@ export default defineScheduled(async (controller, env) => {
   // TODO: implement ${name}
 });
 `;
-  writeIfNotExists(filePath, content);
-
-  outro('Cron job created.');
+  if (writeIfNotExists(filePath, content)) {
+    printSuccess('Cron job created.');
+  }
 }
 
 function runQueue(root: string, name: string): void {
@@ -1004,9 +989,9 @@ export default defineQueue<Message>(async (batch, env) => {
   }
 });
 `;
-  writeIfNotExists(filePath, content);
-
-  outro('Queue consumer created.');
+  if (writeIfNotExists(filePath, content)) {
+    printSuccess('Queue consumer created.');
+  }
 }
 
 function runSsr(root: string, framework?: 'react' | 'vue' | 'svelte' | 'solid'): void {
@@ -1024,7 +1009,7 @@ function runSsr(root: string, framework?: 'react' | 'vue' | 'svelte' | 'solid'):
     writeSolidSsr(root);
   }
 
-  outro('SSR scaffolding complete.');
+  printSuccess('SSR scaffolding complete.');
 }
 
 function detectFramework(root: string): 'react' | 'vue' | 'svelte' | 'solid' {

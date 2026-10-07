@@ -6,13 +6,7 @@ import {
   type AiProviderOptions,
 } from './ai-types.ts';
 import { getRawRuntimeEnv, type RuntimeEnv } from './env-raw.ts';
-import {
-  readUsageLimit,
-  UsageLimit,
-  limitOperation,
-  limitFromResponse,
-  type LimitOperation,
-} from './limits.ts';
+import { UsageLimit, limitFromResponse } from './limits.ts';
 
 const VOID_FILE_MARKER = '__voidFile';
 
@@ -193,11 +187,6 @@ async function serializeProxyValue(
   return value;
 }
 
-function formFileName(value: File | Blob, fallback: string): string {
-  const name = fileNameFromBlob(value);
-  return name ?? fallback;
-}
-
 async function serializeFormData(form: FormData): Promise<SerializedProviderBody> {
   const entries: Array<{ name: string; value: string | SerializedFileInput }> = [];
   for (const [name, value] of form.entries()) {
@@ -210,7 +199,7 @@ async function serializeFormData(form: FormData): Promise<SerializedProviderBody
       value: {
         [VOID_FILE_MARKER]: true,
         data: arrayBufferToBase64(await value.arrayBuffer()),
-        name: formFileName(value, name),
+        name: fileNameFromBlob(value) ?? name,
         type: value.type || undefined,
       },
     });
@@ -370,7 +359,7 @@ function isUnsafeProviderPath(path: string): boolean {
 }
 
 /**
- * Build a real outgoing HTTP body for the user's own AI Gateway (P3 self-host).
+ * Build a real outgoing HTTP body for the user's own AI Gateway (self-host).
  *
  * Unlike `serializeProviderBody`/`providerRequestBody` (which build the proxy
  * envelope decoded on the proxy side), this emits an actual `BodyInit` +
@@ -456,93 +445,16 @@ async function providerRequestBody(
   };
 }
 
-function makeServiceBindingBackend(proxy: Fetcher, runtimeEnv: RuntimeEnv): AiBackend {
+type ProxySend = (action: string, payload: Record<string, unknown>) => Promise<Response>;
+
+/** Backend for the Void platform proxy, reached by service binding or HTTPS. */
+function makeProxyBackend(send: ProxySend, runtimeEnv: RuntimeEnv): AiBackend {
   async function proxyFetch(
     action: string,
-    body: Record<string, unknown>,
+    payload: Record<string, unknown>,
     options: { throwOnError?: boolean } = {},
   ): Promise<Response> {
-    const res = await proxy.fetch(`https://ai-proxy/ai/${action}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ action, ...body }),
-    });
-    const limit = await limitFromResponse(res, 'ai');
-    if (limit) {
-      throw limit;
-    }
-    if (options.throwOnError !== false && !res.ok) {
-      const text = await res.text();
-      throw new Error(`ai: Proxy request failed with ${res.status}: '${text}'.`);
-    }
-    return res;
-  }
-
-  return {
-    async run(model, inputs, options) {
-      const projectId = runtimeEnv.__PROJECT_ID;
-      const aiToken = runtimeEnv.__VOID_PROXY_TOKEN;
-
-      const res = await proxyFetch('run', { model, inputs, options, projectId, aiToken });
-      if (hasStreamFlag(inputs) && inputs.stream) {
-        return res.body;
-      }
-      return readProxyResult(res);
-    },
-    async image(model, inputs, options) {
-      const projectId = runtimeEnv.__PROJECT_ID;
-      const aiToken = runtimeEnv.__VOID_PROXY_TOKEN;
-      const { runOptions } = splitImageOptions(options);
-
-      return proxyFetch('run', { model, inputs, options: runOptions, projectId, aiToken });
-    },
-    async providerFetch(provider, path, init, options) {
-      const projectId = runtimeEnv.__PROJECT_ID;
-      const aiToken = runtimeEnv.__VOID_PROXY_TOKEN;
-      return proxyFetch(
-        'provider',
-        {
-          ...(await providerRequestBody(provider, path, init, options, runtimeEnv)),
-          projectId,
-          aiToken,
-        },
-        { throwOnError: false },
-      );
-    },
-    async models(params) {
-      const projectId = runtimeEnv.__PROJECT_ID;
-      const aiToken = runtimeEnv.__VOID_PROXY_TOKEN;
-      const res = await proxyFetch('models', { inputs: params, projectId, aiToken });
-      return res.json();
-    },
-    async toMarkdown(items, options) {
-      const projectId = runtimeEnv.__PROJECT_ID;
-      const aiToken = runtimeEnv.__VOID_PROXY_TOKEN;
-      const res = await proxyFetch('toMarkdown', { inputs: items, options, projectId, aiToken });
-      return res.json();
-    },
-  };
-}
-
-function makeHttpBackend(token: string, projectId: string, runtimeEnv: RuntimeEnv): AiBackend {
-  const base = getProxyUrl(runtimeEnv);
-  const headers = {
-    'content-type': 'application/json',
-    authorization: `Bearer ${token}`,
-    ...cfAccessHeaders(runtimeEnv, base),
-  };
-
-  async function proxyFetch(
-    action: string,
-    body: Record<string, unknown>,
-    options: { throwOnError?: boolean } = {},
-  ): Promise<Response> {
-    const res = await fetch(`${base}/${action}`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ action, ...body, projectId }),
-      redirect: 'manual',
-    });
+    const res = await send(action, payload);
     const limit = await limitFromResponse(res, 'ai');
     if (limit) {
       throw limit;
@@ -583,6 +495,43 @@ function makeHttpBackend(token: string, projectId: string, runtimeEnv: RuntimeEn
       return res.json();
     },
   };
+}
+
+function makeServiceBindingBackend(proxy: Fetcher, runtimeEnv: RuntimeEnv): AiBackend {
+  return makeProxyBackend(
+    (action, payload) =>
+      proxy.fetch(`https://ai-proxy/ai/${action}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          action,
+          ...payload,
+          projectId: runtimeEnv.__PROJECT_ID,
+          aiToken: runtimeEnv.__VOID_PROXY_TOKEN,
+        }),
+      }),
+    runtimeEnv,
+  );
+}
+
+function makeHttpBackend(token: string, projectId: string, runtimeEnv: RuntimeEnv): AiBackend {
+  const base = getProxyUrl(runtimeEnv);
+  const headers = {
+    'content-type': 'application/json',
+    authorization: `Bearer ${token}`,
+    ...cfAccessHeaders(runtimeEnv, base),
+  };
+
+  return makeProxyBackend(
+    (action, payload) =>
+      fetch(`${base}/${action}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ action, ...payload, projectId }),
+        redirect: 'manual',
+      }),
+    runtimeEnv,
+  );
 }
 
 function makeDirectBackend(
@@ -674,7 +623,6 @@ function makeDirectBackend(
   };
 }
 
-// Lazy-init backend on first access
 let _backend: AiBackend | undefined;
 function backend(): AiBackend {
   return (_backend ??= resolveBackend());
@@ -687,40 +635,38 @@ function backend(): AiBackend {
  * in a `Response` with SSE headers — ready to return from a route handler.
  */
 export type VoidAi = {
-  models(...args: Parameters<Ai['models']>): LimitOperation<Awaited<ReturnType<Ai['models']>>>;
+  models(...args: Parameters<Ai['models']>): Promise<Awaited<ReturnType<Ai['models']>>>;
   toMarkdown(
     files: Array<Parameters<Ai['toMarkdown']>[0]>,
     options?: Parameters<Ai['toMarkdown']>[1],
-  ): LimitOperation<Array<Awaited<ReturnType<Ai['toMarkdown']>>>>;
-  toMarkdown(
-    ...args: Parameters<Ai['toMarkdown']>
-  ): LimitOperation<Awaited<ReturnType<Ai['toMarkdown']>>>;
-  /** Workers AI inference (existing) */
+  ): Promise<Array<Awaited<ReturnType<Ai['toMarkdown']>>>>;
+  toMarkdown(...args: Parameters<Ai['toMarkdown']>): Promise<Awaited<ReturnType<Ai['toMarkdown']>>>;
+  /** Workers AI inference. */
   run<Name extends keyof AiModels>(
     model: Name,
     inputs: AiModels[Name]['inputs'],
     options?: AiOptions,
-  ): LimitOperation<AiModels[Name]['postProcessedOutputs']>;
+  ): Promise<AiModels[Name]['postProcessedOutputs']>;
 
   /** Cloudflare AI Gateway model inference. Accepts Cloudflare model IDs unchanged. */
-  run(model: string, inputs: unknown, options?: AiOptions): LimitOperation<unknown>;
+  run(model: string, inputs: unknown, options?: AiOptions): Promise<unknown>;
 
   /** Image generation. Returns the proxy response so callers can return or parse it. */
   image<Name extends keyof AiModels>(
     model: Name,
     inputs: AiModels[Name]['inputs'],
     options?: AiOptions,
-  ): LimitOperation<Response>;
+  ): Promise<Response>;
 
   /** Cloudflare AI Gateway model inference returned as a Response. */
-  image(model: string, inputs: unknown, options?: AiOptions): LimitOperation<Response>;
+  image(model: string, inputs: unknown, options?: AiOptions): Promise<Response>;
 
   /** Provider-native AI Gateway requests using a project secret for the provider API key. */
   provider(
     provider: AiProvider,
     options?: AiProviderOptions,
   ): {
-    fetch(path: string, init?: AiProviderFetchInit): LimitOperation<Response>;
+    fetch(path: string, init?: AiProviderFetchInit): Promise<Response>;
   };
 
   /** Stream Workers AI response as SSE */
@@ -728,44 +674,37 @@ export type VoidAi = {
     model: Name,
     inputs: Omit<AiModels[Name]['inputs'], 'stream'>,
     options?: AiOptions,
-  ): LimitOperation<Response>;
+  ): Promise<Response>;
 
   /** Stream any Cloudflare AI Gateway model response as SSE */
-  stream(
-    model: string,
-    inputs: Record<string, unknown>,
-    options?: AiOptions,
-  ): LimitOperation<Response>;
+  stream(model: string, inputs: Record<string, unknown>, options?: AiOptions): Promise<Response>;
 };
 
 /** Normalize provider 429 responses and binding quota failures before they reach callers. */
-function aiOperation<T>(execute: () => Promise<T>, rawStream = false): LimitOperation<T> {
-  return limitOperation(
-    async () => {
-      const value = await execute();
-      if (value instanceof Response) {
-        const limit = await limitFromResponse(value, 'ai');
-        if (limit) {
-          throw limit;
-        }
+async function aiOperation<T>(execute: () => Promise<T>, rawStream = false): Promise<T> {
+  let value: T;
+  try {
+    value = await execute();
+    if (value instanceof Response) {
+      const limit = await limitFromResponse(value, 'ai');
+      if (limit) {
+        throw limit;
       }
-      return value;
-    },
-    classifyAiLimit,
-    (value, limited) => {
-      if (
-        value instanceof Response &&
-        value.body &&
-        value.headers.get('content-type')?.includes('text/event-stream')
-      ) {
-        return new Response(streamResponse(value.body, limited).body, value) as T;
-      }
-      if (rawStream && value instanceof ReadableStream) {
-        return streamResponse(value, limited).body as T;
-      }
-      return value;
-    },
-  );
+    }
+  } catch (error) {
+    throw classifyAiLimit(error) ?? error;
+  }
+  if (
+    value instanceof Response &&
+    value.body &&
+    value.headers.get('content-type')?.includes('text/event-stream')
+  ) {
+    return new Response(streamResponse(value.body).body, value) as T;
+  }
+  if (rawStream && value instanceof ReadableStream) {
+    return streamResponse(value).body as T;
+  }
+  return value;
 }
 
 function classifyAiLimit(error: unknown): UsageLimit | null {
@@ -787,7 +726,7 @@ function classifyAiLimit(error: unknown): UsageLimit | null {
 }
 
 /** Streaming failures after headers are sent end with an explicit terminal SSE event. */
-function streamResponse(body: ReadableStream, limited: (limit: UsageLimit) => unknown): Response {
+function streamResponse(body: ReadableStream): Response {
   const reader = body.getReader();
   return new Response(
     new ReadableStream({
@@ -804,14 +743,6 @@ function streamResponse(body: ReadableStream, limited: (limit: UsageLimit) => un
           let data: unknown = { message: 'Generation was interrupted. Please try again.' };
           if (limit) {
             data = await limit.response().json();
-            try {
-              const fallback = await limited(limit);
-              if (fallback instanceof Response) {
-                data = readUsageLimit(await fallback.json().catch(() => null)) ?? data;
-              }
-            } catch {
-              /* Preserve a terminal event even if application fallback code fails. */
-            }
           }
           controller.enqueue(
             new TextEncoder().encode(

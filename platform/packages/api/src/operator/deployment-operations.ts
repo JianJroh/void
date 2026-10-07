@@ -1,6 +1,7 @@
 import { and, count, desc, eq, getTableColumns, ilike, or } from 'drizzle-orm';
 import { cancelDeployment, getDeployment, getProject, type Db } from '../db.ts';
 import { type ApiEnv, isDevBypass } from '../env.ts';
+import { LOG_ROW_GROUP_BY } from '../observability/log-rows.ts';
 import { deployments, projects } from '../schema.ts';
 import { OperatorError } from './common.ts';
 
@@ -164,7 +165,7 @@ type LogRow = {
   method: string;
   statusCode: string;
   ts: number;
-  timestamp: string | number;
+  ingestedAt: string | number;
 };
 
 const FOLLOW_OVERLAP_MS = 5 * 60 * 1000;
@@ -201,8 +202,8 @@ export async function deploymentLogs(
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
     throw new OperatorError(400, 'limit must be between 1 and 500.');
   }
-  // The admin browser requests newest-first pages and has always treated `since`
-  // as an ingestion-time window: a long-running request that started before the
+  // The admin browser requests newest-first pages and treats `since` as an
+  // ingestion-time window: a long-running request that started before the
   // window can still finish and emit a new error inside it. Operator history is
   // oldest-first and remains event-time based; operator follow switches to the
   // ingestion clock explicitly through `after` and keeps its overlap protocol.
@@ -261,14 +262,16 @@ export async function deploymentLogs(
     clock === 'ingestion'
       ? `timestamp >= toDateTime(${sqlString(sinceStr)}) AND timestamp < toDateTime(${sqlString(untilStr)})`
       : `timestamp >= toDateTime(${sqlString(sinceStr)}) AND timestamp < toDateTime(${sqlString(untilStr)}) AND double1 >= ${since} AND double1 < ${until}`;
+  // A grouped query can order only by its selected aliases.
   const order =
     clock === 'ingestion'
-      ? `timestamp ${direction}, double1 ${direction}`
-      : `double1 ${direction}, timestamp ${direction}`;
-  const query = `SELECT blob1 as outcome, blob2 as logData, blob3 as exceptionData, blob4 as url, blob5 as method, blob6 as statusCode, double1 as ts, timestamp
+      ? `ingestedAt ${direction}, ts ${direction}`
+      : `ts ${direction}, ingestedAt ${direction}`;
+  const query = `SELECT blob1 as outcome, blob2 as logData, blob3 as exceptionData, blob4 as url, blob5 as method, blob6 as statusCode, double1 as ts, min(timestamp) as ingestedAt
     FROM ${dataset} WHERE index1 = ${sqlString(`user-${project.slug}`)} AND blob7 = ${sqlString(deployment.id)}
     AND ${timeFilter}
-    ORDER BY ${order}, blob1 ${direction}, blob2 ${direction}, blob3 ${direction}, blob4 ${direction}, blob5 ${direction}, blob6 ${direction} LIMIT ${limit + 1} OFFSET ${offset}`;
+    ${LOG_ROW_GROUP_BY}
+    ORDER BY ${order}, outcome ${direction}, logData ${direction}, exceptionData ${direction}, url ${direction}, method ${direction}, statusCode ${direction} LIMIT ${limit + 1} OFFSET ${offset}`;
   const response = await fetch(
     `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/analytics_engine/sql`,
     {
@@ -296,7 +299,7 @@ export async function deploymentLogs(
       url: row.url,
       method: row.method,
       status: row.statusCode,
-      ingestedAt: analyticsTimestamp(row.timestamp),
+      ingestedAt: analyticsTimestamp(row.ingestedAt),
     })),
     nextCursor,
     watermark: String(until),

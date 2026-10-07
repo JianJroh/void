@@ -72,6 +72,74 @@ export type PlatformRuntimeProvenance = Readonly<{
   sourceRevision: string | null;
 }>;
 
+/** Saved operator progress; this does not attest application availability. */
+export type PlatformLifecycleOperation = Readonly<{
+  id: string;
+  action: 'install' | 'upgrade' | 'rollback' | 'repair' | 'enable';
+  fromVersion: string | null;
+  toVersion: string;
+  runtimeManifestSha256?: string;
+  phase:
+    | 'preparing'
+    | 'deploying'
+    | 'verifying'
+    | 'enabling'
+    | 'waiting-for-dns'
+    | 'waiting-for-sandbox-drain'
+    | 'complete'
+    | 'failed';
+  startedAt: string;
+  updatedAt: string;
+}>;
+
+export function parsePlatformLifecycleOperation(value: unknown): PlatformLifecycleOperation {
+  assertRecord(value, 'operation');
+  const actions = ['install', 'upgrade', 'rollback', 'repair', 'enable'] as const;
+  const phases = [
+    'preparing',
+    'deploying',
+    'verifying',
+    'enabling',
+    'waiting-for-dns',
+    'waiting-for-sandbox-drain',
+    'complete',
+    'failed',
+  ] as const;
+  const action = actions.find((action) => action === value.action);
+  const phase = phases.find((phase) => phase === value.phase);
+  if (!action || !phase) {
+    throw new Error('Invalid platform operation action or phase.');
+  }
+  if (
+    value.runtimeManifestSha256 !== undefined &&
+    (typeof value.runtimeManifestSha256 !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(value.runtimeManifestSha256))
+  ) {
+    throw new Error('Invalid platform operation runtime digest.');
+  }
+  return {
+    id: requiredString(value.id, 'operation.id'),
+    action,
+    fromVersion:
+      value.fromVersion === null
+        ? null
+        : requiredString(value.fromVersion, 'operation.fromVersion'),
+    toVersion: requiredString(value.toVersion, 'operation.toVersion'),
+    ...(typeof value.runtimeManifestSha256 === 'string'
+      ? { runtimeManifestSha256: value.runtimeManifestSha256 }
+      : {}),
+    phase,
+    startedAt: assertTimestamp(
+      requiredString(value.startedAt, 'operation.startedAt'),
+      'operation.startedAt',
+    ),
+    updatedAt: assertTimestamp(
+      requiredString(value.updatedAt, 'operation.updatedAt'),
+      'operation.updatedAt',
+    ),
+  };
+}
+
 export type PlatformInstallationManifest = Readonly<{
   authenticationResources?: ReadonlyArray<
     Readonly<{
@@ -99,6 +167,7 @@ export type PlatformInstallationManifest = Readonly<{
   endpoints: PlatformInstallationEndpoints;
   id: string;
   ownershipNonce: string;
+  operation?: PlatformLifecycleOperation;
   platformVersion: string;
   resources: ReadonlyArray<InstallationResource>;
   runtime: PlatformRuntimeProvenance | null;
@@ -231,18 +300,10 @@ export function parsePlatformResourceOwnershipMarker(
       `Unsupported platform resource ownership schema version: ${String(value.schemaVersion)}.`,
     );
   }
-  if (!isResourceKind(value.resourceKind)) {
-    throw new Error('Invalid ownership marker resource kind.');
-  }
-  return createPlatformResourceOwnershipMarker({
-    accountId: requiredString(value.accountId, 'ownership accountId'),
-    installationId: requiredString(value.installationId, 'ownership installationId'),
-    ownershipNonce: requiredString(value.ownershipNonce, 'ownership ownershipNonce'),
-    resourceId: requiredString(value.resourceId, 'ownership resourceId'),
-    resourceKey: requiredString(value.resourceKey, 'ownership resourceKey'),
-    resourceKind: value.resourceKind,
-    resourceName: requiredString(value.resourceName, 'ownership resourceName'),
-  });
+  // The constructor validates every field.
+  return createPlatformResourceOwnershipMarker(
+    value as Parameters<typeof createPlatformResourceOwnershipMarker>[0],
+  );
 }
 
 export function createPlatformInstallationManifest(input: {
@@ -446,6 +507,9 @@ export function parsePlatformInstallationManifest(value: unknown): PlatformInsta
             : 'enabled',
       status: value.status,
       runtime,
+      ...(value.operation !== undefined
+        ? { operation: parsePlatformLifecycleOperation(value.operation) }
+        : {}),
       ...(pendingDomain ? { pendingDomain } : {}),
       ...(value.authenticationResources !== undefined
         ? { authenticationResources: parseAuthenticationResources(value.authenticationResources) }
@@ -545,7 +609,7 @@ function parseAuthenticationResources(
   return resources;
 }
 
-function parseUsageProtocolVersion(value: unknown): 0 | 1 | 2 {
+export function parseUsageProtocolVersion(value: unknown): 0 | 1 | 2 {
   if (value === undefined || value === 0) {
     return 0;
   }

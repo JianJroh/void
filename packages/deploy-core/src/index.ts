@@ -343,6 +343,7 @@ export type {
 } from './target.ts';
 
 export { canonicalJson } from './canonical-json.ts';
+export { isRecord } from './is-record.ts';
 export { tokenizeSql, type SqlSegment } from './sql-tokenize.ts';
 export {
   canonicalSql,
@@ -351,6 +352,7 @@ export {
   hasStandalonePragma,
   isSingleStatement,
   MIGRATION_CLASSIFIER_VERSION,
+  splitSqlStatements,
   UNSPLIT_MULTI_STATEMENT_PRAGMA,
   type MigrationPlanHashInput,
   type SqlMigrationClassification,

@@ -124,11 +124,10 @@ export async function setOperatorSignup(
     });
   }
   await context.get('db').transaction(async (transaction) => {
-    const tx = transaction as unknown as Db;
-    const settings = await lockAuthSettings(tx);
+    const settings = await lockAuthSettings(transaction);
     await context.env.ROUTING.put('signup:enabled', String(enabled));
     if (settings) {
-      await tx
+      await transaction
         .update(platformAuthSettings)
         .set({
           admission: { mode: enabled ? 'restricted' : 'public' },
@@ -259,12 +258,7 @@ export async function sendOperatorInvitations(
   if (
     !input.length ||
     input.length > 100 ||
-    input.some(
-      (email) =>
-        typeof email !== 'string' ||
-        email.length > 320 ||
-        !/^[^\s@,]+@[^\s@,]+$/.test(email.trim()),
-    )
+    input.some((email) => email.length > 320 || !/^[^\s@,]+@[^\s@,]+$/.test(email.trim()))
   ) {
     throw new OperatorError(
       400,

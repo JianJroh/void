@@ -44,7 +44,7 @@ import {
   quoteSqlString,
 } from './db-export-sequences.ts';
 import { formatTimestamp } from './gen.ts';
-import { dim, formatCount, pc } from './output.ts';
+import { printSuccess, dim, formatCount, pc } from './output.ts';
 import { readDeploymentPlatform, readProjectConfig } from './project.ts';
 
 const drizzleKitBin = join(fileURLToPath(import.meta.resolve('drizzle-kit')), '..', 'bin.cjs');
@@ -309,7 +309,7 @@ async function runConnect(
       region: args.region,
     });
     connectionString = result.connectionString;
-    log.success(`Provisioned ${adapter.label} database.`);
+    log.step(`Provisioned ${adapter.label} database.`);
     if (result.dashboardUrl) {
       log.info(`Dashboard: ${result.dashboardUrl}`);
     }
@@ -340,7 +340,7 @@ async function runConnect(
   }
 
   writeLocalDatabaseUrl(root, connectionString);
-  log.success('Saved DATABASE_URL to .env.');
+  log.step('Saved DATABASE_URL to .env.');
 
   if (!args.localOnly) {
     const token = getToken(root);
@@ -348,13 +348,13 @@ async function runConnect(
     if (token && projectConfig) {
       const client = new PlatformClient(token, { root });
       await client.setDatabaseUrl(projectConfig.projectId, connectionString);
-      log.success('Updated the linked Void project database URL.');
+      log.step('Updated the linked Void project database URL.');
     } else {
       log.info('No authenticated Void project is linked, so only local configuration was updated.');
     }
   }
 
-  outro('Database connected.');
+  printSuccess('Database connected.');
 }
 
 async function runPush(root: string, dialect: DatabaseDialect): Promise<void> {
@@ -377,7 +377,7 @@ async function runPush(root: string, dialect: DatabaseDialect): Promise<void> {
   } catch {
     process.exit(1);
   }
-  outro('Done.');
+  printSuccess('Database schema pushed.');
 }
 
 async function runGenerate(root: string, dialect: DatabaseDialect): Promise<void> {
@@ -415,7 +415,7 @@ async function runGenerate(root: string, dialect: DatabaseDialect): Promise<void
     log.error(getErrorMessage(error));
     process.exit(1);
   }
-  outro('Done.');
+  printSuccess('Migration generation complete.');
 }
 
 async function runStatus(root: string, dialect: DatabaseDialect): Promise<void> {
@@ -432,7 +432,7 @@ async function runStatus(root: string, dialect: DatabaseDialect): Promise<void> 
 
   if (allMigrations.length === 0) {
     log.info(`No migration files found in ${paths.sourceRelative('db/migrations')}/`);
-    outro('Done.');
+
     return;
   }
 
@@ -473,7 +473,6 @@ async function runStatus(root: string, dialect: DatabaseDialect): Promise<void> 
   }
   const localSet = new Set(localApplied.map((m) => m.name));
 
-  // Try to get remote status
   let remoteApplied: Array<{ name: string; applied_at: string }> | null = null;
   const deploymentPlatform = readDeploymentPlatform(root);
   if (deploymentPlatform === 'cloudflare') {
@@ -551,11 +550,9 @@ async function runStatus(root: string, dialect: DatabaseDialect): Promise<void> 
 }
 
 async function resetDatabase(root: string, dialect: DatabaseDialect): Promise<number> {
-  // Coherence check must happen before any destructive work. Route
-  // failures through `log.error` + `process.exit(1)` instead of letting
-  // malformed `_journal.json` bubble as a raw stack trace — this matches
-  // `runStatus`, `runMigrate`, and the deploy path, and this is the exact
-  // drift case the preflight is here to surface.
+  // Coherence check must happen before any destructive work. Report a
+  // malformed `_journal.json` like `runStatus`, `runMigrate`, and the deploy
+  // path do, not as a raw stack trace.
   const paths = readProjectPaths(root);
   const migrationsDir = paths.migrationsDir;
   const migrations = collectMigrations(migrationsDir);
@@ -634,11 +631,10 @@ async function resetDatabase(root: string, dialect: DatabaseDialect): Promise<nu
 
 async function runReset(root: string, dialect: DatabaseDialect): Promise<void> {
   const count = await resetDatabase(root, dialect);
-  log.success(`Database reset. Applied ${formatCount(count, 'migration')}.`);
   if (dialect === 'sqlite') {
     log.info(dim("Restart your dev server if it's running."));
   }
-  outro('Done.');
+  printSuccess(`Database reset. Applied ${formatCount(count, 'migration')}.`);
 }
 
 async function runSeed(
@@ -659,8 +655,8 @@ async function runSeed(
       await withPgClient(root, async (client) => {
         await client.query(sql);
       });
-      log.success(`Seeded from ${seed.displayPath}.`);
-      outro('Done.');
+      printSuccess(`Seeded from ${seed.displayPath}.`);
+
       return;
     }
 
@@ -668,8 +664,8 @@ async function runSeed(
       await withMySqlClient(root, async (client) => {
         await client.query(sql);
       });
-      log.success(`Seeded from ${seed.displayPath}.`);
-      outro('Done.');
+      printSuccess(`Seeded from ${seed.displayPath}.`);
+
       return;
     }
 
@@ -685,9 +681,8 @@ async function runSeed(
     await runSeedModule(root, seed.path, dialect);
   }
 
-  log.success(`Seeded from ${seed.displayPath}.`);
   log.info(dim("Restart your dev server if it's running."));
-  outro('Done.');
+  printSuccess(`Seeded from ${seed.displayPath}.`);
 }
 
 /**
@@ -700,7 +695,7 @@ async function runSeed(
  *   users` or `EXPLAIN -- c\n ANALYZE ...` can't bypass the EXPLAIN ANALYZE
  *   check by hiding the `ANALYZE` keyword behind a comment that PostgreSQL
  *   treats as whitespace. This also handles leading comments, so
- *   `-- header\nSELECT 1` is now correctly classified as safe.
+ *   `-- header\nSELECT 1` is classified as safe.
  * - The comment-stripping regex is naive and doesn't understand string
  *   literals: a string literal containing a block-comment marker will have its
  *   contents stripped. That's harmless here (still classified as SELECT, still
@@ -778,8 +773,6 @@ async function executeExternalRemoteSql(
       const result = await pgClient.query(sql);
       if (result.rows && result.rows.length > 0) {
         printTable(result.rows);
-      } else {
-        log.success('Executed successfully.');
       }
     } finally {
       await pgClient.end();
@@ -792,8 +785,6 @@ async function executeExternalRemoteSql(
     const [rows] = await mySqlClient.query(sql);
     if (Array.isArray(rows) && rows.length > 0) {
       printTable(rows as Array<Record<string, unknown>>);
-    } else {
-      log.success('Executed successfully.');
     }
   } finally {
     await mySqlClient.end();
@@ -856,8 +847,6 @@ async function runExecute(
         );
         if (rows.length > 0) {
           printTable(rows);
-        } else {
-          log.success('Executed successfully.');
         }
       } else {
         const dbUrl = process.env.DATABASE_URL;
@@ -869,7 +858,7 @@ async function runExecute(
         }
         await executeExternalRemoteSql(dialect, dbUrl, sql);
       }
-      outro('Done.');
+      printSuccess('SQL executed successfully.');
       return;
     }
 
@@ -897,7 +886,7 @@ async function runExecute(
       const dbUrl = await fetchRemoteDatabaseUrl(client, projectConfig.projectId);
 
       await executeExternalRemoteSql(dialect, dbUrl, sql);
-      outro('Done.');
+      printSuccess('SQL executed successfully.');
       return;
     }
 
@@ -970,10 +959,8 @@ async function runExecute(
     const rows = data.results ?? [];
     if (rows.length > 0) {
       printTable(rows);
-    } else {
-      log.success('Executed successfully.');
     }
-    outro('Done.');
+    printSuccess('SQL executed successfully.');
     return;
   }
 
@@ -983,11 +970,9 @@ async function runExecute(
       const result = await client.query(sql);
       if (result.rows && result.rows.length > 0) {
         printTable(result.rows);
-      } else {
-        log.success('Executed successfully.');
       }
     });
-    outro('Done.');
+    printSuccess('SQL executed successfully.');
     return;
   }
 
@@ -997,11 +982,9 @@ async function runExecute(
       const rows = await client.query(sql);
       if (rows.length > 0) {
         printTable(rows);
-      } else {
-        log.success('Executed successfully.');
       }
     });
-    outro('Done.');
+    printSuccess('SQL executed successfully.');
     return;
   }
 
@@ -1027,12 +1010,11 @@ async function runExecute(
       }
     } else {
       db.exec(sql);
-      log.success('Executed successfully.');
     }
   } finally {
     db.close();
   }
-  outro('Done.');
+  printSuccess('SQL executed successfully.');
 }
 
 function printTable(rows: Array<Record<string, unknown>>): void {
@@ -1085,7 +1067,7 @@ async function runMigrate(root: string, dialect: DatabaseDialect, remote?: boole
 
       if (rawMigrations.length === 0) {
         log.info(`No migration files found in ${paths.sourceRelative('db/migrations')}/`);
-        outro('Done.');
+
         return;
       }
       const databaseUrl = process.env.DATABASE_URL;
@@ -1114,7 +1096,7 @@ async function runMigrate(root: string, dialect: DatabaseDialect, remote?: boole
         const pending = rawMigrations.filter((migration) => !appliedSet.has(migration.name));
         if (pending.length === 0) {
           log.info('Remote database is up to date.');
-          outro('Done.');
+
           return;
         }
         validateMigrations(pending);
@@ -1122,8 +1104,8 @@ async function runMigrate(root: string, dialect: DatabaseDialect, remote?: boole
         for (const migration of applied) {
           log.step(migration);
         }
-        log.success(`Applied ${formatCount(applied.length, 'migration')} to remote database.`);
-        outro('Done.');
+        printSuccess(`Applied ${formatCount(applied.length, 'migration')} to remote database.`);
+
         return;
       } catch (error) {
         log.error(`db: Remote ${dialect} migrations failed — ${getErrorMessage(error)}`);
@@ -1134,7 +1116,7 @@ async function runMigrate(root: string, dialect: DatabaseDialect, remote?: boole
     if (deploymentPlatform === 'cloudflare') {
       if (rawMigrations.length === 0) {
         log.info(`No migration files found in ${paths.sourceRelative('db/migrations')}/`);
-        outro('Done.');
+
         return;
       }
       const {
@@ -1149,7 +1131,7 @@ async function runMigrate(root: string, dialect: DatabaseDialect, remote?: boole
       const pending = rawMigrations.filter((migration) => !remoteBefore.has(migration.name));
       if (pending.length === 0) {
         log.info('Remote database is up to date.');
-        outro('Done.');
+
         return;
       }
       try {
@@ -1183,8 +1165,8 @@ async function runMigrate(root: string, dialect: DatabaseDialect, remote?: boole
       for (const migration of pending) {
         log.step(migration.name);
       }
-      log.success(`Applied ${formatCount(pending.length, 'migration')} to remote database.`);
-      outro('Done.');
+      printSuccess(`Applied ${formatCount(pending.length, 'migration')} to remote database.`);
+
       return;
     }
 
@@ -1202,7 +1184,7 @@ async function runMigrate(root: string, dialect: DatabaseDialect, remote?: boole
 
     if (rawMigrations.length === 0) {
       log.info(`No migration files found in ${paths.sourceRelative('db/migrations')}/`);
-      outro('Done.');
+
       return;
     }
 
@@ -1225,7 +1207,7 @@ async function runMigrate(root: string, dialect: DatabaseDialect, remote?: boole
     const pendingMigrations = rawMigrations.filter((m) => !remoteApplied.has(m.name));
     if (pendingMigrations.length === 0) {
       log.info('Remote database is up to date.');
-      outro('Done.');
+
       return;
     }
 
@@ -1253,12 +1235,16 @@ async function runMigrate(root: string, dialect: DatabaseDialect, remote?: boole
       for (const name of result.applied) {
         log.step(name);
       }
-      log.success(`Applied ${formatCount(result.applied.length, 'migration')} to remote database.`);
     }
     for (const warning of result.warnings ?? []) {
       log.warn(warning);
     }
-    outro('Done.');
+    if (result.applied.length > 0) {
+      printSuccess(
+        `Applied ${formatCount(result.applied.length, 'migration')} to remote database.`,
+      );
+    }
+
     return;
   }
 
@@ -1289,9 +1275,9 @@ async function runMigrate(root: string, dialect: DatabaseDialect, remote?: boole
       for (const name of applied) {
         log.step(name);
       }
-      log.success(`Applied ${formatCount(applied.length, 'migration')}.`);
+      printSuccess(`Applied ${formatCount(applied.length, 'migration')}.`);
     }
-    outro('Done.');
+
     return;
   }
 
@@ -1323,9 +1309,9 @@ async function runMigrate(root: string, dialect: DatabaseDialect, remote?: boole
       for (const name of applied) {
         log.step(name);
       }
-      log.success(`Applied ${formatCount(applied.length, 'migration')}.`);
+      printSuccess(`Applied ${formatCount(applied.length, 'migration')}.`);
     }
-    outro('Done.');
+
     return;
   }
 
@@ -1347,10 +1333,9 @@ async function runMigrate(root: string, dialect: DatabaseDialect, remote?: boole
     for (const name of applied) {
       log.step(name);
     }
-    log.success(`Applied ${formatCount(applied.length, 'migration')}.`);
     log.info(dim("Restart your dev server if it's running."));
+    printSuccess(`Applied ${formatCount(applied.length, 'migration')}.`);
   }
-  outro('Done.');
 }
 
 async function runStudio(root: string, dialect: DatabaseDialect, remote?: boolean): Promise<void> {
@@ -1433,7 +1418,7 @@ async function runRenameMigrations(root: string, dialect: DatabaseDialect): Prom
   const migrationsDir = readProjectPaths(root).migrationsDir;
   if (!existsSync(migrationsDir)) {
     log.info('No migrations directory found.');
-    outro('Done.');
+
     return;
   }
 
@@ -1482,7 +1467,7 @@ async function runRenameMigrations(root: string, dialect: DatabaseDialect): Prom
   const oldStyleFiles = files.filter((f) => /^\d{1,4}_/.test(f));
   if (oldStyleFiles.length === 0) {
     log.info('No migrations with numeric prefixes found. Nothing to rename.');
-    outro('Done.');
+
     return;
   }
 
@@ -1544,7 +1529,7 @@ async function runRenameMigrations(root: string, dialect: DatabaseDialect): Prom
   const snapshotPathFor = (tag: string): string =>
     join(metaDir, `${snapshotPrefix(tag)}_snapshot.json`);
 
-  // Round 29 gate: if this is a journal-backed project, every tag we're
+  // If this is a journal-backed project, every tag we're
   // about to rename MUST have its matching snapshot on disk. The rename
   // loop below silently skips missing snapshots so bare-legacy projects
   // (no journal, no snapshots at all) keep working — but a journal-backed
@@ -1554,7 +1539,7 @@ async function runRenameMigrations(root: string, dialect: DatabaseDialect): Prom
   // would be unable to locate the expected snapshot under the new
   // filename. Refuse up front with a concrete recovery path.
   //
-  // Round 30 refinement: the "journal file exists on disk" signal
+  // The "journal file exists on disk" signal
   // (`originalJournalBytes !== null`) is not enough on its own. The
   // kitchen-sink playground ships a placeholder journal of the form
   // `{ "version": "7", "dialect": "sqlite", "entries": [] }` with no
@@ -1908,8 +1893,7 @@ async function runRenameMigrations(root: string, dialect: DatabaseDialect): Prom
     }
   }
 
-  log.success(`Renamed ${formatCount(renames.length, 'migration')} to timestamp format.`);
-  outro('Done.');
+  printSuccess(`Renamed ${formatCount(renames.length, 'migration')} to timestamp format.`);
 }
 
 function formatMySqlExportValue(value: unknown): string {
@@ -2050,8 +2034,7 @@ async function runExport(
     const output = parts.join('\n');
     if (args.output) {
       writeFileSync(join(root, args.output), output);
-      log.success(`Exported to ${args.output}`);
-      outro('Done.');
+      printSuccess(`Exported to ${args.output}`);
     } else {
       process.stdout.write(output);
     }
@@ -2109,8 +2092,7 @@ async function runExport(
     const output = parts.join('\n');
     if (args.output) {
       writeFileSync(join(root, args.output), output);
-      log.success(`Exported to ${args.output}`);
-      outro('Done.');
+      printSuccess(`Exported to ${args.output}`);
     } else {
       process.stdout.write(output);
     }
@@ -2228,8 +2210,7 @@ async function runExport(
 
     if (args.output) {
       writeFileSync(join(root, args.output), output);
-      log.success(`Exported to ${args.output}`);
-      outro('Done.');
+      printSuccess(`Exported to ${args.output}`);
     } else {
       // Print raw SQL to stdout for piping — no clack formatting
       process.stdout.write(output);
@@ -2291,8 +2272,7 @@ async function runSetUrl(root: string): Promise<void> {
   const client = new PlatformClient(token, { root });
   await client.setDatabaseUrl(projectConfig.projectId, connectionString as string);
 
-  log.success('Database URL updated.');
-  outro('Done.');
+  printSuccess('Database URL updated.');
 }
 
 function resolveSeedTarget(root: string, file: string | undefined): SeedTarget {

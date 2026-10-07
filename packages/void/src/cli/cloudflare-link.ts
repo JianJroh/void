@@ -11,6 +11,7 @@ import { confirm, isCancel, log } from '@voidzero-dev/vite-plus-prompts';
 import { applyEdits, modify, parse, type ParseError } from 'jsonc-parser';
 import { basename, join } from 'pathslash';
 import { materializeCloudflareConfig, persistCloudflareConfig } from '../cloudflare-config.ts';
+import { isVersionIdChain } from './cloudflare-candidate.ts';
 import type { RunDeployOptions } from './deploy.ts';
 import { discoverFrameworkWranglerFiles } from './framework-config-migrate.ts';
 import { readDeploymentPlatform, writeDeploymentPlatform } from './project.ts';
@@ -40,12 +41,7 @@ export function readCloudflareLink(root: string): CloudflareLink | null {
         receipt !== null &&
         typeof receipt.parentVersionId === 'string' &&
         receipt.parentVersionId.length > 0 &&
-        Array.isArray(receipt.versionIds) &&
-        receipt.versionIds.length > 0 &&
-        receipt.versionIds.every(
-          (versionId: unknown) => typeof versionId === 'string' && versionId.length > 0,
-        ) &&
-        new Set(receipt.versionIds).size === receipt.versionIds.length);
+        isVersionIdChain(receipt.versionIds));
     if (
       typeof value.accountId === 'string' &&
       value.accountId &&
@@ -129,13 +125,11 @@ export async function prepareExistingCloudflareDeploy(options: {
   readExistingWorker?: typeof readExistingCloudflareWorker;
   approvedKv?: ReadonlyArray<ApprovedCloudflareKvBinding>;
 }): Promise<ExistingCloudflareWorker | null> {
-  const onDiskLink = readCloudflareLink(options.root);
-  const pending = options.pinnedLink === undefined ? onDiskLink : options.pinnedLink;
-  if (options.pinnedLink !== undefined && !isDeepStrictEqual(onDiskLink, options.pinnedLink)) {
-    throw new Error(
-      'The pending Cloudflare handoff changed while project code was running. Restore .void/cloudflare-link.json and retry.',
-    );
+  if (options.pinnedLink !== undefined) {
+    assertCloudflareLinkUnchanged(options.root, options.pinnedLink);
   }
+  const pending =
+    options.pinnedLink === undefined ? readCloudflareLink(options.root) : options.pinnedLink;
   if (!options.reuse && !pending) {
     return null;
   }
@@ -155,9 +149,22 @@ export async function prepareExistingCloudflareDeploy(options: {
     configPath: options.configPath,
     workerName: config.name,
   });
+  const patch: Record<string, unknown> = { account_id: options.accountId, keep_vars: true };
+  // Native deploys may add version metadata only to their generated artifact.
+  // Reuse the inspected binding when omitted; authored replacements still fail validation.
+  const metadataBindings = existing.bindings.filter(
+    (binding) => binding.type === 'version_metadata',
+  );
+  if (
+    config.version_metadata === undefined &&
+    metadataBindings.length === 1 &&
+    typeof metadataBindings[0]!.name === 'string'
+  ) {
+    config.version_metadata = { binding: metadataBindings[0]!.name };
+    patch.version_metadata = config.version_metadata;
+  }
   assertExistingCloudflareConfig(existing, config, false, options.approvedKv);
   let updated = text;
-  const patch: Record<string, unknown> = { account_id: options.accountId, keep_vars: true };
   for (const key of ['compatibility_date', 'compatibility_flags', 'limits']) {
     if (config[key] === undefined && existing.runtime[key] !== undefined) {
       patch[key] = existing.runtime[key];

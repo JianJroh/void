@@ -11,6 +11,7 @@ import {
   saveOperatorToken,
 } from './operator-auth.ts';
 import { OperatorClient, OperatorClientError } from './operator-client.ts';
+import { printSuccess } from './output.ts';
 
 const MAX_RUNTIME_FOLLOW_ROWS = 10_000;
 export const BUILD_LOG_DRAIN_TIMEOUT_MS: number = 2 * 60_000;
@@ -89,7 +90,32 @@ function eventLines(events: Array<unknown>, indent: string): Array<string> {
   ]);
 }
 
-function humanLines(value: unknown, indent = ''): Array<string> {
+const LABEL_WORDS: Record<string, string> = {
+  api: 'API',
+  dns: 'DNS',
+  github: 'GitHub',
+  http: 'HTTP',
+  id: 'ID',
+  ids: 'IDs',
+  oauth: 'OAuth',
+  oidc: 'OIDC',
+  url: 'URL',
+  urls: 'URLs',
+};
+
+function fieldLabel(key: string): string {
+  const words = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((word) => LABEL_WORDS[word.toLowerCase()] ?? word.toLowerCase());
+  if (words[0]) {
+    words[0] = words[0][0]!.toUpperCase() + words[0].slice(1);
+  }
+  return words.join(' ');
+}
+
+export function humanLines(value: unknown, indent = ''): Array<string> {
   if (Array.isArray(value)) {
     return table(value, indent);
   }
@@ -97,7 +123,7 @@ function humanLines(value: unknown, indent = ''): Array<string> {
     return [`${indent}${printable(value)}`];
   }
   return Object.entries(value).flatMap(([key, item]) => {
-    const label = key.replaceAll('_', ' ').replace(/([a-z])([A-Z])/g, '$1 $2');
+    const label = fieldLabel(key);
     if (Array.isArray(item)) {
       return [
         `${indent}${label}:`,
@@ -113,6 +139,30 @@ function humanLines(value: unknown, indent = ''): Array<string> {
 
 function output(value: unknown, json: boolean): void {
   console.log(json ? JSON.stringify(value) : humanLines(value).join('\n'));
+}
+
+function outputMutation(result: Record<string, unknown>, args: OperatorArgs): void {
+  output(result, args.json);
+  // Some successful HTTP responses checkpoint work rather than complete it.
+  const configuration = result.configuration as { status?: string } | undefined;
+  const project = result.project as { state?: string; last_error?: string | null } | undefined;
+  if (
+    args.json ||
+    result.ok === false ||
+    result.partial === true ||
+    result.complete === false ||
+    result.error ||
+    (result.operationStatus && result.operationStatus !== 'completed') ||
+    (configuration?.status &&
+      configuration.status !== 'ready' &&
+      configuration.status !== 'disabled') ||
+    project?.state === 'reconciling' ||
+    project?.state === 'error' ||
+    project?.last_error
+  ) {
+    return;
+  }
+  printSuccess(`Platform ${args.group} ${args.action} completed.`);
 }
 
 function outputLogs(result: Record<string, unknown>, json: boolean): void {
@@ -313,6 +363,9 @@ async function runAuth(origin: string, args: OperatorArgs): Promise<void> {
     } else {
       saveOperatorToken(origin, token);
       output({ origin, ...identity }, args.json);
+      if (!args.json) {
+        printSuccess('Signed in to platform administration.');
+      }
     }
     return;
   }
@@ -338,6 +391,9 @@ async function runAuth(origin: string, args: OperatorArgs): Promise<void> {
       },
       args.json,
     );
+    if (!args.json) {
+      printSuccess('Signed out of platform administration.');
+    }
   } else {
     const session = await client.request('/session');
     if (args.action === 'token') {
@@ -432,8 +488,8 @@ export async function followOperatorLogs(
             return;
           }
           // `null` means the current server cannot prove completion. `undefined`
-          // comes from platforms before 0.20.0 (commit 16a15403). Operator
-          // commands do not run the minimum platform version check, so keep it.
+          // comes from platforms before 0.20.0. Operator commands do not run the
+          // minimum platform version check, so keep it.
           if (result.logsComplete === null || result.logsComplete === undefined) {
             throw new OperatorClientError(
               'This platform cannot confirm that the final build logs were captured. Upgrade the platform runtime, or read the retained logs without --follow.',
@@ -558,6 +614,9 @@ async function migrateDeploymentAssets(
     // Preserve each successful continuation in stdout if a later batch fails or is interrupted.
     output(result, args.json);
     if (result.complete) {
+      if (!args.json) {
+        printSuccess('Deployment assets migrated.');
+      }
       return;
     }
     const cursor = nextCursor as string;
@@ -643,9 +702,9 @@ export async function runOperatorCommand(args: OperatorArgs): Promise<void> {
         : {}),
       ...recoveryFence,
     };
-    output(
+    outputMutation(
       await client.request(args.path, { method: 'POST', body, timeoutMs: args.timeoutMs }),
-      args.json,
+      args,
     );
   } else if (args.follow) {
     await followOperatorLogs(client, args);
@@ -663,7 +722,7 @@ export async function runOperatorCommand(args: OperatorArgs): Promise<void> {
       console.log(
         [
           ...humanLines({ pagination: result.pagination }),
-          'deployments:',
+          'Deployments:',
           ...eventLines(result.deployments, '  '),
         ].join('\n'),
       );

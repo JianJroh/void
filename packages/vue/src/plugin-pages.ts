@@ -1,14 +1,17 @@
 import { existsSync, readdirSync } from 'node:fs';
 import { dirname } from 'pathslash';
 import { normalizePath, type Plugin, type ResolvedConfig, type ViteDevServer } from 'vite';
-import { resolveStaticPageDataBuildOptions, scanPages } from 'void/pages';
+import {
+  generateComponentManifest,
+  resolveStaticPageDataBuildOptions,
+  scanPages,
+} from 'void/pages';
 import type { PageScanResult, StaticPageDataBuildOptions } from 'void/pages';
-import { generateComponentManifest } from './pages-manifest.ts';
 
 const RENDERER_ID = 'virtual:void-pages-renderer';
 const CLIENT_ENTRY_ID = 'virtual:void-pages-client';
 
-type PrefetchConfig = {
+export type PrefetchConfig = {
   hoverDelay?: number;
   cacheFor?: number | string | [string, string];
 };
@@ -355,7 +358,7 @@ function replaceRecord(target, source) {
   Object.assign(target, source || {});
 }
 
-const { router, initialPageData, initialComponent, initialLayouts, start } =
+const { router, initialPageData, initialComponent, initialLayouts, start, commitInitialRender } =
   await createVoidRouter({
     adapter: {
       createDeferred: () => createDeferred(),
@@ -402,7 +405,7 @@ currentLayouts.value = initialLayouts;
 
 const appEl = document.getElementById("app");
 if (!appEl) throw new Error("pages: Missing #app element for Void Vue pages hydration.");
-const createVoidApp = appEl?.getAttribute("data-void-ssr") === "false" ? createApp : createSSRApp;
+const createVoidApp = appEl.getAttribute("data-void-ssr") === "false" ? createApp : createSSRApp;
 const app = createVoidApp({
   setup() {
     provide("__void_shared", shared);
@@ -428,5 +431,6 @@ app.mount(appEl);
 appEl.setAttribute("data-hydrated", "true");
 export { reactiveRouter as router };
 start();
+commitInitialRender();
 `;
 }

@@ -256,7 +256,7 @@ Authentication errors (`401`, `403`), server errors (`500`, `502`), and unexpect
 Actions can throw `ValidationError` for custom validation logic:
 
 ```ts
-import { defineHandler, ValidationError } from 'void';
+import { defineHandler, ValidationError } from 'void/handler';
 
 export const action = defineHandler(async (c) => {
   const body = await c.req.json();
@@ -269,7 +269,7 @@ export const action = defineHandler(async (c) => {
 
 ### Usage limits
 
-For [AI](../ai.md) and [Sandbox](../sandboxes.md) actions, return `limit.response({ message: 'Try again shortly. Your draft is still editable.' })` from the operation's `limited` handler. `Form` displays the message and waits until a known retry deadline before allowing resubmission. It keeps the fields editable and never retries automatically.
+For [AI](../ai.md#usage-limits) and [Sandbox](../sandboxes.md#usage-limits) actions, an uncaught `UsageLimit` automatically produces a structured HTTP 429. To customize the message, catch the error with `instanceof UsageLimit` and return `error.response({ message: 'Try again shortly. Your draft is still editable.' })`. `Form` displays the message and waits until a known retry deadline before allowing resubmission. It keeps the fields editable and never retries automatically.
 
 ## Authentication and origin checks
 

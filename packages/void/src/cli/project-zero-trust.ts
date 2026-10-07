@@ -1,14 +1,14 @@
-import { log, note, outro } from '@voidzero-dev/vite-plus-prompts';
+import { log, outro } from '@voidzero-dev/vite-plus-prompts';
 import { getToken } from './auth.ts';
 import {
   PlatformClient,
   type ProjectZeroTrustResponse,
   type ProjectZeroTrustUpdateResponse,
 } from './client.ts';
-import { sanitizeTerminalText } from './output.ts';
+import { printSuccess, note, sanitizeTerminalText } from './output.ts';
 import type { ProjectArgs } from './project-args.ts';
 import { readProjectConfig } from './project.ts';
-import { getRequestedProjectSlug, resolveProjectBySlug } from './resolve-project.ts';
+import { getRequestedProjectSlug, requireProjectBySlug } from './resolve-project.ts';
 
 type ZeroTrustArgs = Extract<ProjectArgs, { subcommand: 'zero-trust' }> & {
   action: 'status' | 'protect' | 'public' | 'reconcile';
@@ -22,10 +22,7 @@ async function resolveTarget(root: string, args: ZeroTrustArgs) {
   const client = new PlatformClient(token, { root });
   const requestedSlug = getRequestedProjectSlug({ projectSlug: args.projectSlug });
   if (requestedSlug) {
-    const project = resolveProjectBySlug(await client.listProjects(), requestedSlug);
-    if (!project) {
-      throw new Error(`project: No project found with slug '${requestedSlug}'.`);
-    }
+    const project = await requireProjectBySlug(client, requestedSlug);
     return { client, projectId: project.projectId, slug: project.slug };
   }
   const linked = readProjectConfig(root);
@@ -86,7 +83,11 @@ export async function runProjectZeroTrustCommand(root: string, args: ZeroTrustAr
     );
     return;
   }
-  outro(
+  if (result.project.last_error || result.project.state === 'error') {
+    outro(`${slug} Zero Trust needs attention (${result.project.state}).`);
+    return;
+  }
+  printSuccess(
     args.action === 'protect'
       ? `${slug} is protected by Zero Trust.`
       : args.action === 'public'

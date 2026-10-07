@@ -18,6 +18,7 @@ import {
 import type { Db } from '../db.ts';
 import {
   createProject,
+  createResource,
   getBuild,
   getProjectBuilds,
   getProjectBySlug,
@@ -58,18 +59,24 @@ import { type ApiEnv, isDevBypass } from '../env.ts';
 import { validateSubmittedExecutionPlans } from '../migrations/execution-plan.ts';
 import { ensureTrackingTable, queryD1, runRemoteMigrations } from '../migrations/remote-runner.ts';
 import { getProjectDeploymentWorkerName, getProjectQueueName } from '../naming.ts';
+import { LOG_ROW_GROUP_BY } from '../observability/log-rows.ts';
 import { resolvePlan, resolvePlanLimits } from '../plans.ts';
 import { PROJECT_PERMISSION_MESSAGES } from '../project-access.ts';
 import { encryptProjectSecret, decryptProjectSecret } from '../project-secrets.ts';
 import { ProjectRequiresNormalizationError, requireNormalizedProject } from '../project-state.ts';
+import { projectWithUrl } from '../project-url.ts';
 import {
   CloudflareApiError,
   InvalidHyperdriveConnectionStringError,
   addQueueConsumer,
+  createHyperdrive,
+  deleteHyperdrive,
   getDispatchWorkerProxyToken,
+  getHyperdriveByName,
   removeQueueConsumer,
   restoreQueueConsumer,
   snapshotQueueConsumer,
+  updateHyperdrive,
 } from '../provisioning/cloudflare-api.ts';
 import {
   addDestination,
@@ -88,7 +95,8 @@ import {
   resolveRoutingUndo,
 } from '../routing.ts';
 import type { Build, DeployManifest, Project, ProjectRole, User } from '../types.ts';
-import { zeroTrustNotReadyMessage } from '../zero-trust/errors.ts';
+import { ZeroTrustUnavailableError, zeroTrustNotReadyMessage } from '../zero-trust/errors.ts';
+import { lockZeroTrustConfiguration } from '../zero-trust/lock.ts';
 import { initializeNewProjectZeroTrust } from '../zero-trust/project.ts';
 import {
   resolveProjectZeroTrustRouting,
@@ -98,7 +106,7 @@ import {
 import { publicProjectZeroTrustState } from '../zero-trust/state.ts';
 import { rollbackCfDestination } from './email.ts';
 import { requireProjectRouteCapability } from './project-access.ts';
-import { getRequestsDataset, queryProjectRequestOverview } from './usage.ts';
+import { getRequestsDataset, queryAnalyticsEngine, queryProjectRequestOverview } from './usage.ts';
 
 /**
  * Slugs no project may claim. Two overlapping reasons:
@@ -340,13 +348,6 @@ function sortProjectList(a: ProjectListItem, b: ProjectListItem): number {
 }
 
 /**
- * D1 returns "no such table" when a table is missing. GET /:id/migrations
- * probes both `_void_migrations` and `_migrations` and must tolerate either
- * being absent, but must NOT silently swallow unrelated errors (auth failure,
- * timeout, quota, "database is locked", etc.) — those should surface to the
- * caller instead of returning an empty applied set.
- */
-/**
  * Resolve the proxy token to use when re-targeting routing/cron at a
  * historical deployment.
  *
@@ -393,6 +394,13 @@ async function resolveRollbackProxyToken(
   return hmacSignState(projectId, env.JWT_SECRET);
 }
 
+/**
+ * D1 returns "no such table" when a table is missing. GET /:id/migrations
+ * probes both `_void_migrations` and `_migrations` and must tolerate either
+ * being absent, but must NOT silently swallow unrelated errors (auth failure,
+ * timeout, quota, "database is locked", etc.) — those should surface to the
+ * caller instead of returning an empty applied set.
+ */
 function isMissingTableError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /no such table/i.test(msg);
@@ -742,7 +750,13 @@ const app = new Hono<ApiEnv>()
 
     const userId = context.get('user').id;
     try {
-      const project = await createProject(context.get('db'), userId, body.slug);
+      // `void platform uninstall --purge-resources` holds this lock across its last
+      // check for projects and records the uninstall before releasing it, so a
+      // project either commits before that check or is refused here.
+      const project = await context.get('db').transaction(async (tx) => {
+        await lockZeroTrustConfiguration(tx, 'shared');
+        return createProject(tx, userId, body.slug);
+      });
       let zeroTrust: Awaited<ReturnType<typeof initializeNewProjectZeroTrust>> = null;
       let zeroTrustWarning: string | undefined;
       try {
@@ -813,6 +827,14 @@ const app = new Hono<ApiEnv>()
         201,
       );
     } catch (err) {
+      // Only the configuration lock above throws this here: the uninstall
+      // record exists.
+      if (err instanceof ZeroTrustUnavailableError) {
+        return context.json(
+          { error: 'The platform is being uninstalled, so new projects cannot be created.' },
+          err.status,
+        );
+      }
       // Unique constraint violation — slug was taken between check and insert
       if (
         err instanceof Error &&
@@ -898,17 +920,11 @@ const app = new Hono<ApiEnv>()
       const minted = await context.get('db').transaction(async (tx) => {
         await tx.execute(drizzleSql`SELECT id FROM projects WHERE id = ${project.id} FOR SHARE`);
         await tx.execute(drizzleSql`SELECT id FROM builds WHERE id = ${deployBuild} FOR UPDATE`);
-        const txDb = tx as unknown as Db;
-        const lockedAccess = await requireProjectRouteCapability(
-          context,
-          project.id,
-          'deploy',
-          txDb,
-        );
+        const lockedAccess = await requireProjectRouteCapability(context, project.id, 'deploy', tx);
         if (lockedAccess instanceof Response) {
           return lockedAccess;
         }
-        const boundBuild = await getBuild(txDb, deployBuild);
+        const boundBuild = await getBuild(tx, deployBuild);
         if (
           lockedAccess.project.status === 'deleting' ||
           !boundBuild ||
@@ -978,18 +994,17 @@ const app = new Hono<ApiEnv>()
 
     return context.get('db').transaction(async (tx) => {
       await tx.execute(drizzleSql`SELECT id FROM projects WHERE id = ${projectId} FOR UPDATE`);
-      const txDb = tx as unknown as Db;
-      const lockedAccess = await requireProjectRouteCapability(context, projectId, 'deploy', txDb);
+      const lockedAccess = await requireProjectRouteCapability(context, projectId, 'deploy', tx);
       if (lockedAccess instanceof Response) {
         return lockedAccess;
       }
 
-      const deployment = await getDeployment(txDb, deploymentId);
+      const deployment = await getDeployment(tx, deploymentId);
       if (!deployment || deployment.project_id !== projectId) {
         return context.json({ error: 'deployment not found' }, 404);
       }
 
-      const canceling = await cancelDeployment(txDb, deploymentId, 'canceled by user');
+      const canceling = await cancelDeployment(tx, deploymentId, 'canceled by user');
       if (!canceling) {
         return context.json(
           { error: 'deployment already completed', status: deployment.status },
@@ -1036,18 +1051,14 @@ const app = new Hono<ApiEnv>()
     if (!preCheck.retained) {
       return context.json({ error: 'deployment not retained (worker script evicted)' }, 400);
     }
-    if (
-      preCheck.manifest &&
-      (JSON.parse(preCheck.manifest) as DeployManifest).sandbox &&
-      !getPlatformCapabilities(context.env).sandbox
-    ) {
-      return context.json(
-        { error: 'This Void platform does not enable rollback to Sandbox deployments.' },
-        501,
-      );
-    }
     if (preCheck.manifest) {
       const manifest = JSON.parse(preCheck.manifest) as DeployManifest;
+      if (manifest.sandbox && !getPlatformCapabilities(context.env).sandbox) {
+        return context.json(
+          { error: 'This Void platform does not enable rollback to Sandbox deployments.' },
+          501,
+        );
+      }
       if (manifest.sandbox && (!isManagedSandbox(manifest) || preCheck.admission_protocol < 3)) {
         return context.json(
           {
@@ -1099,13 +1110,7 @@ const app = new Hono<ApiEnv>()
     try {
       const rollbackLease = await context.get('db').transaction(async (tx) => {
         await tx.execute(drizzleSql`SELECT id FROM projects WHERE id = ${projectId} FOR UPDATE`);
-        const txDb = tx as unknown as Db;
-        const lockedAccess = await requireProjectRouteCapability(
-          context,
-          projectId,
-          'deploy',
-          txDb,
-        );
+        const lockedAccess = await requireProjectRouteCapability(context, projectId, 'deploy', tx);
         if (lockedAccess instanceof Response) {
           const denied = await getProjectAccessErrorBody(lockedAccess);
           throw new RollbackError(
@@ -1120,18 +1125,18 @@ const app = new Hono<ApiEnv>()
           throw new RollbackError(409, 'project is being deleted');
         }
         try {
-          await requireNormalizedProject(txDb, lockedProject);
+          await requireNormalizedProject(tx, lockedProject);
         } catch (error) {
           if (error instanceof ProjectRequiresNormalizationError) {
             throw new RollbackError(409, error.code, undefined, error.message);
           }
           throw error;
         }
-        const pendingOperation = await getPendingDeploymentOperation(txDb, projectId);
+        const pendingOperation = await getPendingDeploymentOperation(tx, projectId);
         if (pendingOperation) {
           throw new RollbackError(409, `deploy in progress: ${pendingOperation.id}`);
         }
-        const activeDeploy = await getActiveDeployment(txDb, projectId);
+        const activeDeploy = await getActiveDeployment(tx, projectId);
         if (activeDeploy) {
           if (activeDeploy.source === 'rollback-lease' && activeDeploy.manifest) {
             try {
@@ -1160,7 +1165,7 @@ const app = new Hono<ApiEnv>()
                   throw new RollbackError(409, `deploy in progress: ${activeDeploy.id}`);
                 }
                 const migrationDiff = lease.migrationDiff as Array<string>;
-                const released = await deleteRollbackLease(txDb, activeDeploy.id, lease.ownerId);
+                const released = await deleteRollbackLease(tx, activeDeploy.id, lease.ownerId);
                 if (!released) {
                   throw new RollbackError(409, `deploy in progress: ${activeDeploy.id}`);
                 }
@@ -1172,7 +1177,7 @@ const app = new Hono<ApiEnv>()
                 (lease.state === 'retryable' || staleRunningLease)
               ) {
                 const adopted = await updateRollbackLeaseState(
-                  txDb,
+                  tx,
                   activeDeploy.id,
                   deploymentId,
                   'running',
@@ -1191,7 +1196,7 @@ const app = new Hono<ApiEnv>()
           throw new RollbackError(409, `deploy in progress: ${activeDeploy.id}`);
         }
         const lease = await createDeployment(
-          txDb,
+          tx,
           projectId,
           JSON.stringify({
             version: 1,
@@ -1218,12 +1223,11 @@ const app = new Hono<ApiEnv>()
           // first statement in the locked section so serialization is
           // established before any subsequent read or write.
           await tx.execute(drizzleSql`SELECT id FROM projects WHERE id = ${projectId} FOR UPDATE`);
-          const txDb = tx as unknown as Db;
           const lockedAccess = await requireProjectRouteCapability(
             context,
             projectId,
             'deploy',
-            txDb,
+            tx,
           );
           if (lockedAccess instanceof Response) {
             const denied = await getProjectAccessErrorBody(lockedAccess);
@@ -1239,25 +1243,21 @@ const app = new Hono<ApiEnv>()
           // rewritten by a concurrent /rename; manifest and retained are
           // stable in practice but re-reading is cheap and removes every
           // time-of-check / time-of-use hazard on this row.
-          const target = await getDeployment(txDb, deploymentId);
+          const target = await getDeployment(tx, deploymentId);
           if (!target || target.project_id !== projectId) {
             throw new RollbackError(404, 'deployment not found');
           }
           if (!target.retained) {
             throw new RollbackError(400, 'deployment not retained (worker script evicted)');
           }
-          if (
-            target.manifest &&
-            (JSON.parse(target.manifest) as DeployManifest).sandbox &&
-            !getPlatformCapabilities(context.env).sandbox
-          ) {
-            throw new RollbackError(
-              501,
-              'This Void platform does not enable rollback to Sandbox deployments.',
-            );
-          }
           if (target.manifest) {
             const manifest = JSON.parse(target.manifest) as DeployManifest;
+            if (manifest.sandbox && !getPlatformCapabilities(context.env).sandbox) {
+              throw new RollbackError(
+                501,
+                'This Void platform does not enable rollback to Sandbox deployments.',
+              );
+            }
             if (manifest.sandbox) {
               if (!isManagedSandbox(manifest) || target.admission_protocol < 3) {
                 throw new RollbackError(
@@ -1291,11 +1291,11 @@ const app = new Hono<ApiEnv>()
           if (lockedProject.status === 'deleting') {
             throw new RollbackError(409, 'project is being deleted');
           }
-          const pendingOperation = await getPendingDeploymentOperation(txDb, projectId);
+          const pendingOperation = await getPendingDeploymentOperation(tx, projectId);
           if (pendingOperation) {
             throw new RollbackError(409, `deploy in progress: ${pendingOperation.id}`);
           }
-          const activeDeploy = await getActiveDeployment(txDb, projectId);
+          const activeDeploy = await getActiveDeployment(tx, projectId);
           let ownsRollbackLease = false;
           if (activeDeploy && activeDeploy.id === rollbackLeaseId && activeDeploy.manifest) {
             try {
@@ -1316,9 +1316,9 @@ const app = new Hono<ApiEnv>()
             ? JSON.parse(target.applied_migrations)
             : [];
 
-          const projectMigrationNames = await getProjectMigrationNames(txDb, projectId);
+          const projectMigrationNames = await getProjectMigrationNames(tx, projectId);
           const currentActive = lockedProject.active_deployment_id
-            ? await getDeployment(txDb, lockedProject.active_deployment_id)
+            ? await getDeployment(tx, lockedProject.active_deployment_id)
             : null;
           const currentMigrations: Array<string> =
             projectMigrationNames.length > 0
@@ -1385,7 +1385,7 @@ const app = new Hono<ApiEnv>()
           const workerName = getProjectDeploymentWorkerName(lockedProject.slug, target.id);
           const existingRouting = await context.env.ROUTING.get(lockedProject.slug);
           const existingEntry = existingRouting ? JSON.parse(existingRouting) : null;
-          const zeroTrust = await resolveProjectZeroTrustRouting(txDb, projectId).catch(
+          const zeroTrust = await resolveProjectZeroTrustRouting(tx, projectId).catch(
             (error: unknown) => {
               const message = zeroTrustNotReadyMessage(error);
               throw message
@@ -1454,8 +1454,8 @@ const app = new Hono<ApiEnv>()
 
           // PG flip FIRST. If this throws, no external state is mutated
           // yet — the tx rolls back cleanly and the caller can retry.
-          await updateProjectType(txDb, projectId, targetType);
-          await setActiveDeployment(txDb, projectId, target.id);
+          await updateProjectType(tx, projectId, targetType);
+          await setActiveDeployment(tx, projectId, target.id);
 
           const snapshottedRoutingKeys = new Set<string>();
           const snapshotRoutingKey = async (key: string): Promise<void> => {
@@ -1528,7 +1528,6 @@ const app = new Hono<ApiEnv>()
             // prior failed cutover could leave the DO holding schedules that
             // no pg manifest still mentions, and a guarded clear would let
             // that stale DO state persist across every future rollback.
-            //
             const previousCronState = await snapshotCronScheduler(context.env, projectId);
             externalUndo.push(() =>
               restoreCronScheduler(context.env, projectId, previousCronState),
@@ -1544,7 +1543,7 @@ const app = new Hono<ApiEnv>()
             }
 
             // Update custom domain routing
-            const projectDomains = await getDomainsByProjectId(txDb, projectId);
+            const projectDomains = await getDomainsByProjectId(tx, projectId);
             for (const domain of projectDomains) {
               if (domain.status === 'active') {
                 await putRouting(`domain:${domain.hostname}`, routingJson);
@@ -1568,8 +1567,8 @@ const app = new Hono<ApiEnv>()
             // excluded, so rollback does not clobber KV routes an in-flight
             // deploy is provisioning.
             const [activatedDeployments, terminalFailedDeployments] = await Promise.all([
-              getActivatedDeployments(txDb, projectId),
-              getTerminalFailedDeployments(txDb, projectId),
+              getActivatedDeployments(tx, projectId),
+              getTerminalFailedDeployments(tx, projectId),
             ]);
             const sweepQueueNames = new Set<string>();
             const unionSource = [...activatedDeployments, ...terminalFailedDeployments];
@@ -1596,7 +1595,7 @@ const app = new Hono<ApiEnv>()
             for (const name of targetQueueNames) {
               sweepQueueNames.add(name);
             }
-            const queueResources = await getProjectResources(txDb, projectId);
+            const queueResources = await getProjectResources(tx, projectId);
             const dispatchWorkerName = context.env.DISPATCH_WORKER_NAME ?? 'void-dispatch';
             const queueResourceByName = new Map(
               queueResources
@@ -1705,7 +1704,7 @@ const app = new Hono<ApiEnv>()
           // `active_deployment_id` alone is insufficient when the requested
           // rollback target was already active before this transaction began.
           const witnessed = await updateRollbackLeaseState(
-            txDb,
+            tx,
             rollbackLeaseId!,
             deploymentId,
             'applied',
@@ -1771,8 +1770,7 @@ const app = new Hono<ApiEnv>()
               await tx.execute(
                 drizzleSql`SELECT id FROM projects WHERE id = ${projectId} FOR UPDATE`,
               );
-              const txDb = tx as unknown as Db;
-              const activeLease = await getActiveDeployment(txDb, projectId);
+              const activeLease = await getActiveDeployment(tx, projectId);
               let stillOwnsLease = false;
               if (activeLease && activeLease.id === rollbackLeaseId && activeLease.manifest) {
                 try {
@@ -1785,7 +1783,7 @@ const app = new Hono<ApiEnv>()
               if (!stillOwnsLease) {
                 return;
               }
-              const zeroTrust = await resolveProjectZeroTrustRoutingForPublication(txDb, projectId);
+              const zeroTrust = await resolveProjectZeroTrustRoutingForPublication(tx, projectId);
               for (const undo of [...externalUndo].reverse()) {
                 try {
                   await undo(zeroTrust);
@@ -1813,7 +1811,7 @@ const app = new Hono<ApiEnv>()
               } catch (compensationError) {
                 compensationErrors.push(compensationError);
               }
-              for (const domain of await getDomainsByProjectId(txDb, projectId)) {
+              for (const domain of await getDomainsByProjectId(tx, projectId)) {
                 try {
                   if (domain.status === 'active' && restoredProjectRouting !== null) {
                     await context.env.ROUTING.put(
@@ -2012,7 +2010,7 @@ const app = new Hono<ApiEnv>()
     //
     // Dedup uses a name → applied_at map with last-write-wins, and
     // _void_migrations is always read second so its timestamps win on
-    // overlaps (matching the pre-fix "primary is _void_migrations" semantics).
+    // overlaps.
     const byName = new Map<string, string>();
 
     try {
@@ -2107,7 +2105,6 @@ const app = new Hono<ApiEnv>()
     // which would leave D1 and pg permanently diverged.
     try {
       const outcome = await context.get('db').transaction(async (tx) => {
-        const txDb = tx as unknown as Db;
         // Per-project row lock. Must be the first statement so all
         // subsequent reads/writes serialize against any concurrent
         // /apply, /rename, or /rollback holding the same row.
@@ -2116,7 +2113,7 @@ const app = new Hono<ApiEnv>()
           context,
           projectId,
           'configure',
-          txDb,
+          tx,
         );
         if (lockedAccess instanceof Response) {
           return {
@@ -2125,7 +2122,7 @@ const app = new Hono<ApiEnv>()
           };
         }
 
-        const resources = await getProjectResources(txDb, projectId);
+        const resources = await getProjectResources(tx, projectId);
         const d1Resource = resources.find((r) => r.type === 'd1');
         if (!d1Resource) {
           return { status: 400 as const, body: { error: 'no D1 database found for this project' } };
@@ -2189,14 +2186,14 @@ const app = new Hono<ApiEnv>()
         const effectiveNames = [...result.applied, ...result.skipped];
         if (effectiveNames.length > 0) {
           await appendProjectMigrations(
-            txDb,
+            tx,
             projectId,
             effectiveNames,
-            locked?.active_deployment_id ?? undefined,
+            locked.active_deployment_id ?? undefined,
           );
         }
-        if (effectiveNames.length > 0 && locked?.active_deployment_id) {
-          await appendAppliedMigrations(txDb, locked.active_deployment_id, effectiveNames);
+        if (effectiveNames.length > 0 && locked.active_deployment_id) {
+          await appendAppliedMigrations(tx, locked.active_deployment_id, effectiveNames);
         }
 
         if (result.failed) {
@@ -2304,7 +2301,6 @@ const app = new Hono<ApiEnv>()
     // name to pg.
     try {
       const outcome = await context.get('db').transaction(async (tx) => {
-        const txDb = tx as unknown as Db;
         // Per-project row lock. Must be the first statement so all
         // subsequent reads/writes serialize against any concurrent
         // /apply, /rename, or /rollback holding the same row.
@@ -2313,7 +2309,7 @@ const app = new Hono<ApiEnv>()
           context,
           projectId,
           'configure',
-          txDb,
+          tx,
         );
         if (lockedAccess instanceof Response) {
           return {
@@ -2325,7 +2321,7 @@ const app = new Hono<ApiEnv>()
           };
         }
 
-        const resources = await getProjectResources(txDb, projectId);
+        const resources = await getProjectResources(tx, projectId);
         const d1Resource = resources.find((r) => r.type === 'd1');
         if (!d1Resource) {
           return { status: 400 as const, body: { error: 'no D1 database found for this project' } };
@@ -2393,10 +2389,10 @@ const app = new Hono<ApiEnv>()
             // row is durable proof that this exact (project_id, from, to)
             // rename was already committed here — which fat-finger
             // requests will never have.
-            const stalePg = await activeDeploymentContainsMigration(txDb, projectId, from);
+            const stalePg = await activeDeploymentContainsMigration(tx, projectId, from);
             const auditLogged = stalePg
               ? false
-              : await migrationRenameExists(txDb, projectId, from, to);
+              : await migrationRenameExists(tx, projectId, from, to);
             if (!stalePg && !auditLogged) {
               return {
                 status: 400 as const,
@@ -2557,12 +2553,12 @@ const app = new Hono<ApiEnv>()
         // same locked tx as the heal/record, so a rollback unwinds all
         // three together.
         if (committed.length > 0) {
-          await renameProjectMigrations(txDb, projectId, committed);
-          await renameAppliedMigrationsForProject(txDb, projectId, committed);
+          await renameProjectMigrations(tx, projectId, committed);
+          await renameAppliedMigrationsForProject(tx, projectId, committed);
           for (const { from } of committed) {
-            await invalidateMigrationRenamesForOldName(txDb, projectId, from);
+            await invalidateMigrationRenamesForOldName(tx, projectId, from);
           }
-          await recordMigrationRenames(txDb, projectId, committed);
+          await recordMigrationRenames(tx, projectId, committed);
         }
 
         if (pairFailure) {
@@ -2622,17 +2618,9 @@ const app = new Hono<ApiEnv>()
       return context.json({ error: 'invalid since parameter, use format like 15m, 2h, 3d' }, 400);
     }
 
-    // Validate before use: an unchecked negative reaches the SQL `LIMIT` and
-    // surfaces an Analytics Engine rejection as a misleading 502 rather than a
-    // client error.
-    const limitParam = context.req.query('limit');
-    let limit = 200;
-    if (limitParam !== undefined) {
-      const parsedLimit = Number(limitParam);
-      if (!Number.isInteger(parsedLimit) || parsedLimit <= 0) {
-        return context.json({ error: 'invalid limit parameter, use a positive integer' }, 400);
-      }
-      limit = Math.min(parsedLimit, 500);
+    const limit = parseAnalyticsLimit(context.req.query('limit'));
+    if (limit === null) {
+      return context.json({ error: 'invalid limit parameter, use a positive integer' }, 400);
     }
     const deploymentId = context.req.query('deploymentId');
     if (deploymentId && !/^dpl_[0-9a-z]+$/.test(deploymentId)) {
@@ -2685,24 +2673,19 @@ const app = new Hono<ApiEnv>()
         blob6 as statusCode,
         blob7 as deployId,
         double1 as ts,
-        timestamp
+        min(timestamp) as ingestedAt
       FROM ${dataset}
       WHERE index1 = '${workerName}'
         AND timestamp >= toDateTime('${sinceStr}')${deployFilter}${levelFilter}
-      ORDER BY timestamp DESC
+      ${LOG_ROW_GROUP_BY}
+      ORDER BY ingestedAt DESC
       LIMIT ${limit}
     `;
 
-    const response = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${context.env.CF_ACCOUNT_ID}/analytics_engine/sql`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${context.env.CF_API_TOKEN}`,
-          'Content-Type': 'text/plain',
-        },
-        body: query,
-      },
+    const response = await queryAnalyticsEngine(
+      context.env.CF_ACCOUNT_ID,
+      context.env.CF_API_TOKEN,
+      query,
     );
 
     const responseText = await response.text();
@@ -2747,8 +2730,8 @@ const app = new Hono<ApiEnv>()
       );
     }
 
-    // Query newest-first to match the working admin path, then return entries
-    // in chronological order for CLI readability.
+    // Query newest-first to match the admin log path, then return entries in
+    // chronological order for CLI readability.
     const data = [...(result.data ?? [])].reverse().map((row) => ({
       timestamp: row.ts,
       outcome: row.outcome,
@@ -2779,17 +2762,9 @@ const app = new Hono<ApiEnv>()
       return context.json({ error: 'invalid since parameter, use format like 15m, 2h, 3d' }, 400);
     }
 
-    // Validate before use: an unchecked negative reaches the SQL `LIMIT` and
-    // surfaces an Analytics Engine rejection as a misleading 502 rather than a
-    // client error.
-    const limitParam = context.req.query('limit');
-    let limit = 200;
-    if (limitParam !== undefined) {
-      const parsedLimit = Number(limitParam);
-      if (!Number.isInteger(parsedLimit) || parsedLimit <= 0) {
-        return context.json({ error: 'invalid limit parameter, use a positive integer' }, 400);
-      }
-      limit = Math.min(parsedLimit, 500);
+    const limit = parseAnalyticsLimit(context.req.query('limit'));
+    if (limit === null) {
+      return context.json({ error: 'invalid limit parameter, use a positive integer' }, 400);
     }
 
     // Optional status filter: a class like `5xx` (LIKE '5%') or an exact 3-digit
@@ -2812,9 +2787,7 @@ const app = new Hono<ApiEnv>()
     }
 
     const sinceStr = new Date(Date.now() - sinceMs).toISOString().replace('T', ' ').slice(0, 19);
-    const dataset =
-      context.env.REQUESTS_DATASET ??
-      (context.env.PLATFORM_ENV === 'staging' ? 'void_requests_staging' : 'void_requests');
+    const dataset = getRequestsDataset(context.env);
 
     // void_requests columns (see dispatch recordRequest): blob2 type, blob3
     // method, blob4 status, blob5 slug; double2 responseBytes, double3 durationMs.
@@ -2833,16 +2806,10 @@ const app = new Hono<ApiEnv>()
       LIMIT ${limit}
     `;
 
-    const response = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${context.env.CF_ACCOUNT_ID}/analytics_engine/sql`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${context.env.CF_API_TOKEN}`,
-          'Content-Type': 'text/plain',
-        },
-        body: query,
-      },
+    const response = await queryAnalyticsEngine(
+      context.env.CF_ACCOUNT_ID,
+      context.env.CF_API_TOKEN,
+      query,
     );
 
     const responseText = await response.text();
@@ -2966,20 +2933,13 @@ const app = new Hono<ApiEnv>()
       //  (b) the genuine stale-active window (PG terminal write threw) — PG is
       //      still non-terminal, so trust the DO's local terminal status.
       const fresh = await getBuild(context.get('db'), build.id);
-      if (fresh && isTerminalBuildStatus(fresh.status)) {
-        return context.json({
-          lines: body.lines,
-          lastSeq: body.lastSeq,
-          status: fresh.status,
-          terminal: true,
-          logsComplete,
-          external: null,
-        });
-      }
       return context.json({
         lines: body.lines,
         lastSeq: body.lastSeq,
-        status: body.status ?? build.status,
+        status:
+          fresh && isTerminalBuildStatus(fresh.status)
+            ? fresh.status
+            : (body.status ?? build.status),
         terminal: true,
         logsComplete,
         external: null,
@@ -3010,9 +2970,6 @@ const app = new Hono<ApiEnv>()
     }
 
     const { connectionString } = await context.req.json<{ connectionString: string }>();
-    const { createHyperdrive, updateHyperdrive, getHyperdriveByName, deleteHyperdrive } =
-      await import('../provisioning/cloudflare-api.ts');
-    const { createResource, getProjectResources } = await import('../db.ts');
 
     // Check if Hyperdrive already exists
     const existing = await getProjectResources(context.get('db'), projectId);
@@ -3039,12 +2996,11 @@ const app = new Hono<ApiEnv>()
     try {
       const lockedResponse = await context.get('db').transaction(async (tx) => {
         await tx.execute(drizzleSql`SELECT id FROM projects WHERE id = ${projectId} FOR UPDATE`);
-        const txDb = tx as unknown as Db;
         const lockedAccess = await requireProjectRouteCapability(
           context,
           projectId,
           'configure',
-          txDb,
+          tx,
         );
         if (lockedAccess instanceof Response) {
           return lockedAccess;
@@ -3055,7 +3011,7 @@ const app = new Hono<ApiEnv>()
 
         // Re-read after acquiring the lock. Membership changes, teardown, and
         // a competing database provision all serialize on this project row.
-        const lockedResources = await getProjectResources(txDb, projectId);
+        const lockedResources = await getProjectResources(tx, projectId);
         if (lockedResources.some((resource) => resource.type === 'hyperdrive')) {
           return context.json(
             { error: 'Hyperdrive already provisioned. Use PUT /database-url to update.' },
@@ -3064,47 +3020,15 @@ const app = new Hono<ApiEnv>()
         }
 
         try {
-          const hd = await createHyperdrive(
-            context.env.CF_ACCOUNT_ID,
-            context.env.CF_API_TOKEN,
-            resourceName,
-            connectionString,
-          );
+          const hd = await createOrAdoptHyperdrive(context.env, resourceName, connectionString);
           hyperdriveId = hd.id;
-          hyperdriveCreatedByUs = true;
+          hyperdriveCreatedByUs = hd.created;
         } catch (err: unknown) {
-          if (isAlreadyExistsError(err)) {
-            // CF already has a Hyperdrive for this name (orphaned from a prior
-            // partial failure). Update it while access is still protected by
-            // the project lock, then durably adopt its id below.
-            try {
-              const hd = await getHyperdriveByName(
-                context.env.CF_ACCOUNT_ID,
-                context.env.CF_API_TOKEN,
-                resourceName,
-              );
-              await updateHyperdrive(
-                context.env.CF_ACCOUNT_ID,
-                context.env.CF_API_TOKEN,
-                hd.id,
-                connectionString,
-                resourceName,
-              );
-              hyperdriveId = hd.id;
-            } catch (lookupErr: unknown) {
-              const response = toDatabaseProvisioningError(lookupErr);
-              if (response) {
-                return context.json(response.body, response.status);
-              }
-              throw lookupErr;
-            }
-          } else {
-            const response = toDatabaseProvisioningError(err);
-            if (response) {
-              return context.json(response.body, response.status);
-            }
-            throw err;
+          const response = toDatabaseProvisioningError(err);
+          if (response) {
+            return context.json(response.body, response.status);
           }
+          throw err;
         }
 
         if (!hyperdriveId) {
@@ -3115,13 +3039,13 @@ const app = new Hono<ApiEnv>()
           // COMMIT fails, the outer catch removes a Hyperdrive we created so
           // no untracked CF object is left behind.
           await upsertProjectDatabaseUrl(
-            txDb,
+            tx,
             projectId,
             encrypted.ciphertext,
             encrypted.iv,
             encrypted.keyVersion,
           );
-          await createResource(txDb, projectId, 'hyperdrive', hyperdriveId, 'HYPERDRIVE');
+          await createResource(tx, projectId, 'hyperdrive', hyperdriveId, 'HYPERDRIVE');
         } catch (error) {
           throw new DatabaseUrlPersistenceError(error);
         }
@@ -3166,9 +3090,6 @@ const app = new Hono<ApiEnv>()
     }
 
     const { connectionString } = await context.req.json<{ connectionString: string }>();
-    const { createHyperdrive, updateHyperdrive, getHyperdriveByName, deleteHyperdrive } =
-      await import('../provisioning/cloudflare-api.ts');
-    const { createResource, getProjectResources } = await import('../db.ts');
 
     const encrypted = await encryptProjectSecret(
       context.env,
@@ -3181,12 +3102,11 @@ const app = new Hono<ApiEnv>()
     try {
       const lockedResponse = await context.get('db').transaction(async (tx) => {
         await tx.execute(drizzleSql`SELECT id FROM projects WHERE id = ${projectId} FOR UPDATE`);
-        const txDb = tx as unknown as Db;
         const lockedAccess = await requireProjectRouteCapability(
           context,
           projectId,
           'configure',
-          txDb,
+          tx,
         );
         if (lockedAccess instanceof Response) {
           return lockedAccess;
@@ -3198,7 +3118,7 @@ const app = new Hono<ApiEnv>()
         // Resolve the resource only after taking the lock. This prevents two
         // creates and ensures a downgrade/removal is authoritative before any
         // live Hyperdrive update is sent to Cloudflare.
-        const lockedResources = await getProjectResources(txDb, projectId);
+        const lockedResources = await getProjectResources(tx, projectId);
         const lockedHyperdrive = lockedResources.find((resource) => resource.type === 'hyperdrive');
         if (lockedHyperdrive) {
           try {
@@ -3219,50 +3139,20 @@ const app = new Hono<ApiEnv>()
         } else {
           let hyperdriveId: string;
           try {
-            const hd = await createHyperdrive(
-              context.env.CF_ACCOUNT_ID,
-              context.env.CF_API_TOKEN,
-              resourceName,
-              connectionString,
-            );
+            const hd = await createOrAdoptHyperdrive(context.env, resourceName, connectionString);
             hyperdriveId = hd.id;
-            createdHyperdriveId = hd.id;
-          } catch (err: unknown) {
-            if (isAlreadyExistsError(err)) {
-              // An earlier partial attempt can leave an untracked object.
-              // Adopt it under the same project lock so no membership change
-              // can interleave its live update and the durable resource row.
-              try {
-                const hd = await getHyperdriveByName(
-                  context.env.CF_ACCOUNT_ID,
-                  context.env.CF_API_TOKEN,
-                  resourceName,
-                );
-                await updateHyperdrive(
-                  context.env.CF_ACCOUNT_ID,
-                  context.env.CF_API_TOKEN,
-                  hd.id,
-                  connectionString,
-                  resourceName,
-                );
-                hyperdriveId = hd.id;
-              } catch (lookupErr: unknown) {
-                const response = toDatabaseProvisioningError(lookupErr);
-                if (response) {
-                  return context.json(response.body, response.status);
-                }
-                throw lookupErr;
-              }
-            } else {
-              const response = toDatabaseProvisioningError(err);
-              if (response) {
-                return context.json(response.body, response.status);
-              }
-              throw err;
+            if (hd.created) {
+              createdHyperdriveId = hd.id;
             }
+          } catch (err: unknown) {
+            const response = toDatabaseProvisioningError(err);
+            if (response) {
+              return context.json(response.body, response.status);
+            }
+            throw err;
           }
           try {
-            await createResource(txDb, projectId, 'hyperdrive', hyperdriveId, 'HYPERDRIVE');
+            await createResource(tx, projectId, 'hyperdrive', hyperdriveId, 'HYPERDRIVE');
           } catch (error) {
             throw new DatabaseUrlPersistenceError(error);
           }
@@ -3270,7 +3160,7 @@ const app = new Hono<ApiEnv>()
 
         try {
           await upsertProjectDatabaseUrl(
-            txDb,
+            tx,
             projectId,
             encrypted.ciphertext,
             encrypted.iv,
@@ -3359,8 +3249,61 @@ function parseDuration(input: string): number | null {
   return ms;
 }
 
+/**
+ * Parse an optional positive `limit` query (default 200, capped at 500).
+ * Validated before use: an unchecked negative reaches the SQL `LIMIT` and
+ * surfaces an Analytics Engine rejection as a misleading 502 rather than a
+ * client error.
+ */
+function parseAnalyticsLimit(value: string | undefined): number | null {
+  if (value === undefined) {
+    return 200;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+  return Math.min(parsed, 500);
+}
+
 function isAlreadyExistsError(error: unknown): boolean {
   return error instanceof Error && error.message.toLowerCase().includes('already exists');
+}
+
+/**
+ * Create the project's Hyperdrive, or adopt one an earlier partial attempt left
+ * untracked under the same name by updating it in place. Callers hold the
+ * project lock so no membership change can interleave the live update and the
+ * durable resource row. `created` is true only for a fresh object — the only
+ * kind that is safe to delete if persistence later fails.
+ */
+async function createOrAdoptHyperdrive(
+  env: ApiEnv['Bindings'],
+  resourceName: string,
+  connectionString: string,
+): Promise<{ id: string; created: boolean }> {
+  try {
+    const hd = await createHyperdrive(
+      env.CF_ACCOUNT_ID,
+      env.CF_API_TOKEN,
+      resourceName,
+      connectionString,
+    );
+    return { id: hd.id, created: true };
+  } catch (err: unknown) {
+    if (!isAlreadyExistsError(err)) {
+      throw err;
+    }
+  }
+  const hd = await getHyperdriveByName(env.CF_ACCOUNT_ID, env.CF_API_TOKEN, resourceName);
+  await updateHyperdrive(
+    env.CF_ACCOUNT_ID,
+    env.CF_API_TOKEN,
+    hd.id,
+    connectionString,
+    resourceName,
+  );
+  return { id: hd.id, created: false };
 }
 
 function getHyperdriveResourceName(projectId: string): string {
@@ -3559,4 +3502,3 @@ function isSyntheticProviderEmail(email: string): boolean {
 }
 
 export default app;
-import { projectWithUrl } from '../project-url.ts';

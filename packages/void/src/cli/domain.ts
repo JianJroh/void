@@ -1,8 +1,8 @@
-import { log, note } from '@voidzero-dev/vite-plus-prompts';
+import { log } from '@voidzero-dev/vite-plus-prompts';
 import { getToken } from './auth.ts';
 import { type DomainStatusResponse, PlatformClient } from './client.ts';
 import type { DomainArgs } from './domain-args.ts';
-import { pc } from './output.ts';
+import { printSuccess, note, pc } from './output.ts';
 import { readDeploymentPlatform, readProjectConfig } from './project.ts';
 
 export async function runDomainCommand(root: string, args: DomainArgs): Promise<void> {
@@ -22,7 +22,6 @@ export async function runDomainCommand(root: string, args: DomainArgs): Promise<
 
   const client = new PlatformClient(token, { root });
 
-  // Resolve project
   const requestedSlug = args.projectSlug ?? process.env.VOID_PROJECT?.trim();
   let projectId: string | undefined;
 
@@ -66,21 +65,21 @@ async function runCloudflareDomainCommand(root: string, args: DomainArgs): Promi
 
   if (args.subcommand === 'add') {
     const result = await changeCloudflareDomain(root, args.hostname!, 'add');
-    log.success(
-      result.modified
-        ? `Domain ${args.hostname} added and activated on Cloudflare.`
-        : `Domain ${args.hostname} is already configured.`,
-    );
     note(
       'Cloudflare Custom Domains manages the DNS record and TLS certificate in the zone on your account.',
       'Cloudflare Domain',
     );
+    if (result.modified) {
+      printSuccess(`Domain ${args.hostname} added and activated on Cloudflare.`);
+    } else {
+      log.info(`Domain ${args.hostname} is already configured.`);
+    }
     return;
   }
   if (args.subcommand === 'delete') {
     const result = await changeCloudflareDomain(root, args.hostname!, 'delete');
     if (result.modified) {
-      log.success(`Domain ${args.hostname} removed from Cloudflare.`);
+      printSuccess(`Domain ${args.hostname} removed from Cloudflare.`);
     } else {
       log.info(`Domain ${args.hostname} is not configured.`);
     }
@@ -121,29 +120,19 @@ async function domainAdd(
   hostname: string,
 ): Promise<void> {
   const domain = await client.addDomain(projectId, hostname);
-  log.success(`Domain ${hostname} added (status: ${domain.status})`);
 
-  // Named locals make the section order explicit (CNAME -> ownership),
-  // rather than relying on the order of conditional pushes onto an array.
   // Cert DCV uses HTTP-DCV, so no user-facing SSL-validation records exist.
-  let cnameSection: string | undefined;
-  let ownershipSection: string | undefined;
-
-  if (domain.cname_target) {
-    cnameSection = `CNAME (traffic)\n    ${hostname} → ${domain.cname_target}`;
-  }
-
-  if (domain.ownership_verification) {
-    ownershipSection = `TXT (ownership verification)\n    ${domain.ownership_verification.name} → ${domain.ownership_verification.value}`;
-  }
-
-  const recordSections = [cnameSection, ownershipSection].filter((s) => s !== undefined);
+  const recordSections = [
+    domain.cname_target ? cnameRecord(hostname, domain.cname_target) : undefined,
+    domain.ownership_verification ? ownershipRecord(domain.ownership_verification) : undefined,
+  ].filter((s) => s !== undefined);
 
   if (recordSections.length > 0) {
     const recordWord = recordSections.length === 1 ? 'the record above' : 'the records above';
     const summary = `Add ${recordWord} to your DNS, then run \`void domain status ${hostname}\` to check progress.`;
     note([...recordSections, summary].join('\n\n'), 'DNS Setup');
   }
+  printSuccess(`Domain ${hostname} added (status: ${domain.status}).`);
 }
 
 async function domainRemove(
@@ -151,16 +140,9 @@ async function domainRemove(
   projectId: string,
   hostname: string,
 ): Promise<void> {
-  // Find domain by hostname
-  const domains = await client.listDomains(projectId);
-  const domain = domains.find((d) => d.hostname === hostname);
-  if (!domain) {
-    log.error(`domain: Domain '${hostname}' not found on this project.`);
-    process.exit(1);
-  }
-
+  const domain = await findProjectDomain(client, projectId, hostname);
   await client.removeDomain(projectId, domain.id);
-  log.success(`Domain ${hostname} removed.`);
+  printSuccess(`Domain ${hostname} removed.`);
 }
 
 async function domainList(client: PlatformClient, projectId: string): Promise<void> {
@@ -260,13 +242,7 @@ async function domainStatus(
   hostname: string,
   verbose: boolean,
 ): Promise<void> {
-  const domains = await client.listDomains(projectId);
-  const domain = domains.find((d) => d.hostname === hostname);
-  if (!domain) {
-    log.error(`domain: Domain '${hostname}' not found on this project.`);
-    process.exit(1);
-  }
-
+  const domain = await findProjectDomain(client, projectId, hostname);
   const status = await client.getDomainStatus(projectId, domain.id);
   const rollup = computeRollup(status);
 
@@ -276,9 +252,7 @@ async function domainStatus(
   ];
 
   if (verbose) {
-    // Visual separator: blank line + "Details:" header so the raw breakdown
-    // reads as a distinct section under the rollup, not just a continuation.
-    // `Hostname:` is already shown by the rollup above, so it's omitted here.
+    // `Hostname:` is already shown by the rollup above.
     rollupLines.push('', 'Details:');
     rollupLines.push(`  Status:      ${status.status}`);
     rollupLines.push(`  SSL Status:  ${status.ssl_status}`);
@@ -299,17 +273,10 @@ async function domainStatus(
   // a missing/misconfigured CNAME silently blocks issuance even after ownership
   // is verified. Once `ssl_status === 'active'` the domain is live and both
   // records are correct, so neither is shown.
-  let cnameSection: string | undefined;
-  let ownershipSection: string | undefined;
-
-  if (status.ssl_status !== 'active') {
-    cnameSection = `CNAME (traffic)\n    ${status.hostname} → ${status.cname_target}`;
-  }
-  if (status.ownership_verification) {
-    ownershipSection = `TXT (ownership verification)\n    ${status.ownership_verification.name} → ${status.ownership_verification.value}`;
-  }
-
-  const pendingRecords = [cnameSection, ownershipSection].filter((s) => s !== undefined);
+  const pendingRecords = [
+    status.ssl_status !== 'active' ? cnameRecord(status.hostname, status.cname_target) : undefined,
+    status.ownership_verification ? ownershipRecord(status.ownership_verification) : undefined,
+  ].filter((s) => s !== undefined);
   if (pendingRecords.length > 0) {
     note(
       pendingRecords.join('\n\n'),
@@ -318,4 +285,22 @@ async function domainStatus(
         : 'Add these DNS records to your provider',
     );
   }
+}
+
+async function findProjectDomain(client: PlatformClient, projectId: string, hostname: string) {
+  const domains = await client.listDomains(projectId);
+  const domain = domains.find((d) => d.hostname === hostname);
+  if (!domain) {
+    log.error(`domain: Domain '${hostname}' not found on this project.`);
+    process.exit(1);
+  }
+  return domain;
+}
+
+function cnameRecord(hostname: string, target: string): string {
+  return `CNAME (traffic)\n    ${hostname} → ${target}`;
+}
+
+function ownershipRecord(record: { name: string; value: string }): string {
+  return `TXT (ownership verification)\n    ${record.name} → ${record.value}`;
 }

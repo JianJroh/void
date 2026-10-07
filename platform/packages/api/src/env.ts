@@ -43,9 +43,9 @@ export type ApiEnv = Env & {
     GITHUB_CLIENT_SECRET: string;
     /**
      * GitHub App credentials for the "Deploy on GitHub" build system. Distinct
-     * from the OAuth-login `GITHUB_CLIENT_ID/SECRET` above. All optional so old
-     * code (and environments without the App configured) tolerates absence —
-     * the webhook/OIDC routes return inert when these are unset.
+     * from the OAuth-login `GITHUB_CLIENT_ID/SECRET` above. All optional so
+     * environments without the App configured tolerate absence — the
+     * webhook/OIDC routes return inert when these are unset.
      */
     GITHUB_APP_ID?: string;
     /** App private key in PKCS#8 PEM form (`openssl pkcs8 -topk8 -nocrypt`). */
@@ -89,9 +89,13 @@ export type ApiEnv = Env & {
     DISPATCH_WORKER_NAME?: string;
     /**
      * Name of the tail-consumer Worker that receives runtime logs (Tail Worker).
-     * Wired into per-user-script `tail_consumers` metadata on each WfP upload
-     * so user scripts have explicit, belt-and-suspenders log fan-out in
-     * addition to the dispatch worker's namespace-wide propagation.
+     * Wired into per-user-script `tail_consumers` metadata on each WfP upload.
+     * This is the only log path for invocations that skip the dispatch Worker
+     * (crons, `/__void/migrate`, Durable Object alarms). Queue deliveries go
+     * through the dispatch Worker. The dispatch Worker's own consumer also
+     * receives the user items it invoked, each in its own tail invocation, so
+     * those rows are stored twice; log queries collapse them
+     * (`observability/log-rows.ts`).
      * Falls back to `void-tail` when unset.
      */
     TAIL_SERVICE_NAME?: string;
@@ -99,7 +103,6 @@ export type ApiEnv = Env & {
     /** Private readiness checks, attached after the proxy Worker has been provisioned. */
     PLATFORM_PROXY?: Fetcher;
     SANDBOX_CONTROL_SERVICE?: string;
-    VOID_PROXY_TOKEN?: string;
     /** Trusted producer used by the API-owned sandbox lease counter. */
     USAGE_EVENTS_QUEUE?: Queue<unknown>;
     DEPLOYMENTS_QUEUE?: Queue<{ deploymentId: string }>;
@@ -194,6 +197,7 @@ export type ApiEnv = Env & {
     DEPLOY_HEARTBEAT_INTERVAL_MS?: number;
   };
   Variables: {
+    platformTrafficPaused: boolean;
     user: User;
     db: Db;
     operatorSession: { id: string; expiresAt: string };

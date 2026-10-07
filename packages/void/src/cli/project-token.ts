@@ -1,10 +1,10 @@
 import { log, outro } from '@voidzero-dev/vite-plus-prompts';
 import { getToken } from './auth.ts';
 import { PlatformClient } from './client.ts';
-import { dim, tablePrefix } from './output.ts';
+import { printSuccess, dim, tablePrefix } from './output.ts';
 import type { ProjectArgs } from './project-args.ts';
 import { readProjectConfig } from './project.ts';
-import { resolveProjectBySlug } from './resolve-project.ts';
+import { requireProjectBySlug } from './resolve-project.ts';
 
 type TokenArgs = Extract<ProjectArgs, { subcommand: 'token' }>;
 
@@ -15,10 +15,7 @@ async function resolveTarget(root: string, args: TokenArgs) {
   }
   const client = new PlatformClient(humanToken, { root });
   if (args.projectSlug) {
-    const resolved = resolveProjectBySlug(await client.listProjects(), args.projectSlug);
-    if (!resolved) {
-      throw new Error(`project: No project found with slug '${args.projectSlug}'.`);
-    }
+    const resolved = await requireProjectBySlug(client, args.projectSlug);
     return { client, projectId: resolved.projectId, slug: args.projectSlug };
   }
   const linked = readProjectConfig(root);
@@ -37,9 +34,10 @@ function printIssued(
     console.log(JSON.stringify({ ...result, apiUrl }));
     return;
   }
-  log.success(`Credential ${result.id} is valid until ${result.expiresAt}.`);
+  log.info(`Credential ${result.id} is valid until ${result.expiresAt}.`);
   log.warn('Copy this token now. Void will not display it again.');
   console.log(`\nVOID_TOKEN=${result.token}\nVOID_API_URL=${apiUrl}\n`);
+  printSuccess('Project deploy credential created.');
 }
 
 export async function runProjectTokenCommand(root: string, args: TokenArgs): Promise<void> {
@@ -64,7 +62,7 @@ export async function runProjectTokenCommand(root: string, args: TokenArgs): Pro
     if (args.json) {
       console.log(JSON.stringify({ ok: true, id: args.credentialId }));
     } else {
-      log.success(`Revoked ${args.credentialId}.`);
+      printSuccess(`Revoked ${args.credentialId}.`);
     }
   } else {
     const rows = await client.listProjectTokens(projectId);

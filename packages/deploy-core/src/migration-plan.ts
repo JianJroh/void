@@ -20,18 +20,22 @@ export function canonicalSql(sql: string): string {
   return withoutBom.replace(/\r\n?/g, '\n');
 }
 
-function isStandalonePragmaLine(line: string, pragma: string): boolean {
-  return line.trim() === pragma;
-}
-
 export function hasStandalonePragma(sql: string, pragma: string): boolean {
   return canonicalSql(sql)
     .split('\n')
-    .some((line) => isStandalonePragmaLine(line, pragma));
+    .some((line) => line.trim() === pragma);
 }
 
-function isBreakpointComment(text: string): boolean {
-  return text.trim() === '--> statement-breakpoint';
+/** Yield `--> statement-breakpoint` line comments outside literals. */
+function* breakpointComments(normalized: string): Generator<{ start: number; end: number }> {
+  for (const segment of tokenizeSql(normalized)) {
+    if (
+      segment.kind === 'line-comment' &&
+      normalized.slice(segment.start, segment.end).trim() === '--> statement-breakpoint'
+    ) {
+      yield segment;
+    }
+  }
 }
 
 function splitBreakpointFramedSql(sql: string): Array<string> {
@@ -39,18 +43,12 @@ function splitBreakpointFramedSql(sql: string): Array<string> {
   const statements: Array<string> = [];
   let cursor = 0;
 
-  for (const segment of tokenizeSql(normalized)) {
-    if (segment.kind !== 'line-comment') {
-      continue;
+  for (const segment of breakpointComments(normalized)) {
+    const statement = normalized.slice(cursor, segment.start).trim();
+    if (statement) {
+      statements.push(statement);
     }
-    const comment = normalized.slice(segment.start, segment.end);
-    if (isBreakpointComment(comment)) {
-      const statement = normalized.slice(cursor, segment.start).trim();
-      if (statement) {
-        statements.push(statement);
-      }
-      cursor = segment.end;
-    }
+    cursor = segment.end;
   }
 
   const statement = normalized.slice(cursor).trim();
@@ -61,23 +59,23 @@ function splitBreakpointFramedSql(sql: string): Array<string> {
 }
 
 function hasStatementBreakpointOutsideLiterals(sql: string): boolean {
-  const normalized = canonicalSql(sql);
-  for (const segment of tokenizeSql(normalized)) {
-    if (segment.kind !== 'line-comment') {
-      continue;
-    }
-    const comment = normalized.slice(segment.start, segment.end);
-    if (isBreakpointComment(comment)) {
-      return true;
-    }
-  }
-  return false;
+  return !breakpointComments(canonicalSql(sql)).next().done;
 }
 
-export function isSingleStatement(sql: string): boolean {
+type StatementScan = {
+  normalized: string;
+  /** Statement ranges in `normalized`, each ending after its `;` when present. */
+  ranges: Array<{ start: number; end: number }>;
+  /** Whether bare SQL (outside literals and comments) contains BEGIN or TRIGGER. */
+  hasCompoundBody: boolean;
+};
+
+function scanStatements(sql: string): StatementScan {
   const normalized = canonicalSql(sql);
-  let statements = 0;
+  const ranges: Array<{ start: number; end: number }> = [];
+  let cursor = 0;
   let inStatement = false;
+  let hasCompoundBody = false;
 
   for (const segment of tokenizeSql(normalized)) {
     if (segment.kind === 'line-comment' || segment.kind === 'block-comment') {
@@ -87,13 +85,17 @@ export function isSingleStatement(sql: string): boolean {
       inStatement = true;
       continue;
     }
+    if (/\b(?:BEGIN|TRIGGER)\b/i.test(normalized.slice(segment.start, segment.end))) {
+      hasCompoundBody = true;
+    }
     for (let index = segment.start; index < segment.end; index++) {
       const character = normalized[index];
       if (character === ';') {
         if (inStatement) {
-          statements++;
+          ranges.push({ start: cursor, end: index + 1 });
           inStatement = false;
         }
+        cursor = index + 1;
         continue;
       }
       if (character !== ' ' && character !== '\t' && character !== '\n' && character !== '\r') {
@@ -103,9 +105,26 @@ export function isSingleStatement(sql: string): boolean {
   }
 
   if (inStatement) {
-    statements++;
+    ranges.push({ start: cursor, end: normalized.length });
   }
-  return statements === 1;
+  return { normalized, ranges, hasCompoundBody };
+}
+
+export function isSingleStatement(sql: string): boolean {
+  return scanStatements(sql).ranges.length === 1;
+}
+
+/**
+ * Split SQL on top-level semicolons, ignoring literals and comments. Returns
+ * null when a statement may contain a compound `BEGIN ... END` body (such as
+ * CREATE TRIGGER), whose inner semicolons cannot be told apart lexically.
+ */
+export function splitSqlStatements(sql: string): Array<string> | null {
+  const { normalized, ranges, hasCompoundBody } = scanStatements(sql);
+  if (hasCompoundBody) {
+    return null;
+  }
+  return ranges.map((range) => normalized.slice(range.start, range.end).trim());
 }
 
 /** Classify SQL without imposing the caller's execution policy or hashing implementation. */

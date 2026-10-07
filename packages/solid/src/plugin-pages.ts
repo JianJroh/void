@@ -1,14 +1,17 @@
 import { existsSync, readdirSync } from 'node:fs';
 import { dirname } from 'pathslash';
 import { normalizePath, type Plugin, type ResolvedConfig, type ViteDevServer } from 'vite';
-import { resolveStaticPageDataBuildOptions, scanPages } from 'void/pages';
+import {
+  generateComponentManifest,
+  resolveStaticPageDataBuildOptions,
+  scanPages,
+} from 'void/pages';
 import type { PageScanResult, StaticPageDataBuildOptions } from 'void/pages';
-import { generateComponentManifest } from './pages-manifest.ts';
 
 const RENDERER_ID = 'virtual:void-pages-renderer';
 const CLIENT_ENTRY_ID = 'virtual:void-pages-client';
 
-type PrefetchConfig = {
+export type PrefetchConfig = {
   hoverDelay?: number;
   cacheFor?: number | string | [string, string];
 };
@@ -280,7 +283,7 @@ function replaceShared(next) {
   Object.assign(shared, next || {});
 }
 
-const { router, initialPageData, initialComponent, initialLayouts, start } =
+const { router, initialPageData, initialComponent, initialLayouts, start, commitInitialRender } =
   await createVoidRouter({
     adapter: {
       createDeferred: () => ({ value: null, loading: true, error: null }),
@@ -376,5 +379,6 @@ if (appEl.getAttribute("data-void-ssr") === "false") {
 appEl.setAttribute("data-hydrated", "true");
 export { reactiveRouter as router };
 start();
+commitInitialRender();
 `;
 }

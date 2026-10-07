@@ -1,4 +1,4 @@
-import type { PlatformDiscoveryDocument } from '@void/platform';
+import type { PlatformDiscoveryDocument, PlatformInstallationManifest } from '@void/platform';
 import { isCancel, log, select, text } from '@voidzero-dev/vite-plus-prompts';
 import { cfAccessHeaders } from '../shared/cf-access.ts';
 import {
@@ -6,23 +6,30 @@ import {
   ensurePlatformAccessToken,
   isCloudflareAccessChallenge,
 } from './cf-access.ts';
-import { pc } from './output.ts';
+import { printSuccess, pc } from './output.ts';
 import type { PlatformArgs } from './platform-args.ts';
-import { readPlatformDiscoveryResponse } from './platform-discovery.ts';
+import { PlatformDisabledError, readPlatformDiscoveryResponse } from './platform-discovery.ts';
 import {
   getActivePlatformConnection,
   listPlatformConnections,
   normalizePlatformApiUrl,
   savePlatformConnection,
   selectPlatformConnection,
+  listInstallationManifests,
+  platformConnectionSlug,
   type PlatformConnection,
 } from './platform-registry.ts';
+
+function normalizePlatformInputUrl(input: string): string {
+  const value = input.trim();
+  return normalizePlatformApiUrl(value.includes('://') ? value : `https://${value}`);
+}
 
 export async function discoverPlatform(
   input: string,
   fetcher: typeof fetch = fetch,
 ): Promise<PlatformDiscoveryDocument> {
-  const apiUrl = normalizePlatformApiUrl(input);
+  const apiUrl = normalizePlatformInputUrl(input);
   ensureCloudflaredToken(apiUrl);
   const request = () =>
     fetcher(`${apiUrl}/.well-known/void-platform`, {
@@ -45,13 +52,13 @@ export async function promptPlatformUrl(): Promise<string> {
   }
   const value = await text({
     message: 'Void platform API URL:',
-    placeholder: 'https://platform.example.com',
+    placeholder: 'platform.example.com',
     validate: (input) => {
       if (!input) {
         return 'Enter a platform URL.';
       }
       try {
-        normalizePlatformApiUrl(input);
+        normalizePlatformInputUrl(input);
       } catch (error) {
         return error instanceof Error ? error.message : String(error);
       }
@@ -75,7 +82,9 @@ async function resolveConnection(selector: string): Promise<PlatformConnection> 
     return selectPlatformConnection(connections[0]!.id);
   }
   if (!process.stdin.isTTY) {
-    throw new Error('platform: Multiple platforms are configured; specify an id or URL.');
+    throw new Error(
+      'platform: Multiple platforms are configured; specify a slug, name, ID, or URL.',
+    );
   }
   const picked = await select({
     message: 'Select a Void platform:',
@@ -91,15 +100,18 @@ async function resolveConnection(selector: string): Promise<PlatformConnection> 
   return selectPlatformConnection(String(picked));
 }
 
-function showConnection(connection: PlatformConnection, activeId: string | null): void {
-  const marker = connection.id === activeId ? pc.green('●') : pc.dim('○');
-  console.log(`${marker} ${pc.bold(connection.displayName)}  ${pc.dim(connection.id)}`);
-  console.log(`  ${connection.apiUrl}`);
+function showPlatform(
+  connection: PlatformConnection,
+  installations: ReadonlyArray<PlatformInstallationManifest>,
+): void {
+  const slug = platformConnectionSlug(connection, installations);
+  console.log(`  ${pc.bold(connection.displayName)}${slug ? ` ${pc.dim(`(${slug})`)}` : ''}`);
+  console.log(`    ${connection.apiUrl}`);
   if (connection.applicationDomain) {
     console.log(
       connection.applicationDomain.endsWith('.workers.dev')
-        ? '  apps: workers.dev (testing)'
-        : `  apps: *.${connection.applicationDomain}`,
+        ? '    apps: workers.dev (testing)'
+        : `    apps: *.${connection.applicationDomain}`,
     );
   }
 }
@@ -157,23 +169,81 @@ export async function runPlatformCommand(_root: string, args: PlatformArgs): Pro
       log.info('No platforms configured. Run `void connect <url>`.');
       return;
     }
-    const activeId = getActivePlatformConnection()?.id ?? null;
-    for (const connection of connections) {
-      showConnection(connection, activeId);
+    const active = getActivePlatformConnection();
+    const installations = listInstallationManifests();
+    if (active) {
+      console.log(pc.blue(pc.bold('Currently selected platform:')));
+      showPlatform(active, installations);
+    } else {
+      console.log('No platform selected.');
+    }
+    const others = connections.filter((connection) => connection.id !== active?.id);
+    if (others.length > 0) {
+      console.log('');
+      console.log(pc.blue(pc.bold('Other platforms:')));
+      for (const [index, connection] of others.entries()) {
+        if (index > 0) {
+          console.log('');
+        }
+        showPlatform(connection, installations);
+      }
+      console.log('');
+      console.log(pc.gray('run `void platform use <id>` to select one'));
     }
     return;
   }
 
   if (args.subcommand === 'use') {
     const connection = await resolveConnection(args.selector);
-    log.success(`Using ${pc.bold(connection.displayName)} (${connection.apiUrl}).`);
+    printSuccess(`Using ${pc.bold(connection.displayName)} (${connection.apiUrl}).`);
     return;
   }
 
   if (args.subcommand === 'status') {
-    const connection = await resolveConnection(args.selector);
-    const discovery = await discoverPlatform(connection.apiUrl);
-    log.success(`${discovery.displayName} is reachable.`);
+    const local = args.selector
+      ? listInstallationManifests().find(
+          (manifest) => manifest.id === args.selector && manifest.status !== 'uninstalled',
+        )
+      : undefined;
+    const connection = local ? null : await resolveConnection(args.selector);
+    const saved =
+      local ??
+      (connection?.installationId
+        ? listInstallationManifests().find((manifest) => manifest.id === connection.installationId)
+        : undefined);
+    if (saved) {
+      showSavedInstallationStatus(saved);
+    }
+    const apiUrl = local?.endpoints.apiUrl ?? connection?.apiUrl;
+    if (!apiUrl) {
+      log.info('No verified API endpoint is saved yet. Live traffic availability is unknown.');
+      return;
+    }
+    let discovery: PlatformDiscoveryDocument;
+    try {
+      discovery = await discoverPlatform(apiUrl);
+    } catch (error) {
+      if (error instanceof PlatformDisabledError && !error.maintenance) {
+        console.log('Platform: disabled (API and application traffic are paused).');
+        if (!saved?.operation) {
+          console.log(`Enable it: void platform enable${saved ? ` ${saved.id}` : ''}`);
+        }
+        return;
+      }
+      if (saved) {
+        log.info(
+          'Live availability could not be confirmed. The saved checkpoint above may be out of date.',
+        );
+      }
+      if (error instanceof PlatformDisabledError) {
+        throw new Error(
+          `platform: Traffic at ${apiUrl} is paused for an upgrade or repair. Check again when it finishes.`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+    log.info(`${discovery.displayName} is reachable.`);
     console.log(`API: ${discovery.apiUrl}`);
     console.log(`Proxy: ${discovery.proxyUrl}`);
     if (discovery.applicationRouting?.workersDev && !discovery.applicationRouting.zoneName) {
@@ -194,4 +264,17 @@ export async function runPlatformCommand(_root: string, args: PlatformArgs): Pro
 
   const { runPlatformLifecycleCommand } = await import('./platform-lifecycle.ts');
   await runPlatformLifecycleCommand(args);
+}
+
+function showSavedInstallationStatus(manifest: PlatformInstallationManifest): void {
+  console.log(`Saved installation: ${manifest.id} (${manifest.status})`);
+  console.log(`Checkpoint: ${manifest.updatedAt}`);
+  if (manifest.operation) {
+    const operation = manifest.operation;
+    console.log(`Saved operation: ${operation.action} — ${operation.phase}`);
+    console.log(`Runtime: ${operation.fromVersion ?? 'new installation'} → ${operation.toVersion}`);
+  }
+  if (manifest.endpoints.apiUrl) {
+    console.log(`Administrator status: ${manifest.endpoints.apiUrl}/admin/status`);
+  }
 }

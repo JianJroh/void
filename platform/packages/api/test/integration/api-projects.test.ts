@@ -682,6 +682,49 @@ describe('project CI credential ownership', () => {
         .where(eq(projectDeployCredentials.project_id, project.id)),
     ).toMatchObject([{ id: 'deleting-credential-row', revoked_at: null }]);
   });
+
+  it('returns ISO-8601 timestamps from create, list, and renew', async () => {
+    const isoTimestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+    const owner = await createTestUser(env.db, 'credential-iso-owner');
+    const project = await createTestProject(env.db, owner.id, 'credential-iso-project');
+
+    const created = await app.fetch(
+      credentialRequest(project.id, owner.jwt, 'POST', '', { name: 'ISO CI', expiresInDays: 30 }),
+      env,
+    );
+    expect(created.status).toBe(201);
+    const credential = await created.json<{ id: string; createdAt: string; expiresAt: string }>();
+    expect(credential.createdAt).toMatch(isoTimestamp);
+    expect(credential.expiresAt).toMatch(isoTimestamp);
+
+    const renewed = await app.fetch(
+      credentialRequest(project.id, owner.jwt, 'POST', `/${credential.id}/renew`, {
+        expiresInDays: 30,
+      }),
+      env,
+    );
+    expect(renewed.status).toBe(200);
+    const replacement = await renewed.json<{ createdAt: string; expiresAt: string }>();
+    expect(replacement.createdAt).toMatch(isoTimestamp);
+    expect(replacement.expiresAt).toMatch(isoTimestamp);
+
+    const listed = await app.fetch(credentialRequest(project.id, owner.jwt, 'GET'), env);
+    expect(listed.status).toBe(200);
+    const rows =
+      await listed.json<
+        Array<{ id: string; createdAt: string; expiresAt: string; revokedAt: string | null }>
+      >();
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.createdAt).toMatch(isoTimestamp);
+      expect(row.expiresAt).toMatch(isoTimestamp);
+      if (row.id === credential.id) {
+        expect(row.revokedAt).toMatch(isoTimestamp);
+      } else {
+        expect(row.revokedAt).toBeNull();
+      }
+    }
+  });
 });
 
 describe('POST /projects/:id/prerender-token', () => {
@@ -1732,33 +1775,30 @@ describe('database URL persistence ordering — CF failure must not overwrite st
     );
     expect(firstRes.status).toBe(200);
 
-    // Now a second POST attempt fails at CF (409 conflict since resource exists)
-    // but the PUT endpoint is what would be called in a re-run; test it via
-    // direct DB read to confirm the original value is intact after a PUT failure
+    // A re-run updates through PUT; a CF rejection there must leave the
+    // original credential intact.
     mockCfApi({
       updateHyperdrive: () => cfError('origin database is unreachable', 400),
     });
 
-    // Insert an existing hyperdrive resource so PUT takes the update path
+    // The first POST created the hyperdrive resource, so PUT takes the update path.
     const rows = await env.db.select().from(resources).where(eq(resources.project_id, project.id));
-    const hdResource = rows.find((r) => r.type === 'hyperdrive');
+    expect(rows.find((r) => r.type === 'hyperdrive')).toBeDefined();
 
-    if (hdResource) {
-      const putRes = await app.fetch(
-        new Request(`http://localhost/projects/${project.id}/database-url`, {
-          method: 'PUT',
-          headers: {
-            Authorization: `Bearer ${user.jwt}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            connectionString: 'postgresql://void_user:new@db2.example.com/otherdb',
-          }),
+    const putRes = await app.fetch(
+      new Request(`http://localhost/projects/${project.id}/database-url`, {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${user.jwt}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          connectionString: 'postgresql://void_user:new@db2.example.com/otherdb',
         }),
-        env,
-      );
-      expect(putRes.status).toBe(502);
-    }
+      }),
+      env,
+    );
+    expect(putRes.status).toBe(502);
 
     // The stored URL must still be the original
     const getRes = await app.fetch(
@@ -2878,11 +2918,10 @@ describe('POST /projects/:id/rollback', () => {
     await markDeploymentRetained(env.db, d2.id, true);
     await setActiveDeployment(env.db, project.id, d2.id);
 
-    // Simulate a transient CF failure on the SECOND bindings call. With
-    // the duplicate-fetch bug, cron sync succeeds on call 1 and commits
-    // DO state; the queue fetch on call 2 then fails and the transaction
-    // aborts — leaving cron partial. With the fix (single hoisted fetch),
-    // the whole rollback succeeds on one healthy call.
+    // Simulate a transient CF failure on the SECOND bindings call. Rollback
+    // reads the proxy token once and reuses it for cron and queue sync, so it
+    // succeeds on one healthy call; a second read could fail after cron sync
+    // committed DO state and leave cron partial.
     let bindingsCalls = 0;
     mockCfApi({
       listWorkerBindings: () => {
@@ -2928,8 +2967,7 @@ describe('POST /projects/:id/rollback', () => {
       env,
     );
     expect(res.status).toBe(200);
-    // Exactly one CF bindings fetch for the rollback — the second call
-    // is the one that used to introduce the extra failure point.
+    // Exactly one CF bindings fetch for the rollback.
     expect(bindingsCalls).toBe(1);
 
     const sync = doCalls.find((c) => c.url === '/sync');
@@ -3126,7 +3164,11 @@ describe('GET /projects/:id/logs', () => {
       analyticsQuery: (_url, init) => {
         const body = typeof init?.body === 'string' ? init.body : '';
         expect(body).toContain('user-my-app');
-        expect(body).toContain('ORDER BY timestamp DESC');
+        // The dispatch Worker's tail consumer and the user Worker's own consumer
+        // each deliver a dispatched request, so identical rows are collapsed.
+        expect(body).toContain('GROUP BY blob1, blob2, blob3, blob4, blob5, blob6, blob7, double1');
+        expect(body).toContain('min(timestamp) as ingestedAt');
+        expect(body).toContain('ORDER BY ingestedAt DESC');
         return Response.json(mockData);
       },
     });

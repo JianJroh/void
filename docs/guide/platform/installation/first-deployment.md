@@ -34,7 +34,11 @@ void project token create --name ci --expires-in 30
 
 Store the printed `VOID_TOKEN` and `VOID_API_URL` in the CI secret manager, then
 run `void connect "$VOID_API_URL" --no-login` before deploying in each fresh CI
-environment. Project files do not replace this connection step. Rotate with `void project token renew <id>` and revoke with
+environment. Project files do not replace this connection step. CI cannot answer
+the project prompt, so choose the project before `void deploy`: set `VOID_PROJECT`,
+pass `--project <slug>`, or commit `.void/project.json` from `void project link`.
+New apps ignore `.void` in `.gitignore`; to commit the link, replace that line
+with `.void/*` and `!.void/project.json`. Rotate with `void project token renew <id>` and revoke with
 `void project token revoke <id>`. A human login token is not a CI credential.
 
 If Cloudflare Access protects the platform, Access proof and the project
@@ -79,7 +83,7 @@ void platform signup allow github teammate
 
 Void shows the proposed access change and asks you to confirm it. Once approved, `teammate` can connect to the platform's API URL and sign in with GitHub.
 
-To see who can join, run `void platform signup show`. You can also allow an email address or a domain such as `*@example.com`. For an OIDC user without verified email, use `void platform signup allow identity <connection-id> <subject>`; the subject match is exact and the provider's domain or group restrictions still apply. Remove that grant with `void platform signup disallow identity <connection-id> <subject>`. `void platform signup open` permits public signup; `void platform signup restrict` requires an allowlist match again.
+To allow email addresses, domains, or OIDC identities, or to open signup, see [Giving People Access](/guide/platform/administration/access#giving-people-access).
 
 Your administrator session lasts for one hour. Use it to inspect users, projects, logs, and platform health. The [Platform Administration guide](/guide/platform-administration) walks through those workflows, previews, and automation. You can also open `<API origin>/admin/login` to use the browser admin UI.
 

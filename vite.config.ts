@@ -21,6 +21,7 @@ const cliUnitTests = [
 // core-markdown workers explicitly from this main config process (which has the runner's step env).
 // Absent/unset → empty strings → the suite skips itself as designed.
 const e2eWorkerEnv = {
+  VOID_TEST_BROWSER: process.env.VOID_TEST_BROWSER ?? 'chromium',
   VOID_E2E_CF_TOKEN: process.env.VOID_E2E_CF_TOKEN ?? '',
   VOID_E2E_CF_ACCOUNT_ID: process.env.VOID_E2E_CF_ACCOUNT_ID ?? '',
   VOID_E2E_RUN_ID: process.env.VOID_E2E_RUN_ID ?? '',
@@ -124,7 +125,7 @@ export default defineConfig({
         specifier: 'eslint-plugin-react-hooks',
       },
     ],
-    plugins: ['typescript', 'import', 'react', 'unicorn', 'vitest', 'node', 'jsdoc'],
+    plugins: ['typescript', 'import', 'react', 'unicorn', 'vitest', 'node', 'jsdoc', 'oxc'],
     ignorePatterns: [
       'packages/prompts/index.mjs',
       'packages/prompts/index.d.mts',
@@ -359,6 +360,7 @@ export default defineConfig({
         },
       ],
       'no-with': 'error',
+      'oxc/no-accumulating-spread': 'error',
       'prefer-const': 'error',
       'react/exhaustive-deps': 'error',
       'react/jsx-key': 'error',

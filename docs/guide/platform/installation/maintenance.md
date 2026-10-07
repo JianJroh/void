@@ -6,7 +6,7 @@ outline: deep
 
 ## Resume, repair, recover, and upgrade
 
-You can omit an installation ID when only one is configured. With several installations, choose one interactively or pass its ID in CI.
+Run `void platform list` to find the installation slug beside its name. Lifecycle commands accept this slug, an installation ID, or a saved connection ID. You can omit the selector when only one installation is configured. With several installations, choose one interactively or pass its slug or ID in CI.
 
 ### Resume an installation
 
@@ -74,6 +74,8 @@ void platform upgrade [id]
 
 An upgrade validates the runtime, applies supported pending migrations, deploys the Workers, and checks their health. Existing Worker secrets are preserved.
 
+Before starting, Void checks access to the installation's Cloudflare account, Workers, and existing R2 buckets. If credentials are rejected, set `CLOUDFLARE_API_TOKEN` to a management token scoped to that account and retry. This overrides the installation's saved management token.
+
 ::: details Migration safety, credential rotation, and interrupted upgrades
 
 Some upgrades briefly put the platform into maintenance mode. Traffic resumes after the new version passes health checks. If an upgrade is interrupted during maintenance, rerun the same command to complete it.
@@ -97,6 +99,35 @@ void platform rollback [id] --runtime /path/to/earlier/runtime
 Keep the earlier runtime files if you need rollback. If the installed version is a custom build, also pass its files with `--from-runtime /path/to/current/runtime`. Void checks that the earlier version can run against your current database and refuses incompatible rollbacks. A later `upgrade` can move forward again. See [Platform Development](/guide/platform/development/runtime#deploying-your-runtime) for working with custom builds.
 
 :::
+
+### Follow upgrade and rollback progress
+
+Watching progress is optional: a running upgrade or rollback proceeds through
+the CLI without action on the status page. During maintenance, navigating the
+admin UI automatically redirects to `/admin/status`. You can also open it
+directly on your platform API origin and sign in as an administrator.
+
+The read-only page shows the saved operation, source and target versions, and
+the traffic state reported by the API. It refreshes automatically every five
+seconds while visible. If updates fail, it keeps the last confirmed snapshot
+and marks it as out of date. Normal administrator changes remain paused.
+
+Sign-in and status remain available while the API and authentication database
+are reachable. An operation completing
+does not confirm every project's health. A disabled installation keeps traffic
+paused after an upgrade or rollback.
+
+If an operation fails or waits for DNS or Sandbox drain work, the CLI prints
+the recovery instructions and command needed to resume. Resolve the reported
+problem, then resume with the same runtime files. For a custom rollback, retain
+the source runtime files too. `void platform status <id>` also prints locally saved progress
+before checking the live API; this local checkpoint can be out of date if another
+administrator changed the installation.
+
+When application traffic is paused, visitors receive a temporary-unavailability
+page with a **Try again** link. API requests and form submissions still receive
+HTTP 503 responses. Void does not automatically replay requests; visitors who
+submitted a form should check its result before submitting it again.
 
 ### Manage an installation from another machine
 

@@ -1,25 +1,16 @@
 import { ofetch } from 'ofetch';
 import { FetchError } from './fetch-error.ts';
+import { asUsageLimit, limitFromResponse } from './limits.ts';
 import { interpolateRouteParams } from './route-url.ts';
 export { FetchError as StreamError };
 
 import type { RouteMap } from 'void/routes';
-type MethodsOf<P extends keyof RouteMap> = keyof RouteMap[P] & string;
+import type { BodyOption, MethodsOf, ParamsOption, QueryOption } from './fetch.ts';
 type InputOf<P extends keyof RouteMap, M extends MethodsOf<P>> = RouteMap[P][M] extends {
   input: infer I;
 }
   ? I
   : {};
-
-type BodyOption<I> = 'body' extends keyof I
-  ? { body: I['body' & keyof I] }
-  : { body?: Record<string, unknown> | BodyInit | null };
-type QueryOption<I> = 'query' extends keyof I
-  ? { query: I['query' & keyof I] }
-  : { query?: Record<string, string> };
-type ParamsOption<I> = 'params' extends keyof I
-  ? { params: I['params' & keyof I] }
-  : { params?: Record<string, string> };
 
 type StreamOptions<P extends keyof RouteMap, M extends MethodsOf<P>> = BodyOption<InputOf<P, M>> &
   QueryOption<InputOf<P, M>> &
@@ -55,15 +46,24 @@ export async function* fetchStream<
 >(path: P, options?: StreamOptions<P, M>): AsyncGenerator<string, void, undefined> {
   const url = interpolateRouteParams(path, options?.params as Record<string, string> | undefined);
 
-  const response = await ofetch.raw(url, {
-    method: (options?.method ?? 'POST') as string,
-    body: options?.body as never,
-    query: options?.query as never,
-    headers: options?.headers,
-    signal: options?.signal,
-    baseURL: options?.baseURL,
-    responseType: 'stream',
-  });
+  const response = await ofetch
+    .raw(url, {
+      method: (options?.method ?? 'POST') as string,
+      body: options?.body as never,
+      query: options?.query as never,
+      headers: options?.headers,
+      signal: options?.signal,
+      baseURL: options?.baseURL,
+      responseType: 'stream',
+    })
+    .catch(async (error: unknown) => {
+      const response =
+        error && typeof error === 'object' && 'response' in error ? error.response : null;
+      if (response instanceof Response) {
+        throw (await limitFromResponse(response, 'ai')) ?? error;
+      }
+      throw error;
+    });
 
   const body = response._data as ReadableStream<Uint8Array> | null;
   if (!body) {
@@ -79,15 +79,19 @@ export async function* fetchStream<
       return;
     }
     let message = 'Generation was interrupted.';
+    let limit = null;
     try {
       const body = JSON.parse(data);
+      if (event === 'void:limit') {
+        limit = asUsageLimit(body);
+      }
       if (typeof body.message === 'string') {
         message = body.message;
       }
     } catch {
       /* Use the default interruption message for malformed events. */
     }
-    throw new FetchError(message);
+    throw limit ?? new FetchError(message);
   };
 
   try {
@@ -99,7 +103,6 @@ export async function* fetchStream<
 
       buffer += decoder.decode(value, { stream: true });
 
-      // Process complete lines
       const lines = buffer.split('\n');
       buffer = lines.pop()!; // Keep incomplete last line
 
@@ -123,48 +126,41 @@ export async function* fetchStream<
           if (data === '[DONE]') {
             return;
           }
-
-          // Try to parse as Workers AI JSON response
-          try {
-            const parsed = JSON.parse(data);
-            if (typeof parsed.response === 'string') {
-              yield parsed.response;
-              continue;
-            }
-            // Parsed JSON with non-string response (e.g. null + usage metadata) — skip
-            if ('response' in parsed) {
-              continue;
-            }
-          } catch {
-            // Not JSON — yield as plain text
+          const chunk = chunkText(data);
+          if (chunk !== undefined) {
+            yield chunk;
           }
-
-          yield data;
         }
       }
     }
 
-    // Process any remaining data in buffer
-    if (buffer.trim()) {
-      const trimmed = buffer.trim();
-      if (trimmed.startsWith('data: ')) {
-        const data = trimmed.slice(6);
-        terminal(data);
-        if (data !== '[DONE]') {
-          try {
-            const parsed = JSON.parse(data);
-            if (typeof parsed.response === 'string') {
-              yield parsed.response;
-            } else if (!('response' in parsed)) {
-              yield data;
-            }
-          } catch {
-            yield data;
-          }
-        }
+    // The stream may end without a trailing newline.
+    const trimmed = buffer.trim();
+    if (trimmed.startsWith('data: ')) {
+      const data = trimmed.slice(6);
+      terminal(data);
+      const chunk = data === '[DONE]' ? undefined : chunkText(data);
+      if (chunk !== undefined) {
+        yield chunk;
       }
     }
   } finally {
     reader.releaseLock();
   }
+}
+
+/** Workers AI frames carry text in `response`; other JSON with that key (e.g. usage metadata) is skipped. */
+function chunkText(data: string): string | undefined {
+  try {
+    const parsed = JSON.parse(data);
+    if (typeof parsed.response === 'string') {
+      return parsed.response;
+    }
+    if ('response' in parsed) {
+      return undefined;
+    }
+  } catch {
+    // Not JSON: plain text frame.
+  }
+  return data;
 }

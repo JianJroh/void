@@ -5750,6 +5750,7 @@ describe('platform installer', () => {
     );
     expect(waitingForSandboxDrain.waitingForSandboxDrain).toBe(true);
     expect(waitingForSandboxDrain.manifest).toMatchObject({
+      operation: { action: 'upgrade', phase: 'waiting-for-sandbox-drain' },
       platformVersion: '0.10.13',
       safetyProtocols: { sandboxDrain: 3 },
       status: 'verifying',
@@ -5813,6 +5814,11 @@ describe('platform installer', () => {
         },
       },
     );
+    expect(resumedAfterSandboxDrain.manifest.operation).toMatchObject({
+      id: waitingForSandboxDrain.manifest.operation!.id,
+      startedAt: waitingForSandboxDrain.manifest.operation!.startedAt,
+      phase: 'complete',
+    });
     expect(resumedAfterSandboxDrain.waitingForSandboxDrain).toBe(false);
     expect(resumedAfterSandboxDrain.manifest).toMatchObject({
       safetyProtocols: { sandboxDrain: 3 },
@@ -5860,6 +5866,10 @@ describe('platform installer', () => {
     ).rejects.toThrow('upgrade health failed');
     expect(verifiedTargetVersion).toBe(readPlatformRuntimeManifest().platformVersion);
     expect(listInstallationManifests(directory)[0]?.platformVersion).toBe('0.10.13');
+    expect(listInstallationManifests(directory)[0]?.operation).toMatchObject({
+      action: 'upgrade',
+      phase: 'failed',
+    });
 
     const upgraded = await installPlatform(upgradedPlan, secrets, sourceManifest, {
       acquireDatabaseLifecycleLock,
@@ -6348,7 +6358,13 @@ describe('platform installer', () => {
     expect(retryPreviousConfigs.slice(0, 5).every((config) => config.workers_dev === false)).toBe(
       true,
     );
-    expect(retryPreviousConfigs.slice(5).every((config) => config.workers_dev === true)).toBe(true);
+    expect(
+      retryPreviousConfigs
+        .slice(5)
+        .every(
+          (config) => config.workers_dev === (config.name !== deployment.resources.tailWorker),
+        ),
+    ).toBe(true);
     expect(
       retryPreviousConfigs
         .slice(5)
@@ -6392,8 +6408,11 @@ describe('platform installer', () => {
       expect((config.vars as Record<string, unknown>).PLATFORM_TRAFFIC_STATE).not.toBe('enabled');
     }
     for (const config of enabledConfigs.slice(5)) {
-      expect(config.workers_dev).toBe(true);
-      expect(config.preview_urls).toBe(config.name !== deployment.resources.emailGatewayWorker);
+      expect(config.workers_dev).toBe(config.name !== deployment.resources.tailWorker);
+      expect(config.preview_urls).toBe(
+        config.name !== deployment.resources.emailGatewayWorker &&
+          config.name !== deployment.resources.tailWorker,
+      );
       if (!String(config.name).endsWith('-tail')) {
         expect((config.vars as Record<string, unknown>).PLATFORM_TRAFFIC_STATE).toBe('enabled');
       }

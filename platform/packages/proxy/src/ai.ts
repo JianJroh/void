@@ -1,6 +1,7 @@
+import { isRecord } from '@void/deploy-core';
 import { Hono } from 'hono';
 import { asRecord, asString } from './body.ts';
-import type { AiGateway, ProxyEnv } from './types.ts';
+import type { ProxyEnv } from './types.ts';
 
 const DEFAULT_GATEWAY_ID = 'void';
 const PROVIDER_AUTH_DEFAULTS: Record<string, { header: string; prefix: string }> = {
@@ -227,10 +228,6 @@ function filteredResponseHeaders(response: Response): Headers {
     headers.set('cache-control', cacheControl);
   }
   return headers;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
 }
 
 function responseFromThrown(value: unknown): Response | null {

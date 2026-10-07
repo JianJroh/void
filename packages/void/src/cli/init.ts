@@ -12,16 +12,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import type { PlatformDiscoveryDocument } from '@void/platform';
-import {
-  outro,
-  log,
-  confirm,
-  isCancel,
-  cancel,
-  note,
-  select,
-  text,
-} from '@voidzero-dev/vite-plus-prompts';
+import { log, confirm, isCancel, cancel, select, text } from '@voidzero-dev/vite-plus-prompts';
 import { parse, type ParseError } from 'jsonc-parser';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'pathslash';
 import { materializeCloudflareConfig } from '../cloudflare-config.ts';
@@ -39,6 +30,7 @@ import { maybeScaffoldEnvTs } from './env-scaffold.ts';
 import { migrateFrameworkAdapterPaths } from './framework-config-migrate.ts';
 import { initialCommitCommand, setupGit } from './init-git.ts';
 import { migrateLegacyVoidConfig } from './migrate.ts';
+import { note, printSuccess } from './output.ts';
 import { discoverPlatform, saveDiscoveredPlatform } from './platform-cmd.ts';
 import { formatProjectCommand } from './preset.ts';
 import {
@@ -71,7 +63,6 @@ import {
 export type InitArgs = {
   tsconfig: boolean;
   github: boolean;
-  agents: boolean;
   git?: boolean;
 };
 
@@ -83,7 +74,6 @@ export function parseInitArgs(args: Array<string>): InitArgs {
       options: {
         tsconfig: { type: 'boolean' },
         github: { type: 'boolean' },
-        agents: { type: 'boolean' },
         git: { type: 'boolean' },
       },
       allowNegative: true,
@@ -97,7 +87,6 @@ export function parseInitArgs(args: Array<string>): InitArgs {
   return {
     tsconfig: parsed.values.tsconfig === true,
     github: parsed.values.github === true,
-    agents: parsed.values.agents === true,
     git: parsed.values.git as boolean | undefined,
   };
 }
@@ -264,6 +253,14 @@ function getOwnConfigBaseUrlDir(config: JsonObject, configDir: string): string |
     : null;
 }
 
+function readExtends(config: JsonObject): Array<string> {
+  return typeof config.extends === 'string'
+    ? [config.extends]
+    : Array.isArray(config.extends)
+      ? config.extends.filter((value): value is string => typeof value === 'string')
+      : [];
+}
+
 function getEffectiveConfigBaseUrlDir(
   config: JsonObject,
   configPath: string,
@@ -280,12 +277,7 @@ function getEffectiveConfigBaseUrlDir(
     return ownBaseUrl;
   }
 
-  const extendsValues =
-    typeof config.extends === 'string'
-      ? [config.extends]
-      : Array.isArray(config.extends)
-        ? config.extends.filter((value): value is string => typeof value === 'string')
-        : [];
+  const extendsValues = readExtends(config);
 
   let inheritedBaseUrl: string | null = null;
   for (const extendsValue of extendsValues) {
@@ -386,12 +378,7 @@ function collectTsconfigPatchFromConfig(
   }
   seen.add(configPath);
 
-  const extendsValues =
-    typeof config.extends === 'string'
-      ? [config.extends]
-      : Array.isArray(config.extends)
-        ? config.extends.filter((value): value is string => typeof value === 'string')
-        : [];
+  const extendsValues = readExtends(config);
 
   const hasOwnFiles = Array.isArray(config.files);
   const compilerOptions = asRecord(config.compilerOptions);
@@ -674,7 +661,7 @@ function parsePackageManagerField(pkg: unknown): ProjectState['packageManager'] 
  * pnpm markers is still pnpm-managed if the enclosing workspace root has
  * `pnpm-workspace.yaml`, a `pnpm-lock.yaml`, or `packageManager: pnpm@...`.
  *
- * Round 33: local non-pnpm signals MUST outrank the ancestor walk. A bun
+ * Local non-pnpm signals MUST outrank the ancestor walk. A bun
  * or yarn subproject nested under a pnpm workspace ancestor is still
  * bun/yarn — its local `bun.lockb` / `yarn.lock` / `package-lock.json` or
  * a local Corepack pin for bun/yarn/npm proves the ancestor's pnpm shape
@@ -702,12 +689,7 @@ function isPnpmProject(root: string, pkg: JsonObject): boolean {
   if (localPm === 'bun' || localPm === 'yarn' || localPm === 'npm') {
     return false;
   }
-  if (
-    existsSync(join(root, 'bun.lockb')) ||
-    existsSync(join(root, 'bun.lock')) ||
-    existsSync(join(root, 'yarn.lock')) ||
-    existsSync(join(root, 'package-lock.json'))
-  ) {
+  if (hasLocalLockfile(root)) {
     return false;
   }
 
@@ -723,14 +705,13 @@ function isPnpmProject(root: string, pkg: JsonObject): boolean {
  * workspace root is pnpm-managed even when the subpackage has no local
  * pnpm signals.
  *
- * Round 43: an ancestor `pnpm-workspace.yaml` / `pnpm-lock.yaml` /
+ * An ancestor `pnpm-workspace.yaml` / `pnpm-lock.yaml` /
  * Corepack pnpm pin alone is NOT proof that `start` is governed by
  * that repo's pnpm install. A scratch app nested under a pnpm
  * monorepo is a separate project when its path doesn't match the
- * workspace globs. Previously this returned `true` too eagerly, and
- * `ensureVoidDependency` / `scaffoldPagesApp` then treated it like a
- * workspace member even though the subsequent local install used the
- * standalone fallback path.
+ * workspace globs; treating it as a member would make
+ * `ensureVoidDependency` / `scaffoldPagesApp` disagree with the local
+ * install, which uses the standalone fallback path.
  *
  * Delegate workspace membership to `findWorkspaceRoot` +
  * `isWorkspaceSubpackage` — the same check used by the
@@ -784,14 +765,13 @@ function hasAncestorPnpmMarkers(start: string): boolean {
  * subpackage's `package.json` (or verified it was already there), and
  * under PnP the workspace-root install is what wires up resolution.
  *
- * Round 40: a committed-but-unfetched `.pnp.cjs` is NOT proof that
+ * A committed-but-unfetched `.pnp.cjs` is NOT proof that
  * `yarn install` has run. Yarn Berry repos commonly commit `.pnp.cjs`
  * but gitignore `.yarn/cache/*.zip` (zero-install is opt-in), so a
  * fresh clone has the runtime file on disk while the archives it
  * points at are missing. The stricter `findInstalledYarnPnpRuntime`
- * also requires `<pnp-root>/.yarn/install-state.gz` — Yarn's canonical
- * post-install marker, gitignored by convention — as proof that yarn
- * install has actually populated the archives. Without that marker,
+ * also requires a post-install marker next to the runtime
+ * (`.yarn/install-state.gz` or a populated `.yarn/cache`). Without it,
  * we fall through and return false so the caller triggers the install
  * step before attempting to spawn drizzle-kit.
  */
@@ -811,7 +791,7 @@ export function isVoidResolvableFrom(start: string): boolean {
   // PnP runtime files AND the post-install marker in the same
   // directory, void MAY resolve through PnP at runtime.
   //
-  // Round 44: an installed PnP runtime still isn't proof that `void`
+  // An installed PnP runtime still isn't proof that `void`
   // is currently on the dependency graph. Branch switches and edits
   // to package.json can leave stale PnP data where void has been
   // removed; `.pnp.cjs` still exists but the current install target
@@ -819,7 +799,7 @@ export function isVoidResolvableFrom(start: string): boolean {
   // verify resolution succeeds in the same env drizzle-kit will
   // later run under.
   //
-  // Round 45: the probe must match the shape of the installed PnP
+  // The probe must match the shape of the installed PnP
   // runtime. When only `.pnp.loader.mjs` is present, `--require` is
   // NOT injected by `buildDrizzleKitSpawnEnv` — only
   // `--experimental-loader` is — and Node's CJS `require.resolve`
@@ -932,12 +912,8 @@ function readWorkspacePatterns(workspaceRoot: string): Array<string> {
  * whitespace (or is the first column) AND it is not inside a quoted
  * scalar. Flow-style inline quoting is handled by a plain state machine
  * — no escape sequence support, because real-world workspace globs
- * never contain escaped quotes.
- *
- * This replaces the original `/\s+#.*$/` strip which was greedy and
- * would truncate legitimate quoted values like `- "path #hash/*"`,
- * leaving a broken glob that silently failed
- * `isWorkspaceSubpackage` membership.
+ * never contain escaped quotes. A naive `/\s+#.*$/` strip would
+ * truncate quoted values like `- "path #hash/*"`.
  */
 function stripYamlLineComment(line: string): string {
   let inSingle = false;
@@ -995,12 +971,6 @@ export function extractPnpmWorkspacePackages(yaml: string): Array<string> {
   const patterns: Array<string> = [];
   let inPackages = false;
   for (const rawLine of lines) {
-    // Strip YAML comments while respecting quoted content. YAML only
-    // treats `#` as a comment marker when it is preceded by whitespace
-    // (or is the first character on the line) AND is not inside a
-    // quoted scalar. A naive `/\s+#.*$/` strip truncates legitimate
-    // quoted values like `- "path #hash/*"` and leaves a broken glob
-    // that silently fails the `isWorkspaceSubpackage` membership check.
     const line = stripYamlLineComment(rawLine);
 
     // Flow-style: `packages: [<items>]` on a single line. Values may
@@ -1317,20 +1287,11 @@ export function detectProjectState(root: string): ProjectState {
   } else {
     // No lockfile and no pnpm-workspace.yaml — honor
     // `package.json#packageManager` (Corepack field) for pnpm, yarn, and
-    // bun before defaulting to npm. Those are the monorepo / workspace
-    // cases that break under `npm install` and were the motivating case
-    // for this fallback: fresh pnpm workspaces with committed
+    // bun before defaulting to npm. Fresh pnpm workspaces with committed
     // `packageManager` pins but no lockfile would get their `workspace:`
-    // specs rejected by npm, and fresh Yarn projects would silently get
-    // an `npm install` that creates the wrong lockfile and bypasses
-    // Yarn's linker/plugin settings.
-    //
-    // Yarn Berry PnP is handled by the round-31 post-install check: if
-    // Yarn writes `.pnp.cjs` / `.pnp.loader.mjs` after install,
-    // `generateStarterMigration()` is skipped cleanly with a note rather
-    // than crashing drizzle-kit resolution through plain `node`. Yarn
-    // Classic and Yarn Berry node-modules users get the expected install
-    // behavior through this branch.
+    // specs rejected by npm, and fresh Yarn projects would get an
+    // `npm install` that creates the wrong lockfile and bypasses Yarn's
+    // linker/plugin settings.
     const field = parsePackageManagerField(pkg);
     if (field === 'pnpm' || field === 'yarn' || field === 'bun') {
       packageManager = field;
@@ -1339,14 +1300,14 @@ export function detectProjectState(root: string): ProjectState {
     }
   }
 
+  const paths = readProjectPaths(root);
   return {
     hasTypescript,
     hasTsconfig: existsSync(join(root, 'tsconfig.json')),
     hasGithubWorkflows: existsSync(join(root, '.github', 'workflows')),
-    hasRoutes: existsSync(readProjectPaths(root).routesDir),
-    hasMigrations:
-      existsSync(readProjectPaths(root).migrationsDir) || existsSync(join(root, 'migrations')),
-    hasPages: existsSync(readProjectPaths(root).pagesDir),
+    hasRoutes: existsSync(paths.routesDir),
+    hasMigrations: existsSync(paths.migrationsDir) || existsSync(join(root, 'migrations')),
+    hasPages: existsSync(paths.pagesDir),
     packageManager,
     typescriptWanted: hasTypescript,
   };
@@ -1362,16 +1323,14 @@ function hasDrizzleSchema(root: string): boolean {
 }
 
 function detectPagesFramework(root: string): ScaffoldFramework | undefined {
-  try {
-    const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf-8'));
-    const deps = {
-      ...(asRecord(pkg.dependencies) ?? {}),
-      ...(asRecord(pkg.devDependencies) ?? {}),
-    };
-    return detectScaffoldFrameworkFromDependencies(deps);
-  } catch {
+  const pkg = readPackageJson(root);
+  if (!pkg) {
     return undefined;
   }
+  return detectScaffoldFrameworkFromDependencies({
+    ...(asRecord(pkg.dependencies) ?? {}),
+    ...(asRecord(pkg.devDependencies) ?? {}),
+  });
 }
 
 function readPackageJson(root: string): JsonObject | undefined {
@@ -1411,12 +1370,15 @@ function resolveScaffoldDependencySpec(
   packageName: string,
   fallbackVersion: string,
 ): string {
-  const explicit = getDeclaredDependencySpec(root, packageName);
-  if (explicit) {
-    return explicit;
-  }
+  return getDeclaredDependencySpec(root, packageName) || fallbackVersion;
+}
 
-  return fallbackVersion;
+function defaultPackageName(root: string): string {
+  return (
+    basename(root)
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, '-') || 'my-app'
+  );
 }
 
 function setupTsconfig(
@@ -1466,7 +1428,7 @@ function setupTsconfig(
         tsconfig.extends = target;
       }
       updated = true;
-      log.success('Updated tsconfig.json — added extends .void/tsconfig.json');
+      log.step('Updated tsconfig.json — added extends .void/tsconfig.json');
     }
 
     // Check types
@@ -1478,7 +1440,7 @@ function setupTsconfig(
     if (!types.includes('void/env')) {
       types.push('void/env');
       updated = true;
-      log.success('Updated tsconfig.json — added void/env to types');
+      log.step('Updated tsconfig.json — added void/env to types');
     }
 
     // Remove @cloudflare/workers-types — void/env includes it
@@ -1486,7 +1448,7 @@ function setupTsconfig(
     if (cfIdx !== -1) {
       types.splice(cfIdx, 1);
       updated = true;
-      log.success('Removed @cloudflare/workers-types from tsconfig types (included in void/env)');
+      log.step('Removed @cloudflare/workers-types from tsconfig types (included in void/env)');
     }
 
     compilerOptions.types = types;
@@ -1497,7 +1459,7 @@ function setupTsconfig(
       if (JSON.stringify(tsconfig.files) !== JSON.stringify(files)) {
         tsconfig.files = files;
         updated = true;
-        log.success('Updated tsconfig.json — merged generated Void type files');
+        log.step('Updated tsconfig.json — merged generated Void type files');
       }
     }
 
@@ -1508,7 +1470,7 @@ function setupTsconfig(
       if (JSON.stringify(existingPaths) !== JSON.stringify(paths)) {
         compilerOptions.paths = paths;
         updated = true;
-        log.success('Updated tsconfig.json — merged generated Void path aliases');
+        log.step('Updated tsconfig.json — merged generated Void path aliases');
       }
     }
 
@@ -1518,7 +1480,7 @@ function setupTsconfig(
       const ordered = { extends: ext, ...rest };
       writeFileSync(tsconfigPath, JSON.stringify(ordered, null, 2) + '\n');
     } else {
-      log.success('tsconfig.json looks good');
+      log.step('tsconfig.json looks good');
     }
 
     // Remove @cloudflare/workers-types from package.json — void/env includes it
@@ -1536,7 +1498,7 @@ function setupTsconfig(
       }
       if (pkgUpdated) {
         writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
-        log.success('Removed @cloudflare/workers-types from package.json (included in void/env)');
+        log.step('Removed @cloudflare/workers-types from package.json (included in void/env)');
         log.info(`Re-run ${state.packageManager} install to update your lockfile`);
       }
     } catch {
@@ -1559,7 +1521,7 @@ function setupTsconfig(
       include: ['src', 'pages', 'routes', 'middleware', 'crons', 'queues', 'db'],
     };
     writeFileSync(tsconfigPath, JSON.stringify(tsconfig, null, 2) + '\n');
-    log.success('Created tsconfig.json');
+    log.step('Created tsconfig.json');
 
     if (!state.hasTypescript) {
       log.info("Don't forget to install typescript");
@@ -1568,26 +1530,19 @@ function setupTsconfig(
 }
 
 function readProjectWranglerCompatDate(root: string): string | undefined {
-  for (const configPath of [materializeCloudflareConfig(root)]) {
-    if (!existsSync(configPath)) {
-      continue;
-    }
-
-    try {
-      const raw = readFileSync(configPath, 'utf-8');
-      const errors: Array<ParseError> = [];
-      const parsed = parse(raw, errors);
-      if (errors.length > 0) {
-        throw new SyntaxError('Failed to parse JSONC');
-      }
-      if (typeof parsed?.compatibility_date === 'string') {
-        return parsed.compatibility_date;
-      }
-    } catch {
-      // Ignore unreadable or invalid wrangler config and fall back to today's date.
-    }
+  const configPath = materializeCloudflareConfig(root);
+  if (!existsSync(configPath)) {
+    return undefined;
   }
-
+  try {
+    const errors: Array<ParseError> = [];
+    const parsed = parse(readFileSync(configPath, 'utf-8'), errors);
+    if (errors.length === 0 && typeof parsed?.compatibility_date === 'string') {
+      return parsed.compatibility_date;
+    }
+  } catch {
+    // Ignore unreadable or invalid wrangler config and fall back to today's date.
+  }
   return undefined;
 }
 
@@ -1607,18 +1562,14 @@ function setupWranglerConfig(root: string, framework: DetectedFramework): void {
   });
 
   if (result.modified) {
-    log.success(
+    log.step(
       hadConfig
         ? 'Updated Cloudflare config with compatibility_date and nodejs_als'
         : 'Created Cloudflare config with compatibility_date and nodejs_als',
     );
   } else {
-    log.success(`${basename(result.configPath)} looks good`);
+    log.step(`${basename(result.configPath)} looks good`);
   }
-}
-
-function writeVoidConfig(root: string, config: Record<string, unknown>): void {
-  writeVoidProjectConfig(root, config);
 }
 
 export function ensureVoidWorkerCompatibilityDate(root: string): void {
@@ -1636,15 +1587,15 @@ export function ensureVoidWorkerCompatibilityDate(root: string): void {
   const compatibilityDate = readProjectWranglerCompatDate(root) ?? LATEST_KNOWN_COMPAT_DATE;
   if (!canRewriteVoidProjectConfig(root)) {
     writeProvisionedWranglerConfig(root, { compatibilityDate });
-    log.success('Pinned worker compatibility_date in void.lock.json');
+    log.step('Pinned worker compatibility_date in void.lock.json');
     return;
   }
   config.worker = {
     ...worker,
     compatibility_date: compatibilityDate,
   };
-  writeVoidConfig(root, config);
-  log.success('Pinned worker compatibility_date in void.config.ts');
+  writeVoidProjectConfig(root, config);
+  log.step('Pinned worker compatibility_date in void.config.ts');
 }
 
 function clearConfiguredDatabase(
@@ -1660,8 +1611,8 @@ function clearConfiguredDatabase(
 
   delete config.database;
 
-  writeVoidConfig(root, config);
-  log.success(messages.updated);
+  writeVoidProjectConfig(root, config);
+  log.step(messages.updated);
 }
 
 function applyDatabaseDialect(root: string, dialect: DatabaseDialect): void {
@@ -1674,8 +1625,8 @@ function applyDatabaseDialect(root: string, dialect: DatabaseDialect): void {
     }
 
     config.database = 'pg';
-    writeVoidConfig(root, config);
-    log.success('Configured PostgreSQL in void.config.ts');
+    writeVoidProjectConfig(root, config);
+    log.step('Configured PostgreSQL in void.config.ts');
     return;
   }
 
@@ -1686,8 +1637,8 @@ function applyDatabaseDialect(root: string, dialect: DatabaseDialect): void {
     }
 
     config.database = 'mysql';
-    writeVoidConfig(root, config);
-    log.success('Configured MySQL in void.config.ts');
+    writeVoidProjectConfig(root, config);
+    log.step('Configured MySQL in void.config.ts');
     return;
   }
 
@@ -1891,7 +1842,7 @@ export async function ensureVoidPlatformConnection(
   const discovery = await discoverPlatform(selectedApiUrl);
   saveDiscoveredPlatform(discovery);
   if (promptedForPlatform) {
-    log.success(`Connected to ${discovery.displayName} at ${discovery.apiUrl}.`);
+    log.step(`Connected to ${discovery.displayName} at ${discovery.apiUrl}.`);
   }
   return discovery;
 }
@@ -2103,7 +2054,7 @@ function setupGithubActions(
     workflowPath,
     getWorkflowYaml(root, state.packageManager, slug, platform, platformApiUrl),
   );
-  log.success('Created .github/workflows/void-deploy.yml');
+  log.step('Created .github/workflows/void-deploy.yml');
 
   if (platform === 'cloudflare') {
     note(
@@ -2155,7 +2106,7 @@ function patchWorkflowProjectSlug(root: string, slug: string): boolean {
     return false;
   }
   writeFileSync(workflowPath, yaml.replace(placeholderBlock, `  VOID_PROJECT: ${slug}`));
-  log.success(`Set VOID_PROJECT: ${slug} in .github/workflows/void-deploy.yml`);
+  log.step(`Set VOID_PROJECT: ${slug} in .github/workflows/void-deploy.yml`);
   return true;
 }
 
@@ -2166,14 +2117,14 @@ function writeFileIfMissing(root: string, filePath: string, content: string): vo
   }
   mkdirSync(dirname(fullPath), { recursive: true });
   writeFileSync(fullPath, content);
-  log.success(`Created ${filePath}`);
+  log.step(`Created ${filePath}`);
 }
 
 function ensureGitignore(root: string): void {
   const gitignorePath = join(root, '.gitignore');
   if (!existsSync(gitignorePath)) {
     writeFileSync(gitignorePath, SCAFFOLD_GITIGNORE_LINES.join('\n') + '\n');
-    log.success('Created .gitignore');
+    log.step('Created .gitignore');
     return;
   }
 
@@ -2191,7 +2142,7 @@ function ensureGitignore(root: string): void {
 
   const separator = content.endsWith('\n') ? '' : '\n';
   writeFileSync(gitignorePath, content + separator + missing.join('\n') + '\n');
-  log.success('Updated .gitignore with Void defaults');
+  log.step('Updated .gitignore with Void defaults');
 }
 
 function removeTopLevelYamlBlock(yaml: string, key: string): string {
@@ -2255,12 +2206,9 @@ function resolvePnpmConfigRoot(root: string, pkg: JsonObject): string {
     return root;
   }
 
+  // `hasAncestorPnpmMarkers` also verifies `root` is a declared member.
   const workspaceRoot = findWorkspaceRoot(root);
-  if (
-    workspaceRoot !== undefined &&
-    isWorkspaceSubpackage(workspaceRoot, root) &&
-    hasAncestorPnpmMarkers(root)
-  ) {
+  if (workspaceRoot !== undefined && hasAncestorPnpmMarkers(root)) {
     return workspaceRoot;
   }
 
@@ -2278,7 +2226,7 @@ function ensurePnpmAllowBuilds(root: string, pkg: JsonObject): boolean {
   const after = insertPnpmAllowBuilds(withoutLegacy);
   if (after !== before) {
     writeFileSync(workspacePath, after);
-    log.success(
+    log.step(
       configRoot === root
         ? 'Updated pnpm-workspace.yaml with approved builds'
         : `Updated ${relative(root, workspacePath)} with approved builds`,
@@ -2313,7 +2261,7 @@ function installProjectDependencies(
     );
   }
 
-  log.success(`Installed dependencies with ${packageManager}`);
+  log.step(`Installed dependencies with ${packageManager}`);
 }
 
 export function generateStarterMigration(
@@ -2331,11 +2279,11 @@ export function generateStarterMigration(
     dialect,
   );
 
-  // Round 43: snapshot everything drizzle-kit might touch so a
+  // Snapshot everything drizzle-kit might touch so a
   // mid-write crash can't leave partial artifacts that wedge
   // subsequent `void db` commands on the journal coherence check.
   // Mirrors the rollback pattern in `gen.ts`'s
-  // `generateCustomMigration`, but extended for the "migrations dir
+  // `runMigration`, but extended for the "migrations dir
   // doesn't exist yet" case that only the starter path hits.
   const migrationsDir = readProjectPaths(root).migrationsDir;
   const metaDir = join(migrationsDir, 'meta');
@@ -2456,7 +2404,7 @@ export function generateStarterMigration(
     );
   }
 
-  log.success('Generated initial Drizzle migration');
+  log.step('Generated initial Drizzle migration');
 }
 
 function scaffoldPagesApp(
@@ -2488,10 +2436,7 @@ function scaffoldPagesApp(
     }
   }
 
-  const fallbackName =
-    basename(root)
-      .toLowerCase()
-      .replace(/[^a-z0-9-]/g, '-') || 'my-app';
+  const fallbackName = defaultPackageName(root);
   if (!pkg.name || typeof pkg.name !== 'string') {
     pkg.name = fallbackName;
   }
@@ -2543,11 +2488,11 @@ function scaffoldPagesApp(
     ensureDependency('devDependencies', name, version);
   }
 
-  // Round 44: the pnpm build approval setup must run for workspace
+  // The pnpm build approval setup must run for workspace
   // subpackages too. `detectProjectState` only checks LOCAL markers and
   // returns `'npm'` for a subpackage without its own lockfile / pin,
-  // but `isPnpmProject(root, pkg)` walks ancestors and (after round 43)
-  // verifies membership. Gate the allowlist on the ancestor-aware check
+  // but `isPnpmProject(root, pkg)` walks ancestors and verifies
+  // membership. Gate the allowlist on the ancestor-aware check
   // so the workspace gets `allowBuilds` and its
   // better-sqlite3 / esbuild / sharp / workerd postinstalls run on the next
   // workspace-root `pnpm install`.
@@ -2567,7 +2512,7 @@ function scaffoldPagesApp(
   }
 
   writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2) + '\n');
-  log.success('Updated package.json with starter scripts and dependencies');
+  log.step('Updated package.json with starter scripts and dependencies');
 
   for (const [filePath, content] of Object.entries(template.files)) {
     writeFileIfMissing(root, filePath, content);
@@ -2628,10 +2573,7 @@ function ensureExistingProjectPackage(
     }
   }
 
-  const fallbackName =
-    basename(root)
-      .toLowerCase()
-      .replace(/[^a-z0-9-]/g, '-') || 'my-app';
+  const fallbackName = defaultPackageName(root);
   let changed = !existedBefore;
   let dependencyAdded = false;
 
@@ -2678,7 +2620,7 @@ function ensureExistingProjectPackage(
 
   if (changed) {
     writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2) + '\n');
-    log.success(
+    log.step(
       existedBefore
         ? plainViteSetup
           ? 'Updated package.json with Void dependencies and Vite scripts'
@@ -2775,7 +2717,7 @@ function ensureExistingProjectViteConfig(root: string, framework?: DetectedFrame
   }
 
   writeFileSync(fullPath, updated);
-  log.success(`Added voidPlugin() to ${configPath}`);
+  log.step(`Added voidPlugin() to ${configPath}`);
 }
 
 function setupExistingProject(
@@ -2825,7 +2767,7 @@ export const posts = sqliteTable("posts", {
 });
 `,
   );
-  log.success('Created db/schema.ts');
+  log.step('Created db/schema.ts');
 
   // API route
   mkdirSync(join(paths.routesDir, 'api'), { recursive: true });
@@ -2841,7 +2783,7 @@ export const GET = defineHandler(async () => {
 });
 `,
   );
-  log.success('Created routes/api/posts.ts');
+  log.step('Created routes/api/posts.ts');
   ensureProjectTsconfig(root, undefined, true, true, { paths });
 
   // Frontend demo
@@ -2860,7 +2802,7 @@ console.log(posts);
 // posts[0].nope   ← TypeScript error
 `,
   );
-  log.success('Created src/demo.ts');
+  log.step('Created src/demo.ts');
 
   note(
     'SQL migration → DB types → Route handler → Route types → Typed fetch\n\n' +
@@ -2896,10 +2838,7 @@ export function ensureVoidDependency(root: string): boolean {
     }
   }
 
-  const fallbackName =
-    basename(root)
-      .toLowerCase()
-      .replace(/[^a-z0-9-]/g, '-') || 'my-app';
+  const fallbackName = defaultPackageName(root);
   let changed = !existedBefore;
   if (!pkg.name || typeof pkg.name !== 'string') {
     pkg.name = fallbackName;
@@ -2944,11 +2883,7 @@ export function ensureVoidDependency(root: string): boolean {
 
   // Only touch `void` if it's not already declared in any dependency
   // group (deps, devDeps, peerDeps, optionalDeps).
-  const voidAlreadyDeclared = DEPENDENCY_FIELDS.some((field) => {
-    const group = asRecord(pkg[field]);
-    return typeof group?.void === 'string';
-  });
-  if (!voidAlreadyDeclared) {
+  if (!hasDeclaredDependency(pkg, 'void')) {
     devDependencies.void = voidSpec;
     changed = true;
   }
@@ -2958,16 +2893,13 @@ export function ensureVoidDependency(root: string): boolean {
   // demo breaks on first local DB / dev commands because
   // `better-sqlite3`/`esbuild`/`sharp`/`workerd` never run their postinstall
   // build steps. Honor both pnpm signals via `isPnpmProject` — a committed
-  // `pnpm-lock.yaml` OR a `package.json#packageManager: pnpm` Corepack pin.
-  // The lockfile-only check used to miss the no-lockfile pin case, which
-  // `detectProjectState` and `runInitCommand` already treat as pnpm; the
-  // demo would then run `pnpm install` against the project but skip the
-  // allowlist, leaving the local DB / dev setup broken on first run.
+  // `pnpm-lock.yaml` OR a `package.json#packageManager: pnpm` Corepack pin,
+  // which `detectProjectState` and `runInitCommand` also treat as pnpm.
   const pnpmConfigChanged = isPnpmProject(root, pkg) ? ensurePnpmAllowBuilds(root, pkg) : false;
 
   if (changed) {
     writeFileSync(packageJsonPath, JSON.stringify(pkg, null, 2) + '\n');
-    log.success(
+    log.step(
       existedBefore
         ? 'Ensured void is in package.json devDependencies'
         : 'Created package.json with void as a devDependency',
@@ -2985,58 +2917,78 @@ function getOwnVersion(): string {
 const MARKER_VERSION_SOURCE =
   String.raw`\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?` +
   String.raw`(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?`;
-const MARKER_OPEN_RE = new RegExp(
-  String.raw`^<!--injected-by-void-v(${MARKER_VERSION_SOURCE})-->\r?$`,
-  'm',
-);
 const MARKER_CLOSE = '<!--/injected-by-void-->';
 const MARKER_BLOCK_RE = new RegExp(
   String.raw`^<!--injected-by-void-v${MARKER_VERSION_SOURCE}-->\r?\n[\s\S]*?^<!--\/injected-by-void-->\r?$`,
   'm',
 );
 
-function injectAgentBlock(root: string): void {
+async function injectAgentBlock(root: string, newProject: boolean): Promise<void> {
   const filePath = 'AGENTS.md';
   const fullPath = join(root, filePath);
   const version = getOwnVersion();
   const template = readFileSync(join(getPackageDir(), 'AGENTS_TEMPLATE.md'), 'utf-8');
   const openMarker = `<!--injected-by-void-v${version}-->`;
   const block = `${openMarker}\n${template}\n${MARKER_CLOSE}`;
+  const existing = existsSync(fullPath) ? readFileSync(fullPath, 'utf-8') : null;
+  const managedBlock = existing?.match(MARKER_BLOCK_RE);
+  if (managedBlock?.[0] === block) {
+    log.info(`${filePath} already has Void instructions (v${version})`);
+    return;
+  }
 
-  if (existsSync(fullPath)) {
-    const existing = readFileSync(fullPath, 'utf-8');
-    const match = existing.match(MARKER_OPEN_RE);
-    if (match) {
-      if (match[1] === version) {
-        log.info(`${filePath} already has Void instructions (v${version})`);
-        return;
-      }
-      // Replace existing block with updated version
+  if (!newProject) {
+    if (process.env.CI || !process.stdin.isTTY) {
+      log.info(
+        `Skipping ${filePath} setup without an interactive terminal; read node_modules/void/docs/.`,
+      );
+      return;
+    }
+    const accepted = await confirm({
+      message: managedBlock
+        ? 'Update Void instructions in AGENTS.md?'
+        : existing !== null
+          ? 'Append Void instructions to AGENTS.md?'
+          : 'Create AGENTS.md with Void instructions?',
+      initialValue: true,
+    });
+    if (isCancel(accepted)) {
+      cancel('Setup cancelled.');
+      process.exit(0);
+    }
+    if (!accepted) {
+      return;
+    }
+  }
+
+  if (existing !== null) {
+    if (managedBlock) {
       const updated = existing.replace(MARKER_BLOCK_RE, block);
       writeFileSync(fullPath, updated);
-      log.success(`Updated Void instructions in ${filePath} (v${match[1]} → v${version})`);
+      log.step(`Updated Void instructions in ${filePath}`);
     } else {
       // Append block to end of file
       const separator = existing.endsWith('\n') ? '\n' : '\n\n';
       writeFileSync(fullPath, existing + separator + block + '\n');
-      log.success(`Added Void instructions to ${filePath}`);
+      log.step(`Added Void instructions to ${filePath}`);
     }
   } else {
     writeFileSync(fullPath, block + '\n');
-    log.success(`Created ${filePath} with Void instructions`);
+    log.step(`Created ${filePath} with Void instructions`);
   }
 }
 
 export async function runInitCommand(root: string, initArgs?: InitArgs): Promise<void> {
   console.log();
 
-  const targeted = Boolean(initArgs && (initArgs.tsconfig || initArgs.github || initArgs.agents));
+  const targeted = Boolean(initArgs && (initArgs.tsconfig || initArgs.github));
   if (!targeted) {
     root = await resolveInitRoot(root);
   }
+  const newProject = isScaffoldableEmptyProject(root) && !existsSync(join(root, 'AGENTS.md'));
   const hadTypedConfig = existsSync(join(root, TYPED_CONFIG_FILE));
   if (migrateLegacyVoidConfig(root)) {
-    log.success(
+    log.step(
       'Migrated project configuration to void.config.ts. Commit void.config.ts and void.lock.json.',
     );
   }
@@ -3192,19 +3144,15 @@ export async function runInitCommand(root: string, initArgs?: InitArgs): Promise
     applyDatabaseSetup(root, await promptDatabaseSetup(root));
   }
 
-  // Steps 4–5: Agent instructions and skills
-  if (!targeted || initArgs?.agents) {
-    // Step 4: Agent instructions
-    injectAgentBlock(root);
+  // Steps 4–5: Agent instructions and skills are part of every init.
+  await injectAgentBlock(root, newProject);
 
-    // Step 5: Link skills
-    const agents = detectAgents(root);
-    if (agents.length > 0) {
-      const { linkSkillsForSpecificAgents } = await import('./skills.ts');
-      linkSkillsForSpecificAgents(root, agents);
-    } else {
-      log.info('No coding agent detected; read the bundled docs linked in AGENTS.md');
-    }
+  const agents = detectAgents(root);
+  if (agents.length > 0) {
+    const { linkSkillsForSpecificAgents } = await import('./skills.ts');
+    linkSkillsForSpecificAgents(root, agents);
+  } else {
+    log.info('Bundled Void docs: node_modules/void/docs/');
   }
 
   // Step 6: Demo code (only in full interactive flow, not for meta-frameworks)
@@ -3264,19 +3212,13 @@ export async function runInitCommand(root: string, initArgs?: InitArgs): Promise
             'Workspace subpackage',
           );
         } else if (!voidResolvable || packageJsonMutated) {
-          // Non-subpackage case: run install so the Yarn PnP detection
-          // below can inspect the post-install state of the filesystem.
-          // We also enter this branch when `packageJsonMutated` is true
-          // even if `void` was already resolvable, because
-          // `scaffoldDemo()` added a new `void` entry to the child's
-          // `package.json` and the lockfile needs to be reconciled.
-          // Without this install, CI frozen-install (or
+          // Non-subpackage case. We also enter this branch when
+          // `packageJsonMutated` is true even if `void` was already
+          // resolvable, because `scaffoldDemo()` added a new `void` entry
+          // to the child's `package.json` and the lockfile needs to be
+          // reconciled. Without this install, CI frozen-install (or
           // `pnpm install --frozen-lockfile`, `npm ci`,
           // `yarn install --immutable`) would fail the integrity check.
-          //
-          // `.pnp.cjs` is only written by Yarn Berry AFTER a successful
-          // `yarn install`, so this check MUST run before the install
-          // gate below.
           scaffoldAddedDependencies = true;
         }
         scaffoldedStarterMode = 'sqlite';
@@ -3312,7 +3254,7 @@ export async function runInitCommand(root: string, initArgs?: InitArgs): Promise
   // change where GitHub reads workflow files from. Compute the
   // subpackage-membership signal directly so both targeted and
   // interactive modes agree.
-  const githubStepSkipForSubpackage = isInsideWorkspaceSubpackage(root);
+  const githubStepSkipForSubpackage = workspaceSubpackage;
   let shouldSetupGithub = targeted ? initArgs?.github === true : deploymentPlatform !== 'none';
   if (
     shouldSetupGithub &&
@@ -3372,9 +3314,9 @@ export async function runInitCommand(root: string, initArgs?: InitArgs): Promise
     if (scaffoldResult.written) {
       const rel = relative(root, scaffoldResult.written) || 'env.ts';
       if (scaffoldResult.entries.length > 0) {
-        log.success(`Scaffolded ${rel} from .env — review inferred types before running dev.`);
+        log.step(`Scaffolded ${rel} from .env — review inferred types before running dev.`);
       } else {
-        log.success(`Created empty ${rel} — add your env keys with \`defineEnv({...})\`.`);
+        log.step(`Created empty ${rel} — add your env keys with \`defineEnv({...})\`.`);
       }
     }
   }
@@ -3383,10 +3325,9 @@ export async function runInitCommand(root: string, initArgs?: InitArgs): Promise
     installProjectDependencies(root, state.packageManager);
   }
   if (scaffoldedStarterMode && !workspaceSubpackageSkip) {
-    // Round 39: `generateStarterMigration` injects the Yarn PnP
-    // loaders into the spawned child's `NODE_OPTIONS` via
-    // `buildDrizzleKitSpawnEnv`, so it works under PnP the same way
-    // `gen.ts:runMigration` does. No skip branch needed.
+    // `generateStarterMigration` injects the Yarn PnP loaders through
+    // `buildDrizzleKitSpawnEnv`, so it works under PnP like
+    // `gen.ts:runMigration`.
     generateStarterMigration(root, scaffoldedStarterMode);
   }
 
@@ -3408,15 +3349,19 @@ export async function runInitCommand(root: string, initArgs?: InitArgs): Promise
   if (workspaceSubpackageSkip) {
     // The workspace install + `void db generate` ordering was already
     // surfaced via `note(..., 'Workspace subpackage')` upstream; the
-    // outro just nudges the user back toward that note instead of
+    // completion nudges the user back toward that note instead of
     // suggesting a dev command they cannot run yet. Static starter mode
     // has no migration step, so omit the `void db generate` half there.
     if (scaffoldedStarterMode) {
-      outro('Run your workspace install, then `void db generate` to finish setup.');
+      printSuccess(
+        'Project initialized. Run your workspace install, then `void db generate` to finish setup.',
+      );
     } else {
-      outro('Run your workspace install to finish setup.');
+      printSuccess('Project initialized. Run your workspace install to finish setup.');
     }
   } else {
-    outro(`Run \`${getDevCommand(root, framework)}\` to start developing`);
+    printSuccess(
+      `Project initialized. Run \`${getDevCommand(root, framework)}\` to start developing.`,
+    );
   }
 }

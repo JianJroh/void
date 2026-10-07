@@ -166,6 +166,14 @@ API integration fixtures reset their tables with one ordered SQL block. Use `cle
 than repeating per-table cleanup; it keeps foreign-key delete behavior and migration history
 intact in PGlite and PostgreSQL.
 
+Platform CI runs the candidate's PostgreSQL concurrency cases in a separate job. The selector
+finds API integration files that read `process.env.VOID_TEST_DATABASE_URL`, excluding mentions
+in comments or strings. Each selected file runs against its own database clone, with two files
+in flight, using the same bounded runner as schema compatibility. This exercises real locks
+without repeating the entire API suite. To run it locally, migrate a disposable loopback
+`void_schema_compat` database as `void_ci`, then set `COMPAT_DATABASE_URL` and run
+`node .github/scripts/postgres-concurrency-tests.ts`.
+
 Staging CI on main also runs the production schema-compatibility gate, so its failures are caught
 before tagging a release. The job copies the candidate's `.github/scripts/schema-compat-tests.ts` runner
 before checking out the deployed revision. It runs every deployed API test file against its own
@@ -220,6 +228,14 @@ local run. The interactive initializer is a Node.js script using the system `scr
 utility and Bash; it has no Python or native npm dependency.
 
 ## Browser readiness and Windows CI
+
+Pages scroll regressions run in Chromium by default. On a machine with Playwright WebKit support,
+run the same document navigation, reload, SPA navigation, and suspended-render cases in WebKit:
+
+```sh
+vp exec playwright install webkit
+VOID_TEST_BROWSER=webkit vp test run packages/react/test/integration packages/vue/test/integration packages/svelte/test/integration packages/solid/test/integration -t 'restores.*scroll'
+```
 
 Use `waitForIslandsHydrated` from `test/browser-helpers.ts` before asserting island state or
 interacting with islands. Pass the expected minimum count when checking a multi-island fixture.
@@ -308,7 +324,7 @@ Use the intended test account rather than an account name embedded in a script. 
 - setting `CLOUDFLARE_ACCOUNT_ID` in the current shell.
 
 When a version has no preview URL, also set `CLOUDFLARE_WORKERS_SUBDOMAIN` to the account's
-workers.dev subdomain. For `https://my-worker.my-team.workers.dev`, the value is `my-team`. The
+workers.dev subdomain. For [`https://my-worker.my-team.workers.dev`](https://my-worker.my-team.workers.dev), the value is `my-team`. The
 account name shown in the dashboard is not necessarily the workers.dev subdomain.
 
 Never commit account IDs, resource IDs, API tokens, or Access credentials. CI should receive them

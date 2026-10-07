@@ -11,6 +11,8 @@ import {
   acquirePlatformLifecycleLock,
   assertPlatformInstallationSlugAvailable,
   getActivePlatformConnection,
+  findPlatformConnections,
+  platformConnectionSlug,
   listInstallationManifests,
   listPlatformConnections,
   normalizePlatformApiUrl,
@@ -20,6 +22,7 @@ import {
   promoteInstallationSecrets,
   readInstallationRecoverySecrets,
   removeInstallationRecoverySecrets,
+  resolveInstallationManifest,
   writePendingInstallationSecrets,
   writeInstallationManifest,
 } from '../../src/cli/platform-registry.ts';
@@ -34,6 +37,25 @@ function temporaryRegistry(): string {
   const directory = mkdtempSync(join(tmpdir(), 'void-platform-registry-'));
   roots.push(directory);
   return directory;
+}
+
+function exampleInstallation() {
+  return setInstallationEndpoints(
+    createPlatformInstallationManifest({
+      account: { id: 'account_123', name: 'Developer Platform Experience' },
+      createdAt: '2026-09-14T00:00:00.000Z',
+      deployment: createPlatformDeploymentManifest({
+        application: { baseDomain: 'example.com', zoneName: 'example.com' },
+        displayName: 'Example',
+        installationSlug: 'example',
+      }),
+      id: 'example-a1b2c3d4',
+      ownershipNonce: '0123456789abcdef0123456789abcdef',
+      platformVersion: '0.10.13',
+    }),
+    { apiUrl: 'https://api.example.com', dashboardUrl: null, proxyUrl: null },
+    '2026-09-14T00:00:00.000Z',
+  );
 }
 
 afterEach(() => {
@@ -133,25 +155,137 @@ describe('platform registry', () => {
 
   it('writes and discovers exact installation manifests', () => {
     const directory = temporaryRegistry();
-    let manifest = createPlatformInstallationManifest({
-      account: { id: 'account_123', name: 'Developer Platform Experience' },
-      createdAt: '2026-09-14T00:00:00.000Z',
-      deployment: createPlatformDeploymentManifest({
-        application: { baseDomain: 'example.com', zoneName: 'example.com' },
-        displayName: 'Example',
-        installationSlug: 'example',
-      }),
-      id: 'example-a1b2c3d4',
-      ownershipNonce: '0123456789abcdef0123456789abcdef',
-      platformVersion: '0.10.13',
-    });
-    manifest = setInstallationEndpoints(
-      manifest,
-      { apiUrl: 'https://api.example.com', dashboardUrl: null, proxyUrl: null },
-      '2026-09-14T00:00:00.000Z',
-    );
+    const manifest = exampleInstallation();
     writeInstallationManifest(manifest, directory);
     expect(listInstallationManifests(directory)).toEqual([manifest]);
+  });
+
+  it('resolves a local installation slug for selection without changing the default on lookup', () => {
+    const directory = temporaryRegistry();
+    const manifest = exampleInstallation();
+    writeInstallationManifest(manifest, directory);
+    const connection = savePlatformConnection(
+      {
+        accountId: manifest.account.id,
+        apiUrl: manifest.endpoints.apiUrl!,
+        applicationDomain: 'example.com',
+        displayName: 'Friendly platform name',
+        installationId: manifest.id,
+        kind: 'installed',
+        proxyUrl: null,
+      },
+      directory,
+    );
+    const before = readFileSync(join(directory, 'registry.json'), 'utf8');
+    expect(platformConnectionSlug(connection, [manifest])).toBe('example');
+    expect(findPlatformConnections('example', directory)).toEqual([connection]);
+    expect(readFileSync(join(directory, 'registry.json'), 'utf8')).toBe(before);
+    expect(selectPlatformConnection('example', directory).id).toBe(connection.id);
+    expect(
+      platformConnectionSlug({ ...connection, accountId: 'another-account' }, [manifest]),
+    ).toBeNull();
+    expect(platformConnectionSlug(connection, [{ ...manifest, status: 'uninstalled' }])).toBeNull();
+  });
+
+  it('refuses an ambiguous slug and lets an API URL select the intended account', () => {
+    const directory = temporaryRegistry();
+    const first = exampleInstallation();
+    const second = {
+      ...first,
+      account: { id: 'account_456', name: 'Other account' },
+      id: 'example-other',
+    };
+    for (const [index, manifest] of [first, second].entries()) {
+      writeInstallationManifest(manifest, directory);
+      savePlatformConnection(
+        {
+          accountId: manifest.account.id,
+          apiUrl: `https://api-${index}.example.com`,
+          applicationDomain: 'example.com',
+          displayName: `Platform ${index}`,
+          installationId: manifest.id,
+          kind: 'installed',
+          proxyUrl: null,
+        },
+        directory,
+      );
+    }
+    expect(findPlatformConnections('example', directory)).toHaveLength(2);
+    expect(() => selectPlatformConnection('example', directory)).toThrow('More than one platform');
+    expect(selectPlatformConnection('https://api-0.example.com', directory).installationId).toBe(
+      first.id,
+    );
+  });
+
+  it('resolves connection IDs to local installations without changing the active connection', () => {
+    const directory = temporaryRegistry();
+    const manifest = exampleInstallation();
+    writeInstallationManifest(manifest, directory);
+    const connection = savePlatformConnection(
+      {
+        accountId: manifest.account.id,
+        apiUrl: manifest.endpoints.apiUrl!,
+        applicationDomain: 'example.com',
+        displayName: 'Saved connection name',
+        installationId: manifest.id,
+        kind: 'installed',
+        proxyUrl: null,
+      },
+      directory,
+    );
+    const otherConnection = savePlatformConnection(
+      {
+        accountId: null,
+        apiUrl: 'https://other.example.com',
+        applicationDomain: null,
+        displayName: 'Other',
+        installationId: null,
+        kind: 'connected',
+        proxyUrl: null,
+      },
+      directory,
+    );
+    const registryBeforeLookup = readFileSync(join(directory, 'registry.json'), 'utf8');
+    for (const selector of [manifest.id, 'example', 'Example', connection.id]) {
+      expect(resolveInstallationManifest(selector, directory)).toEqual(manifest);
+    }
+    expect(readFileSync(join(directory, 'registry.json'), 'utf8')).toBe(registryBeforeLookup);
+    expect(getActivePlatformConnection(directory)?.id).toBe(otherConnection.id);
+    expect(() => resolveInstallationManifest(otherConnection.id, directory)).toThrow(
+      'No local installation matches',
+    );
+  });
+
+  it('rejects connection IDs with mismatched, uninstalled, or missing local installations', () => {
+    const directory = temporaryRegistry();
+    const manifest = exampleInstallation();
+    writeInstallationManifest(manifest, directory);
+    const connection = savePlatformConnection(
+      {
+        accountId: manifest.account.id,
+        apiUrl: manifest.endpoints.apiUrl!,
+        applicationDomain: 'example.com',
+        displayName: 'Example',
+        installationId: manifest.id,
+        kind: 'installed',
+        proxyUrl: null,
+      },
+      directory,
+    );
+    savePlatformConnection({ ...connection, accountId: 'another_account' }, directory);
+    expect(() => resolveInstallationManifest(connection.id, directory)).toThrow(
+      'No local installation matches',
+    );
+    savePlatformConnection({ ...connection, accountId: null }, directory);
+    expect(resolveInstallationManifest(connection.id, directory)).toEqual(manifest);
+    writeInstallationManifest({ ...manifest, status: 'uninstalled' }, directory);
+    expect(() => resolveInstallationManifest(connection.id, directory)).toThrow(
+      'No local installation matches',
+    );
+    rmSync(join(directory, manifest.account.id), { recursive: true });
+    expect(() => resolveInstallationManifest(connection.id, directory)).toThrow(
+      'No local installation matches',
+    );
   });
 
   it('keeps recovery material private and removes it explicitly', () => {

@@ -39,11 +39,7 @@ import { removeSharedEmailRecipients } from '../email/shared-recipient-service.t
 import type { ApiEnv } from '../env.ts';
 import { cancelContainerBuildDos } from '../github/cancel-builds.ts';
 import { generateId } from '../id.ts';
-import {
-  getLegacyProjectWorkerName,
-  getProjectDeploymentWorkerName,
-  getProjectQueueName,
-} from '../naming.ts';
+import { getLegacyProjectWorkerName, getProjectDeploymentWorkerName } from '../naming.ts';
 import { requireProjectCapability } from '../project-access.ts';
 import {
   deployments as deploymentsTable,
@@ -220,7 +216,6 @@ async function runCleanupBatch(
 async function cleanupCriticalResources(
   context: Context<ApiEnv>,
   projectId: string,
-  _project: Pick<Project, 'slug'>,
 ): Promise<void> {
   const resources = await getProjectResources(context.get('db'), projectId);
   for (const resource of resources) {
@@ -539,8 +534,7 @@ async function lockAndMarkDeleting(
 }> | null> {
   return await db.transaction(async (tx) => {
     await tx.execute(drizzleSql`SELECT id FROM projects WHERE id = ${projectId} FOR UPDATE`);
-    const txDb = tx as unknown as Db;
-    const lockedProject = await getProject(txDb, projectId);
+    const lockedProject = await getProject(tx, projectId);
     if (!lockedProject) {
       throw new Error('project disappeared during deletion');
     }
@@ -552,22 +546,22 @@ async function lockAndMarkDeleting(
     // The route precheck can go stale. Authorize again under the same lock as
     // the irreversible status transition. Operator cleanup has no actor here.
     if (actorUserId) {
-      await requireProjectCapability(txDb, projectId, actorUserId, 'delete');
+      await requireProjectCapability(tx, projectId, actorUserId, 'delete');
     }
-    const activeDeployment = await getActiveDeployment(txDb, projectId);
+    const activeDeployment = await getActiveDeployment(tx, projectId);
     if (activeDeployment?.source === 'rollback-lease') {
       throw new ProjectOperationInProgressError();
     }
-    if (await getPendingDeploymentOperation(txDb, projectId)) {
+    if (await getPendingDeploymentOperation(tx, projectId)) {
       throw new ProjectOperationInProgressError(
         'Deployment execution is still settling. Cancel it or wait for its result, then retry project deletion.',
       );
     }
-    const owner = await getUser(txDb, lockedProject.user_id);
+    const owner = await getUser(tx, lockedProject.user_id);
     if (!owner) {
       throw new Error('project owner disappeared during deletion');
     }
-    const [openOwnership] = await txDb
+    const [openOwnership] = await tx
       .select()
       .from(projectOwnershipPeriods)
       .where(
@@ -583,7 +577,7 @@ async function lockAndMarkDeleting(
     }
     const [latestClosedOwnership] = openOwnership
       ? []
-      : await txDb
+      : await tx
           .select()
           .from(projectOwnershipPeriods)
           .where(
@@ -597,7 +591,7 @@ async function lockAndMarkDeleting(
           .limit(1);
     let ownership: ProjectOwnershipPeriod | undefined;
     if (openOwnership) {
-      [ownership] = await txDb
+      [ownership] = await tx
         .update(projectOwnershipPeriods)
         .set({ ends_at: drizzleSql`clock_timestamp()` })
         .where(eq(projectOwnershipPeriods.id, openOwnership.id))
@@ -608,15 +602,15 @@ async function lockAndMarkDeleting(
     ) {
       // A previous teardown attempt may have stopped after detaching usage.
       // Extend its cutoff so the retry reconciles activity through this attempt.
-      [ownership] = await txDb
+      [ownership] = await tx
         .update(projectOwnershipPeriods)
         .set({
           ends_at: drizzleSql`greatest(${projectOwnershipPeriods.ends_at}, clock_timestamp())`,
         })
         .where(eq(projectOwnershipPeriods.id, latestClosedOwnership.id))
         .returning();
-    } else if (!ownership) {
-      [ownership] = await txDb
+    } else {
+      [ownership] = await tx
         .insert(projectOwnershipPeriods)
         .values({
           id: generateId('pown'),
@@ -659,7 +653,7 @@ async function lockAndMarkDeleting(
       ownerBillingCycleStart: owner.billing_cycle_start,
       ownershipStartedAt: ownership!.starts_at,
       ownershipEndedAt: ownership!.ends_at!,
-      cancelledBuilds: await terminateBuildsForProject(txDb, projectId, {
+      cancelledBuilds: await terminateBuildsForProject(tx, projectId, {
         reason: 'project deleted',
       }),
     };
@@ -720,9 +714,8 @@ export class ProjectOperationInProgressError extends Error {
  * durable handle (the row) is now gone. `deleteProjectCascade` atomically writes
  * cleanup jobs for the COMPLETE set of missed resources before COMMIT (its FOR
  * UPDATE conflicts with the INSERT's FK FOR KEY SHARE), so failures remain
- * retryable. Containers are excluded
- * — they have their own deterministic-name double-sweep in
- * `cleanupCriticalResources`. Failures become warnings backed by jobs. Normally a
+ * retryable. Containers are excluded — they have their own deterministic-name
+ * double-sweep in `cleanupCriticalResources`. Failures become warnings backed by jobs. Normally a
  * no-op (no concurrent create → every row was in the snapshot). See design-doc 0067.
  */
 async function cleanupRaceWindowResourceOrphans(
@@ -865,7 +858,7 @@ export async function teardownProject(
     );
   }
 
-  await cleanupCriticalResources(context, projectId, project);
+  await cleanupCriticalResources(context, projectId);
   await removeSharedEmailRecipients(context.get('db'), context.env, projectId);
   // Customer-side cleanup is durable and may continue after project deletion.
   await cleanupProjectEmailAssignments(context, projectId);

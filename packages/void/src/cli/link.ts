@@ -2,7 +2,7 @@ import { outro, log, cancel } from '@voidzero-dev/vite-plus-prompts';
 import { getToken, getSiteDomain } from './auth.ts';
 import { PlatformClient } from './client.ts';
 import { promptAndCreateProject } from './create-project.ts';
-import { pc } from './output.ts';
+import { printSuccess, pc } from './output.ts';
 import { attachSelectedPlatform, readProjectConfig, writeProjectConfig } from './project.ts';
 import { promptProjectSelection } from './prompt.ts';
 import { resolveProjectBySlug } from './resolve-project.ts';
@@ -20,7 +20,6 @@ function projectLabel(slug: string, root: string, url?: string): string {
 export async function runLink(root: string, slug?: string): Promise<void> {
   console.log();
 
-  // Check if already linked
   const existing = readProjectConfig(root);
   if (existing) {
     log.warn(`Already linked to ${projectLabel(existing.slug, root)}`);
@@ -28,7 +27,6 @@ export async function runLink(root: string, slug?: string): Promise<void> {
     return;
   }
 
-  // Auth
   const token = getToken(root);
   if (!token) {
     cancel('No auth token found. Run `void account login` first.');
@@ -47,7 +45,7 @@ export async function runLink(root: string, slug?: string): Promise<void> {
     }
     const config = attachSelectedPlatform(root, resolved, client.apiUrl);
     writeProjectConfig(root, config);
-    outro(
+    printSuccess(
       `Linked to ${projectLabel(config.slug, root, projects.find((project) => project.id === config.projectId)?.url)}`,
     );
     return;
@@ -60,7 +58,7 @@ export async function runLink(root: string, slug?: string): Promise<void> {
 
   if (result.action === 'create') {
     const config = await promptAndCreateProject(root, client);
-    outro(`Created and linked to ${projectLabel(config.slug, root)}`);
+    printSuccess(`Created and linked to ${projectLabel(config.slug, root)}`);
     return;
   }
 
@@ -72,5 +70,5 @@ export async function runLink(root: string, slug?: string): Promise<void> {
       client.apiUrl,
     ),
   );
-  outro(`Linked to ${projectLabel(result.project.slug, root, result.project.url)}`);
+  printSuccess(`Linked to ${projectLabel(result.project.slug, root, result.project.url)}`);
 }

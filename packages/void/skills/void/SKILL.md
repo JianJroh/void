@@ -5,9 +5,12 @@ description: Build Void apps and use the Void CLI by loading the relevant bundle
 
 # Void
 
-Read only the guides needed for the user's task. The bundled documentation lives
-under `docs/` beside this skill; in an installed project it is available at
-`node_modules/void/skills/void/docs/`.
+Read only the guides needed for the user's task. Prefer the app's installed
+documentation at `node_modules/void/docs/` so it matches the app's Void version.
+All `docs/` paths below are relative to that package's root. When using this
+skill globally without a local Void installation, follow the skill's symlink to
+its real directory and use `../../docs/` in the same Void package. If the skill
+was copied without the package, use the guides at [https://void.cloud](https://void.cloud) instead.
 
 Before running a Void command, find its group in `docs/reference/cli.md`, then
 read the matching page under `docs/reference/cli/` for syntax, options, and
@@ -19,6 +22,8 @@ Use `void` and `@void/*` in imports, examples, and package manifests. Follow the
 project's existing framework and deployment destination. Deploying to a Void
 platform requires an explicit `void connect <url>` first; never infer a platform
 from old examples, tokens, or project IDs.
+Platform hostnames passed to `void connect` default to HTTPS; include `http://`
+explicitly when connecting to a local HTTP platform.
 For a one-time deployment elsewhere, connect to that platform, then set
 `VOID_API_URL` for the deploy command and pass `--project <slug>`. This preserves
 the app's existing saved destination, including when the target project is new.
@@ -78,7 +83,8 @@ the app's existing saved destination, including when the target project is new.
 - Declare application environment keys in `env.ts` and access them through
   `void/env`; follow `docs/guide/env-vars.md` for local and production values.
 - For platform setup, follow the pages linked from
-  `docs/guide/self-hosted-platform.md`. For recovery, use its documented resume
+  `docs/guide/self-hosted-platform.md`. Use `void platform list` to find the
+  installation slug for maintenance. For recovery, use its documented resume
   or repair workflow and preserve the installation's credentials and resources.
 - Use `--plan` to review platform changes. If an operation has an uncertain
   outcome, inspect its status and events before retrying.
@@ -87,4 +93,4 @@ If the user invokes this skill without a task, inspect the app's local structure
 configuration, and saved deployment destination, give a brief status, and ask
 what they want to work on.
 
-For AI and Sandbox operations, use `.match({ ok, limited })` and choose a useful quota fallback. In Pages, prefer the adapter’s `Form` with `useForm()` so action failures remain visible and entered data is preserved. See `docs/guide/ai.md`, `docs/guide/sandboxes.md`, and `docs/guide/pages-routing/actions-and-forms.md`.
+Await AI and Sandbox operations normally. Usage limits reject with `UsageLimit` from `void/limits`; Void routes and Pages actions automatically return HTTP 429. Optionally catch with `instanceof UsageLimit` for a fallback or custom response. In Pages, prefer the adapter’s `Form` with `useForm()` so action failures remain visible and entered data is preserved. See `docs/guide/ai.md`, `docs/guide/sandboxes.md`, and `docs/guide/pages-routing/actions-and-forms.md`.

@@ -13,12 +13,8 @@ import {
   type Db,
 } from '../db.ts';
 import type { ApiEnv } from '../env.ts';
-import {
-  deleteWorkerSecret,
-  encryptProjectSecret,
-  getVersionedWorkerName,
-  putWorkerSecret,
-} from '../project-secrets.ts';
+import { getProjectDeploymentWorkerName } from '../naming.ts';
+import { deleteWorkerSecret, encryptProjectSecret, putWorkerSecret } from '../project-secrets.ts';
 import { isReservedBindingName } from '../reserved-bindings.ts';
 import type { Project } from '../types.ts';
 import { requireProjectRouteCapability } from './project-access.ts';
@@ -37,8 +33,7 @@ async function withProjectSecretUpdate(
     // routing. Hold it through live propagation, and reject in-flight work
     // before changing storage: a candidate may already have captured secrets.
     await tx.execute(sql`SELECT id FROM projects WHERE id = ${projectId} FOR UPDATE`);
-    const db = tx as unknown as Db;
-    const access = await requireProjectRouteCapability(context, projectId, 'configure', db);
+    const access = await requireProjectRouteCapability(context, projectId, 'configure', tx);
     if (access instanceof Response) {
       return access;
     }
@@ -46,7 +41,7 @@ async function withProjectSecretUpdate(
     if (project.status === 'deleting') {
       return context.json({ error: 'project is being deleted' }, 410);
     }
-    const pending = await getActiveDeployment(db, projectId);
+    const pending = await getActiveDeployment(tx, projectId);
     if (pending) {
       return context.json(
         {
@@ -56,7 +51,7 @@ async function withProjectSecretUpdate(
         409,
       );
     }
-    return update(db, project);
+    return update(tx, project);
   });
 }
 
@@ -94,12 +89,7 @@ const app = new Hono<ApiEnv>()
       return access;
     }
 
-    let body: { value?: string } = {};
-    try {
-      body = await context.req.json<{ value?: string }>();
-    } catch {
-      body = {};
-    }
+    const body = await context.req.json<{ value?: string }>().catch((): { value?: string } => ({}));
     if (typeof body.value !== 'string' || body.value.length === 0) {
       return context.json({ error: 'value is required' }, 400);
     }
@@ -121,7 +111,10 @@ const app = new Hono<ApiEnv>()
 
       if (project.active_deployment_id) {
         const dispatchNamespace = context.env.DISPATCH_NAMESPACE ?? DEFAULT_DISPATCH_NAMESPACE;
-        const workerName = getVersionedWorkerName(project.slug, project.active_deployment_id);
+        const workerName = getProjectDeploymentWorkerName(
+          project.slug,
+          project.active_deployment_id,
+        );
         try {
           await putWorkerSecret(context.env, dispatchNamespace, workerName, secretName, value);
         } catch (error) {
@@ -158,7 +151,10 @@ const app = new Hono<ApiEnv>()
 
       if (project.active_deployment_id) {
         const dispatchNamespace = context.env.DISPATCH_NAMESPACE ?? DEFAULT_DISPATCH_NAMESPACE;
-        const workerName = getVersionedWorkerName(project.slug, project.active_deployment_id);
+        const workerName = getProjectDeploymentWorkerName(
+          project.slug,
+          project.active_deployment_id,
+        );
         try {
           await deleteWorkerSecret(context.env, dispatchNamespace, workerName, secretName);
         } catch (error) {

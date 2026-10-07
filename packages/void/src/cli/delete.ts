@@ -1,7 +1,7 @@
-import { outro, note, log, text, isCancel, cancel } from '@voidzero-dev/vite-plus-prompts';
+import { log, text, isCancel, cancel } from '@voidzero-dev/vite-plus-prompts';
 import { getToken } from './auth.ts';
 import { PlatformClient } from './client.ts';
-import { createSpinner } from './output.ts';
+import { printSuccess, createSpinner, note } from './output.ts';
 import { readProjectConfig, removeProjectConfig } from './project.ts';
 import { resolveProjectBySlug } from './resolve-project.ts';
 
@@ -74,7 +74,7 @@ export async function runDeleteCommand(
 
   const result = await client.deleteProject(projectId);
 
-  s.stop('Project deleted.');
+  s.clear();
 
   if (result.warnings && result.warnings.length > 0) {
     for (const warning of result.warnings) {
@@ -89,5 +89,5 @@ export async function runDeleteCommand(
     log.step('Removed local .void/project.json');
   }
 
-  outro(`Deleted ${projectSlug}`);
+  printSuccess(`Deleted ${projectSlug}`);
 }

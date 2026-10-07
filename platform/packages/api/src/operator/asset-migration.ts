@@ -7,7 +7,7 @@ import {
   getContentType,
   KV_THRESHOLD,
 } from '../assets.ts';
-import { getActiveDeployment, getDeployment, getProject, type Db } from '../db.ts';
+import { getActiveDeployment, getDeployment, getProject } from '../db.ts';
 import type { ApiEnv } from '../env.ts';
 import { deployments, projects } from '../schema.ts';
 import { OperatorError, preview } from './common.ts';
@@ -311,7 +311,7 @@ export async function migrateOperatorDeploymentAssets(
   }
   await context.get('db').transaction(async (tx) => {
     await tx.execute(sql`SELECT id FROM projects WHERE id = ${initial.project.id} FOR UPDATE`);
-    const fresh = await snapshot(context, deploymentId, tx as unknown as Db);
+    const fresh = await snapshot(context, deploymentId, tx);
     if (fresh.expected !== initial.expected) {
       throw new OperatorError(
         409,

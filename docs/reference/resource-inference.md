@@ -17,6 +17,7 @@ Void automatically detects which Cloudflare resources your project uses by scann
 | `SANDBOX`        | Managed Sandbox capability | `import { getSandbox } from "void/sandbox"`                                                                                                                      | `getSandbox()`; native Cloudflare also exposes `env.SANDBOX` / `c.env.SANDBOX` |
 | Auth             | none                       | `import { ... } from "void/auth"` or `import { auth } from "void/client"` / `void/client/react` / `void/client/vue` / `void/client/svelte` / `void/client/solid` | none                                                                           |
 | `QUEUE_*`        | `Queue`                    | `import { queues } from "void/queues"`                                                                                                                           | `env.QUEUE_*`                                                                  |
+| `VOID_LIVE`      | `DurableObjectNamespace`   | `import { defineLiveStream } from "void/live"`                                                                                                                   | n/a                                                                            |
 | filename-derived | `DurableObjectNamespace`   | A default-exported `defineDurableState()` module in `durable-objects/`                                                                                           | n/a                                                                            |
 
 Auth detection also triggers when importing the `auth` specifier from `void/client` or a framework-specific client subpath such as `void/client/react` (but not when importing only `fetch`).
@@ -79,22 +80,7 @@ Paths are relative to the project root. When `inference.scanDirs` is set, it rep
 
 ## Explicit Binding Overrides
 
-Override individual bindings when inference does not match your setup:
-
-```json
-{
-  "inference": {
-    "bindings": {
-      "db": true,
-      "kv": true,
-      "storage": false,
-      "ai": false
-    }
-  }
-}
-```
-
-Explicit values override only their named bindings. Omitted bindings continue to be inferred, so setting `kv` does not disable storage, auth, or other features. Auth and checked-in migrations still require a database even when `db` is `false`.
+Use [`inference.bindings`](./config.md#inference-bindings) to enable, disable, or rename a binding when inference does not match your setup. It overrides only the bindings you name; the rest are still inferred.
 
 ## File Types
 

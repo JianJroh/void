@@ -2,7 +2,7 @@ import { execSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import spawn from 'cross-spawn';
-import { chromium, type Browser, type Page } from 'playwright';
+import { type Browser, type Page } from 'playwright';
 import { describe, expect, it, beforeAll, afterAll } from 'vite-plus/test';
 import { waitForIslandsHydrated } from '../../../../test/browser-helpers.ts';
 import {
@@ -11,6 +11,7 @@ import {
   waitForServer,
   killChild,
 } from '../../../../test/integration-helpers.ts';
+import { launchPagesBrowser } from '../../../../test/pages-browser.ts';
 import { registerSharedClientTests } from '../../../../test/pages-client-contract.ts';
 import { defineSharedIslandTests } from '../../../../test/pages-island-contract.ts';
 
@@ -168,7 +169,7 @@ export default function Layout({ children }: { children: ReactNode }) {
 }
 
 beforeAll(async () => {
-  browser = await chromium.launch();
+  browser = await launchPagesBrowser();
 });
 
 afterAll(async () => {
@@ -644,7 +645,10 @@ describe('react-pages client (dev)', () => {
       });
 
       const serverTimeout = process.platform === 'win32' ? 45_000 : 20_000;
-      await waitForServer(DEV_BASE, serverTimeout);
+      await waitForServer(DEV_BASE, serverTimeout, {
+        isAlive: () => child.exitCode === null && child.signalCode === null,
+        diagnostics: collectServerOutput(child),
+      });
       const paths = ['/', '/users', '/action-error', '/router-params/alpha', '/visit-await'];
       coldStartResponses.push(
         ...(await Promise.all(
@@ -692,6 +696,28 @@ describe('react-pages client (dev)', () => {
     expect(coldStartResponses.find(({ path, body }) => path === '/users')?.body).toContain('Alice');
     expect(stderr).not.toContain('Invalid hook call');
     expect(stderr).not.toMatch(/\(void_worker\).*new dependencies optimized: @void-repro/);
+  });
+
+  it('dev: client-only shells retain the React preamble and mount loader props', async () => {
+    const response = await fetch(`${DEV_BASE}/client-only`);
+    const html = await response.text();
+    expect(response.status).toBe(200);
+    expect(html).toContain('data-void-ssr="false"');
+    expect(html).toContain('__vite_plugin_react_preamble_installed__ = true');
+    expect(html).not.toContain('client-only page component rendered on the server');
+
+    const context = await browser.newContext();
+    try {
+      const page = await context.newPage();
+      await page.goto(`${DEV_BASE}/client-only`);
+      await page.waitForSelector('#app[data-hydrated="true"]');
+      expect(await page.textContent('[data-testid="client-only-title"]')).toBe('Client-only Route');
+      expect(await page.textContent('[data-testid="client-only-marker"]')).toBe(
+        'loader-props-available',
+      );
+    } finally {
+      await context.close();
+    }
   });
 
   it('dev: SSR pages, Inertia protocol, form handling, API coexistence', async () => {

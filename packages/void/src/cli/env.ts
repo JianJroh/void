@@ -1,11 +1,12 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { outro, log, note } from '@voidzero-dev/vite-plus-prompts';
+import { outro, log } from '@voidzero-dev/vite-plus-prompts';
 import { join } from 'pathslash';
 import { findEnvFile, generateEnvTypes } from '../codegen/env-types.ts';
 import { getToken } from './auth.ts';
 import { PlatformClient } from './client.ts';
 import type { EnvArgs } from './env-args.ts';
 import { fetchRemoteSecretNames, formatEnvReport, validateProdEnv } from './env-validation.ts';
+import { printSuccess, note } from './output.ts';
 import { readDeploymentPlatform, readProjectConfig } from './project.ts';
 
 export async function runEnvCommand(root: string, args: EnvArgs): Promise<void> {
@@ -58,7 +59,7 @@ async function runCheck(root: string, useRemoteSecrets: boolean): Promise<void> 
     return;
   }
   if (report.valid) {
-    outro(
+    printSuccess(
       useRemoteSecrets
         ? 'All required remote env names are present; values validate at runtime.'
         : 'Local .env values are valid.',
@@ -87,5 +88,5 @@ function runTypes(root: string): void {
   mkdirSync(outDir, { recursive: true });
   const { dts } = generateEnvTypes(envFile, outDir);
   writeFileSync(join(outDir, 'env.d.ts'), dts);
-  outro(`Wrote ${join('.void', 'env.d.ts')}.`);
+  printSuccess(`Wrote ${join('.void', 'env.d.ts')}.`);
 }

@@ -2,6 +2,7 @@ import { log } from '@voidzero-dev/vite-plus-prompts';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import { PlatformApiError, type PlatformClient } from '../../src/cli/client.ts';
 import { runGithubJoin } from '../../src/cli/github-cmd.ts';
+import * as output from '../../src/cli/output.ts';
 
 // Mock node:child_process so openBrowser never launches a real browser; the
 // localhost callback server is driven directly by fetch in each test.
@@ -55,7 +56,7 @@ function drive(opts: {
     completeGithubJoin: opts.completeGithubJoin,
   };
 
-  const run = runGithubJoin('/project', client as unknown as PlatformClient);
+  const run = runGithubJoin(client as unknown as PlatformClient);
 
   // Once the command has built the callback URL, fire the simulated browser
   // redirect back at the localhost server. Swallow fetch errors: on the
@@ -74,7 +75,7 @@ function drive(opts: {
 
 describe('runGithubJoin', () => {
   it('completes the join on a successful callback (count > 0, plural)', async () => {
-    const successSpy = vi.spyOn(log, 'success').mockImplementation(() => {});
+    const successSpy = vi.spyOn(output, 'printSuccess').mockImplementation(() => {});
     const messageSpy = vi.spyOn(log, 'message').mockImplementation(() => {});
     const completeGithubJoin = vi.fn(async () => ({ status: 'joined' as const, count: 2 }));
 
@@ -100,7 +101,7 @@ describe('runGithubJoin', () => {
   });
 
   it('uses the singular form when exactly one installation is joined', async () => {
-    const successSpy = vi.spyOn(log, 'success').mockImplementation(() => {});
+    const successSpy = vi.spyOn(output, 'printSuccess').mockImplementation(() => {});
     const completeGithubJoin = vi.fn(async () => ({ status: 'joined' as const, count: 1 }));
 
     await drive({
@@ -120,7 +121,7 @@ describe('runGithubJoin', () => {
 
   it('reports the no-op path when count === 0', async () => {
     const infoSpy = vi.spyOn(log, 'info').mockImplementation(() => {});
-    const successSpy = vi.spyOn(log, 'success').mockImplementation(() => {});
+    const successSpy = vi.spyOn(output, 'printSuccess').mockImplementation(() => {});
     const completeGithubJoin = vi.fn(async () => ({ status: 'joined' as const, count: 0 }));
 
     await drive({
@@ -170,7 +171,7 @@ describe('runGithubJoin', () => {
     const completeGithubJoin = vi.fn(async () => ({ status: 'joined' as const, count: 0 }));
     const client: FakeClient = { getGithubJoinUrl, completeGithubJoin };
 
-    await expect(runGithubJoin('/project', client as unknown as PlatformClient)).rejects.toThrow(
+    await expect(runGithubJoin(client as unknown as PlatformClient)).rejects.toThrow(
       'process.exit(1)',
     );
 

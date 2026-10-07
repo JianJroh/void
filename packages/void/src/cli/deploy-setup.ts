@@ -11,17 +11,6 @@ import {
 } from './project.ts';
 import { promptProjectSelection } from './prompt.ts';
 
-async function ensureToken(root: string): Promise<string> {
-  const existing = getToken(root);
-  if (existing) {
-    return existing;
-  }
-
-  const token = await promptForLoginToken(root);
-  log.success('Token saved.');
-  return token;
-}
-
 export async function maybeSetupDeployProject(root: string): Promise<ProjectConfig | null> {
   const existing = readProjectConfig(root);
   if (existing) {
@@ -43,7 +32,11 @@ export async function maybeSetupDeployProject(root: string): Promise<ProjectConf
     return null;
   }
 
-  const token = existingToken ?? (await ensureToken(root));
+  let token = existingToken;
+  if (!token) {
+    token = await promptForLoginToken(root);
+    log.step('Token saved.');
+  }
   const client = new PlatformClient(token, { root });
   const projects = await client.listProjects();
 
@@ -57,7 +50,7 @@ export async function maybeSetupDeployProject(root: string): Promise<ProjectConf
   if (result.action === 'select') {
     const config = { projectId: result.project.id, slug: result.project.slug };
     writeProjectConfig(root, attachSelectedPlatform(root, config, client.apiUrl));
-    log.success(`Linked project: ${config.slug}`);
+    log.step(`Linked project: ${config.slug}`);
     return config;
   }
 

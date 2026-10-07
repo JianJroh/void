@@ -80,22 +80,18 @@ const app = new Hono<ApiEnv>()
 
     const { hostname } = await context.req.json<{ hostname: string }>();
 
-    // Validate hostname format
     if (!hostname || typeof hostname !== 'string') {
       return context.json({ error: 'hostname is required' }, 400);
     }
 
-    // Must be a valid domain (basic check)
     if (!/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/.test(hostname)) {
       return context.json({ error: 'invalid hostname format' }, 400);
     }
 
-    // Cannot be a subdomain of the platform's app domain
     if (hostname.endsWith(`.${SITE_DOMAIN}`)) {
       return context.json({ error: `cannot use ${SITE_DOMAIN} subdomains` }, 400);
     }
 
-    // Uniqueness check
     const existing = await getDomainByHostname(context.get('db'), hostname);
     if (existing) {
       return context.json({ error: 'hostname already in use' }, 409);
@@ -118,10 +114,8 @@ const app = new Hono<ApiEnv>()
     // whose CF message ("Authentication error", "permission denied", etc.)
     // would leak internal state if surfaced. 403 is also returned for some
     // caller-fixable cases (SaaS zone-apex collision), but the HTTP status
-    // alone can't disambiguate — discriminating would need CF's internal
-    // error code (`errors[].code`), which `CloudflareApiError` does not
-    // currently preserve. Until it does, the conservative choice is to
-    // treat 403 like 401 and re-throw → onError → generic 500.
+    // alone can't disambiguate and this route does not map CF error codes,
+    // so 403 is treated like 401 and re-thrown → onError → generic 500.
     //
     // Same for 404 (could be zone-not-found = misconfig) and any other
     // status not in the whitelist. CF 5xx (upstream degraded) also re-throws.
@@ -203,12 +197,11 @@ const app = new Hono<ApiEnv>()
     try {
       const lockedResult = await context.get('db').transaction(async (tx) => {
         await tx.execute(drizzleSql`SELECT id FROM projects WHERE id = ${projectId} FOR UPDATE`);
-        const txDb = tx as unknown as Db;
         const lockedAccess = await requireProjectRouteCapability(
           context,
           projectId,
           'settings',
-          txDb,
+          tx,
         );
         if (lockedAccess instanceof Response) {
           return lockedAccess;
@@ -219,11 +212,11 @@ const app = new Hono<ApiEnv>()
 
         // Recheck after waiting for the project lock. A prior request for this
         // project may have committed while this request was queued.
-        const lockedExisting = await getDomainByHostname(txDb, hostname);
+        const lockedExisting = await getDomainByHostname(tx, hostname);
         if (lockedExisting) {
           return context.json({ error: 'hostname already in use' }, 409);
         }
-        if (await protectedProjectReachedDomainLimit(txDb, projectId)) {
+        if (await protectedProjectReachedDomainLimit(tx, projectId)) {
           return context.json({ error: DOMAIN_LIMIT_ERROR }, 409);
         }
 
@@ -235,13 +228,7 @@ const app = new Hono<ApiEnv>()
           ownership_verification: cfHostname.ownership_verification,
           ssl_validation_records: cfHostname.ssl.validation_records,
         };
-        const domain = await createDomain(
-          txDb,
-          projectId,
-          hostname,
-          cfHostname.id,
-          verificationData,
-        );
+        const domain = await createDomain(tx, projectId, hostname, cfHostname.id, verificationData);
 
         return context.json({
           ...domain,
@@ -345,13 +332,7 @@ const app = new Hono<ApiEnv>()
         }
         throw error;
       }
-      const txDb = tx as unknown as Db;
-      const lockedAccess = await requireProjectRouteCapability(
-        context,
-        projectId,
-        'settings',
-        txDb,
-      );
+      const lockedAccess = await requireProjectRouteCapability(context, projectId, 'settings', tx);
       if (lockedAccess instanceof Response) {
         return lockedAccess;
       }
@@ -372,8 +353,8 @@ const app = new Hono<ApiEnv>()
       // The project's custom domain application still lists this hostname.
       // Record that with the deletion, so the hostname is never freed while
       // no retry would remove it from that application.
-      await markProjectCustomDomainsChanged(txDb, projectId);
-      await deleteDomain(txDb, domain.id);
+      await markProjectCustomDomainsChanged(tx, projectId);
+      await deleteDomain(tx, domain.id);
       return null;
     });
     if (lockedResponse) {

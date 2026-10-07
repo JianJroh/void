@@ -1,5 +1,3 @@
-// no deps
-//
 // Structured request-scoped logger for the API deploy pipeline. Each call
 // emits exactly one JSON line to `console.log/warn/error` so Cloudflare Tail
 // captures one `logs[]` entry per record with the appropriate level.
@@ -10,7 +8,7 @@
 // `with(...)` returns a child logger with merged context; the parent is
 // unchanged.
 
-type Level = 'debug' | 'info' | 'warn' | 'error';
+type Level = 'info' | 'warn' | 'error';
 
 export type DeployLogContext = Readonly<{
   projectId: string;
@@ -23,7 +21,6 @@ export type DeployLogContext = Readonly<{
 
 export type DeployLogger = Readonly<{
   with(fields: Partial<DeployLogContext>): DeployLogger;
-  debug(phase: string, msg: string, fields?: Record<string, unknown>): void;
   info(phase: string, msg: string, fields?: Record<string, unknown>): void;
   warn(phase: string, msg: string, fields?: Record<string, unknown>): void;
   error(phase: string, msg: string, err: unknown, fields?: Record<string, unknown>): void;
@@ -47,10 +44,10 @@ function serializeError(input: unknown): SerializedError {
   const seen = new WeakSet<object>();
   function step(value: unknown, depth: number): SerializedError {
     if (value && typeof value === 'object') {
-      if (seen.has(value as object)) {
+      if (seen.has(value)) {
         return { message: '[circular]' };
       }
-      seen.add(value as object);
+      seen.add(value);
     }
     if (value instanceof Error) {
       const node: SerializedError = {
@@ -58,15 +55,14 @@ function serializeError(input: unknown): SerializedError {
         message: value.message,
         stack: value.stack,
       };
-      const anyVal = value as unknown as { code?: unknown; errno?: unknown; cause?: unknown };
-      if (anyVal.code !== undefined) {
-        node.code = anyVal.code;
+      if ('code' in value && value.code !== undefined) {
+        node.code = value.code;
       }
-      if (anyVal.errno !== undefined) {
-        node.errno = anyVal.errno;
+      if ('errno' in value && value.errno !== undefined) {
+        node.errno = value.errno;
       }
-      if (depth < MAX_CAUSE_DEPTH && anyVal.cause !== undefined) {
-        node.cause = step(anyVal.cause, depth + 1);
+      if (depth < MAX_CAUSE_DEPTH && value.cause !== undefined) {
+        node.cause = step(value.cause, depth + 1);
       }
       return node;
     }
@@ -74,7 +70,7 @@ function serializeError(input: unknown): SerializedError {
       return { message: 'undefined' };
     }
     try {
-      return { message: typeof value === 'string' ? value : String(value) };
+      return { message: String(value) };
     } catch {
       return { message: '[unserializable]' };
     }
@@ -132,9 +128,6 @@ class LoggerImpl implements DeployLogger {
 
   with(fields: Partial<DeployLogContext>): DeployLogger {
     return new LoggerImpl({ ...this.context, ...fields });
-  }
-  debug(phase: string, msg: string, fields?: Record<string, unknown>): void {
-    emit('debug', this.context, phase, msg, fields);
   }
   info(phase: string, msg: string, fields?: Record<string, unknown>): void {
     emit('info', this.context, phase, msg, fields);

@@ -1,3 +1,4 @@
+import type { CloudflareOperation, CloudflareCommandResult } from '@void/deploy-cloudflare';
 /**
  * Mode B email — the developer's OWN Cloudflare account (`void deploy --platform
  * cloudflare`). Design doc 0078, "Mode B — the developer's own Cloudflare account".
@@ -13,7 +14,7 @@
  * Both callers (`void deploy --platform cloudflare` step 3b-ii and `void email
  * setup|status --platform cloudflare`) borrow the session bearer through the deploy
  * runner's `runWranglerAuthToken` and gate the prompt on `isWranglerNonInteractiveOrCI`
- * (both in `cli/deploy.ts`), so the two never disagree.
+ * (both in `cli/deploy-cloudflare-auth.ts`), so the two never disagree.
  *
  * Rules that hold the whole thing together (0078 "The flow, by lane"):
  *
@@ -48,8 +49,7 @@
  * Invalid data fails closed: the row reads `unknown` and the checklist directs the
  * developer to `void email setup`. Failed commands retain their API error codes.
  */
-
-import type { CloudflareOperation, CloudflareCommandResult } from '@void/deploy-cloudflare';
+import { isRecord } from '@void/deploy-core';
 import type { EmailHandlersScan } from '../router/email.ts';
 import { findBindingNameOwner } from './wrangler.ts';
 
@@ -346,10 +346,6 @@ export interface SendingSettings {
   name: string;
   enabled: boolean;
   tag: string;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 export function readRoutingSettings(data: unknown): RoutingSettings | null {

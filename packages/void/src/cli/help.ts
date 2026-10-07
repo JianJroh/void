@@ -1,10 +1,10 @@
 import { readFileSync } from 'node:fs';
-import { note, outro } from '@voidzero-dev/vite-plus-prompts';
+import { outro } from '@voidzero-dev/vite-plus-prompts';
 import { join } from 'pathslash';
 import { getPackageDir } from './agents.ts';
 import { asciiArts } from './ascii.ts';
 import { operatorCommands, operatorGroups } from './operator-args.ts';
-import { categoryTitle, helpLine, pc, sectionTitle } from './output.ts';
+import { categoryTitle, helpLine, note, pc, sectionTitle } from './output.ts';
 
 type HelpCommand = {
   command: string;
@@ -45,7 +45,7 @@ function operatorHelpTree(): HelpTree {
                 ],
                 options: [
                   {
-                    command: '--connection <id-or-url>',
+                    command: '--connection <slug-or-url>',
                     description:
                       'Choose a registered connection; otherwise use VOID_API_URL or the active connection',
                   },
@@ -125,7 +125,8 @@ function operatorHelpTree(): HelpTree {
 
 const HELP_TREE: HelpTree = {
   connect: {
-    summary: 'Connect this project to Cloudflare or an existing Void platform.',
+    summary:
+      'Connect this project to Cloudflare or an existing Void platform. Platform hostnames default to HTTPS.',
     usage: ['void connect [url] [--platform <cloudflare|void>] [--no-login]'],
     options: [
       { command: '--platform <cloudflare|void>', description: 'Choose the deployment destination' },
@@ -133,7 +134,7 @@ const HELP_TREE: HelpTree = {
     ],
     examples: [
       { command: 'void connect', description: 'Choose a destination and sign in' },
-      { command: 'void connect https://platform.example.com', description: 'Join a Void platform' },
+      { command: 'void connect platform.example.com', description: 'Join a Void platform' },
       {
         command: 'void connect --platform cloudflare',
         description: 'Sign in and select a Cloudflare account',
@@ -144,18 +145,16 @@ const HELP_TREE: HelpTree = {
     summary: 'Set up Void in a new or existing project.',
     usage: ['void init [options]'],
     options: [
-      { command: '--agents', description: 'Set up agent instructions and skills' },
-      { command: '--tsconfig', description: 'Only update tsconfig.json' },
+      { command: '--tsconfig', description: 'Update tsconfig.json and set up coding agents' },
       { command: '--git', description: 'Initialize a Git repository without prompting' },
       { command: '--no-git', description: 'Skip Git repository initialization' },
       {
         command: '--github',
-        description: 'Only create the GitHub Actions deploy workflow (OIDC, no stored token)',
+        description: 'Create the GitHub Actions deploy workflow and set up coding agents',
       },
     ],
     examples: [
       { command: 'void init', description: 'Scaffold or configure the current project' },
-      { command: 'void init --agents', description: 'Install agent instructions and skills' },
       { command: 'void init --github', description: 'Scaffold the GitHub Actions deploy workflow' },
     ],
   },
@@ -356,7 +355,10 @@ const HELP_TREE: HelpTree = {
               { command: 'sync', description: 'Continue pending account limit updates' },
             ],
             options: [
-              { command: '--connection <id-or-url>', description: 'Select a registered platform' },
+              {
+                command: '--connection <slug-or-url>',
+                description: 'Select a registered platform',
+              },
               {
                 command: '--file <path>',
                 description: 'Read plan settings and partial limits from JSON',
@@ -423,7 +425,10 @@ const HELP_TREE: HelpTree = {
               },
             ],
             options: [
-              { command: '--connection <id-or-url>', description: 'Select a registered platform' },
+              {
+                command: '--connection <slug-or-url>',
+                description: 'Select a registered platform',
+              },
               {
                 command: '--installation <id>',
                 description: 'Select recovery authority for protection or provider recovery',
@@ -470,7 +475,10 @@ const HELP_TREE: HelpTree = {
         },
       },
       list: basicSubcommand('List installed and connected platforms.', 'void platform list'),
-      use: basicSubcommand('Select the default Void platform.', 'void platform use [id]'),
+      use: basicSubcommand(
+        'Select the default Void platform by installation slug, name, saved ID, or API URL.',
+        'void platform use [id]',
+      ),
       status: basicSubcommand('Inspect a platform and its health.', 'void platform status [id]'),
       discover: {
         summary: 'Recover owned platform installations from Cloudflare.',
@@ -579,6 +587,11 @@ const HELP_TREE: HelpTree = {
           {
             command: '--purge-data',
             description: 'Delete installer-owned data even when it contains apps',
+          },
+          {
+            command: '--purge-resources',
+            description:
+              'Delete every resource the installation created (includes --purge-data); keeps zones, adopted resources, and PostgreSQL',
           },
           {
             command: '--keep-zone',
@@ -1461,9 +1474,6 @@ export function printGlobalHelp(): void {
       globalCommandLine(['prepare'], 'void prepare'),
       ...globalCommandLines('gen', { route: 'route <path> [--methods]' }),
       '',
-      categoryTitle('agent'),
-      helpLine('void init --agents', requiredOption(['init'], '--agents').description),
-      '',
       categoryTitle('help'),
       helpLine('void help <command>', 'Show command-specific help'),
       helpLine('void <command> --help', 'Show command-specific help'),
@@ -1579,14 +1589,6 @@ function globalCommandLine(path: Array<string>, command: string): string {
 function globalOptionLines(path: Array<string>): Array<string> {
   const page = requiredPage(path);
   return (page.options ?? []).map((option) => helpLine(`  ${option.command}`, option.description));
-}
-
-function requiredOption(path: Array<string>, command: string): HelpCommand {
-  const option = requiredPage(path).options?.find((entry) => entry.command === command);
-  if (!option) {
-    throw new Error(`Missing help option: ${formatHelpPath(path)} ${command}`);
-  }
-  return option;
 }
 
 function requiredPage(path: Array<string>): HelpPage {

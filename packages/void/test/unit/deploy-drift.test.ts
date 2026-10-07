@@ -12,6 +12,7 @@ import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 import { generateVoidAuthDrizzleSchema } from '../../src/auth/drizzle.ts';
+import { getDeploySchemaDriftMessage } from '../../src/cli/deploy-drift.ts';
 import { hasDeploySchemaDrift, validateAuthMigrationSchema } from '../../src/cli/deploy.ts';
 import { writeDrizzleConfig } from '../../src/drizzle/config.ts';
 import { collectMigrations } from '../../src/migrations/collect.ts';
@@ -164,6 +165,35 @@ describe('hasDeploySchemaDrift', { timeout: driftTestTimeout }, () => {
         }
       }
     }
+  });
+
+  it('links to the repair guide when SQL migrations have no Drizzle metadata', () => {
+    const root = createTempApp();
+    writeSqliteSchema(root);
+    mkdirSync(join(root, 'db', 'migrations'), { recursive: true });
+    writeFileSync(
+      join(root, 'db', 'migrations', '001_create_users.sql'),
+      'CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);\n',
+    );
+
+    expect(hasDeploySchemaDrift(root, 'sqlite')).toBe(true);
+
+    const message = getDeploySchemaDriftMessage(root);
+    expect(message).toBe(
+      'Missing Drizzle metadata in db/migrations/.\nSee https://void.cloud/guide/database#hand-written-migrations',
+    );
+  });
+
+  it('keeps the generate advice when Drizzle metadata exists', () => {
+    const root = createTempApp();
+    writeSqliteSchema(root);
+    generateMigrations(root);
+    writeSqliteSchema(root, { includeEmail: true });
+
+    expect(hasDeploySchemaDrift(root, 'sqlite')).toBe(true);
+    expect(getDeploySchemaDriftMessage(root)).toContain(
+      'Run `void db generate`, review the generated migration',
+    );
   });
 
   it('throws when drizzle-kit cannot evaluate the schema', () => {

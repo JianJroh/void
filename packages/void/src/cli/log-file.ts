@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'pathslash';
@@ -24,9 +25,9 @@ export type ErrChainNode = {
 };
 
 /**
- * Flatten an already-serialized `ErrChainNode` (as read back out of a JSONL
- * record) to a single inline string. Mirrors `formatErrorChainInline`, which
- * does the same job for a live `Error` before it is written.
+ * Flatten a serialized `ErrChainNode` (from `describeErrorChain`, or read back
+ * out of a JSONL record) to a single inline string, joining cause levels with
+ * ` -> `.
  */
 export function formatErrorNodeInline(
   node: ErrChainNode | string | null | undefined,
@@ -64,7 +65,7 @@ export function formatErrorNodeInline(
  * Walk `err.cause` up to 6 levels and return a plain JSON-friendly chain.
  * Skips stack traces deliberately — keeps output line-oriented and readable.
  */
-export function describeErrorChain(err: unknown, depth = 0): ErrChainNode | string {
+function describeErrorChain(err: unknown, depth = 0): ErrChainNode | string {
   if (depth > 5 || err == null) {
     return String(err);
   }
@@ -91,39 +92,6 @@ export function describeErrorChain(err: unknown, depth = 0): ErrChainNode | stri
       }
     }
     return node;
-  }
-  return String(err);
-}
-
-/**
- * Flatten an error and its `cause` chain to a single inline string suitable
- * for stderr skimming. Mirrors `describeErrorChain`'s walk (depth cap 6,
- * same fields, no stack traces) but joins levels with ` -> ` instead of
- * nesting JSON.
- */
-function formatErrorChainInline(err: unknown, depth = 0): string {
-  if (depth > 5 || err == null) {
-    return String(err);
-  }
-  if (err instanceof Error) {
-    let head = err.name ? `${err.name}: ${err.message}` : err.message;
-    const code = (err as Error & { code?: string | number }).code;
-    const errno = (err as Error & { errno?: string | number }).errno;
-    const tags: Array<string> = [];
-    if (code !== undefined) {
-      tags.push(`code=${code}`);
-    }
-    if (errno !== undefined) {
-      tags.push(`errno=${errno}`);
-    }
-    if (tags.length > 0) {
-      head = `${head} (${tags.join(' ')})`;
-    }
-    const cause = (err as Error & { cause?: unknown }).cause;
-    if (cause != null) {
-      return `${head} -> ${formatErrorChainInline(cause, depth + 1)}`;
-    }
-    return head;
   }
   return String(err);
 }
@@ -156,7 +124,7 @@ function formatStderrLine(
     }
   }
   if (err !== undefined) {
-    parts.push(`-> err=${formatErrorChainInline(err)}`);
+    parts.push(`-> err=${formatErrorNodeInline(describeErrorChain(err))}`);
   }
   return parts.join(' ');
 }
@@ -174,8 +142,12 @@ export function openDeployLog(opts?: { mirrorToStderr?: boolean }): CliLogger {
     const dir = join(homedir(), '.void', 'logs');
     mkdirSync(dir, { recursive: true });
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
-    const filePath = join(dir, `deploy-${ts}.jsonl`);
-    stream = createWriteStream(filePath, { flags: 'a', autoClose: true });
+    // Deploys started in the same millisecond (parallel deploys from one
+    // machine) must not share a file, so add the pid and a random suffix and
+    // refuse to open a file that already exists.
+    const suffix = randomBytes(3).toString('hex');
+    const filePath = join(dir, `deploy-${ts}-${process.pid}-${suffix}.jsonl`);
+    stream = createWriteStream(filePath, { flags: 'wx', autoClose: true });
     stream.on('error', () => {
       // Disable subsequent writes silently. Stream errors should never
       // bubble up into the deploy pipeline.

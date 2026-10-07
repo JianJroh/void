@@ -1,6 +1,11 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { stripVTControlCharacters } from 'node:util';
+import {
+  createPlatformDeploymentManifest,
+  createPlatformInstallationManifest,
+} from '@void/platform';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import { hasHelpPage } from '../../src/cli/help.ts';
 import { operatorCommands, parseOperatorArgs } from '../../src/cli/operator-args.ts';
@@ -16,6 +21,7 @@ import { parsePlatformArgs } from '../../src/cli/platform-args.ts';
 import {
   getActivePlatformConnection,
   savePlatformConnection,
+  writeInstallationManifest,
 } from '../../src/cli/platform-registry.ts';
 
 const keyring = vi.hoisted(() => ({ read: vi.fn(), write: vi.fn(), remove: vi.fn() }));
@@ -57,6 +63,64 @@ function connect(apiUrl: string) {
     proxyUrl: null,
   });
 }
+
+describe('operator mutation completion output', () => {
+  async function runMutation(result: Record<string, unknown>, flags: Array<string> = []) {
+    connect('https://one.example');
+    vi.stubEnv('VOID_API_URL', 'https://one.example');
+    vi.stubEnv('VOID_OPERATOR_TOKEN', 'operator');
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const details = vi.spyOn(console, 'log').mockImplementation(() => {});
+    let terminal = '';
+    vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      terminal += String(chunk);
+      return true;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          Response.json({ dryRun: true, action: 'user.suspend', target: 'u1' }),
+        )
+        .mockResolvedValueOnce(Response.json(result)),
+    );
+    const operation = runOperatorCommand(
+      parseOperatorArgs(['user', 'suspend', 'u1', '--yes', ...flags]),
+    );
+    if (result.ok === false || result.partial === true) {
+      await expect(operation).rejects.toMatchObject({ code: 'partial_failure' });
+    } else {
+      await operation;
+    }
+    return { terminal: stripVTControlCharacters(terminal), details };
+  }
+
+  it('separates a completed mutation from its detailed result', async () => {
+    const { terminal, details } = await runMutation({ action: 'user.suspend', target: 'u1' });
+    expect(details).toHaveBeenCalledWith(expect.stringContaining('Target: u1'));
+    expect(terminal).toBe('\n✓ Platform user suspend completed.\n\n');
+  });
+
+  it.each([
+    { ok: false, partial: true },
+    { ok: true, complete: false },
+    { operationStatus: 'pending' },
+    { ok: true, configuration: { status: 'configuring' } },
+    { ok: true, project: { state: 'reconciling' } },
+    { ok: true, project: { state: 'error', last_error: 'DNS verification failed' } },
+  ])('does not claim completion for a failed or checkpointed result: %j', async (result) => {
+    const { terminal } = await runMutation(result);
+    expect(terminal).not.toContain('✓');
+  });
+
+  it('keeps successful JSON output free of terminal formatting', async () => {
+    const result = { ok: true, action: 'user.suspend', target: 'u1' };
+    const { terminal, details } = await runMutation(result, ['--json']);
+    expect(details).toHaveBeenCalledExactlyOnceWith(JSON.stringify(result));
+    expect(terminal).toBe('');
+  });
+});
 
 describe('operator argument and help coverage', () => {
   it('has nested help and routable arguments for every operation', () => {
@@ -487,6 +551,34 @@ describe('operator argument and help coverage', () => {
 });
 
 describe('operator credential isolation', () => {
+  it('resolves an installation slug without changing the active connection', () => {
+    const manifest = createPlatformInstallationManifest({
+      account: { id: 'account', name: 'Account' },
+      createdAt: '2026-09-14T00:00:00.000Z',
+      deployment: createPlatformDeploymentManifest({
+        application: { baseDomain: 'example.com', zoneName: 'example.com' },
+        displayName: 'Example',
+        installationSlug: 'example',
+      }),
+      id: 'example-a1b2c3d4',
+      ownershipNonce: '0123456789abcdef0123456789abcdef',
+      platformVersion: '1.0.0',
+    });
+    writeInstallationManifest(manifest);
+    const installed = savePlatformConnection({
+      accountId: manifest.account.id,
+      apiUrl: 'https://api.example.com',
+      applicationDomain: 'example.com',
+      displayName: 'Friendly platform name',
+      installationId: manifest.id,
+      kind: 'installed',
+      proxyUrl: null,
+    });
+    const active = connect('https://other.example.com');
+    expect(resolveOperatorOrigin('example')).toBe(installed.apiUrl);
+    expect(getActivePlatformConnection()?.id).toBe(active.id);
+    expect(keyring.read).not.toHaveBeenCalled();
+  });
   it('uses only registered explicit connections, without changing the active connection', () => {
     const first = connect('https://one.example');
     const second = connect('https://two.example');
@@ -583,10 +675,11 @@ describe('deployment asset migration', () => {
           .mocked(console.log)
           .mock.calls.map(([line]) => String(line))
           .join('\n');
-        expect(printed).toContain('needs Migration: 2');
-        expect(printed).toContain('invalid: false');
-        expect(printed).toContain('bundle Stored: true');
-        expect(printed).toContain('total Pages: 2');
+        expect(printed).toContain('Needs migration: 2');
+        expect(printed).toContain('Invalid: false');
+        expect(printed).toContain('Bundle stored: true');
+        expect(printed).toContain('Total pages: 2');
+        expect(printed).toContain('Deployments:');
       }
     },
   );
@@ -798,6 +891,41 @@ describe('operator transport and execution', () => {
       }),
     ).rejects.toMatchObject({ code: 'partial_failure', details });
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it('names a disabled platform and how to restore it', async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(Response.json({ error: 'Platform disabled' }, { status: 503 }));
+    await expect(
+      new OperatorClient('https://one.example', 'operator', fetcher).request('/users'),
+    ).rejects.toMatchObject({
+      code: 'Platform disabled',
+      status: 503,
+      message: 'Operator request failed (HTTP 503): Platform disabled. Run `void platform enable`.',
+    });
+  });
+  it('does not suggest enabling a platform paused for an upgrade or repair', async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(
+        Response.json({ error: 'Platform disabled', reason: 'maintenance' }, { status: 503 }),
+      );
+    await expect(
+      new OperatorClient('https://one.example', 'operator', fetcher).request('/users'),
+    ).rejects.toMatchObject({
+      code: 'Platform disabled',
+      status: 503,
+      message:
+        'Operator request failed (HTTP 503): the platform is paused for an upgrade or repair. Retry when it finishes.',
+    });
+  });
+  it('includes the error code when the API sends no message', async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(Response.json({ error: 'not_found' }, { status: 404 }));
+    await expect(
+      new OperatorClient('https://one.example', 'operator', fetcher).request('/users/x'),
+    ).rejects.toMatchObject({ message: 'Operator request failed (HTTP 404): not_found.' });
   });
   it('uses short read deadlines, longer mutation deadlines, and bounded overrides', async () => {
     vi.useFakeTimers();
@@ -1278,11 +1406,46 @@ describe('operator transport and execution', () => {
     await runOperatorCommand(parseOperatorArgs(['system', 'events']));
 
     const rendered = write.mock.calls.map(([line]) => String(line)).join('\n');
-    expect(rendered).toContain('version id: version-failed');
-    expect(rendered).toContain('error message: Version no longer exists.');
-    expect(rendered).toContain('audit Error: Could not persist the outcome.');
-    expect(rendered).toContain('action: workers/api/rollback');
-    expect(rendered).toContain('target: {"worker":"api","versionId":"version-failed"}');
+    expect(rendered).toContain('Version ID: version-failed');
+    expect(rendered).toContain('Error message: Version no longer exists.');
+    expect(rendered).toContain('Audit error: Could not persist the outcome.');
+    expect(rendered).toContain('Action: workers/api/rollback');
+    expect(rendered).toContain('Target: {"worker":"api","versionId":"version-failed"}');
+  });
+
+  it('renders sentence-case field labels that keep known acronyms', async () => {
+    vi.stubEnv('VOID_API_URL', 'https://one.example');
+    vi.stubEnv('VOID_OPERATOR_TOKEN', 'operator');
+    const write = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>().mockResolvedValue(
+        Response.json({
+          apiVersion: 3,
+          githubOAuth: true,
+          customDomains: false,
+          callbackUrl: 'https://one.example/auth/callback',
+          installation_id: 'install-1',
+          http_status: 200,
+          capabilities: { workerIds: 2 },
+        }),
+      ),
+    );
+
+    await runOperatorCommand(parseOperatorArgs(['system', 'health']));
+
+    expect(write.mock.calls.map(([line]) => String(line)).join('\n')).toBe(
+      [
+        'API version: 3',
+        'GitHub OAuth: true',
+        'Custom domains: false',
+        'Callback URL: https://one.example/auth/callback',
+        'Installation ID: install-1',
+        'HTTP status: 200',
+        'Capabilities:',
+        '  Worker IDs: 2',
+      ].join('\n'),
+    );
   });
 
   it('follows build log sequence and stops when terminal', async () => {

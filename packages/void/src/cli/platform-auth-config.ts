@@ -9,19 +9,14 @@ import {
   parsePlatformAdmissionPolicy,
   type PlatformAdmissionPolicy,
 } from '@void/platform';
-import {
-  type CANCEL_SYMBOL,
-  confirm,
-  isCancel,
-  multiselect,
-  password,
-  select,
-  text,
-} from '@voidzero-dev/vite-plus-prompts';
+import { confirm, multiselect, password, select, text } from '@voidzero-dev/vite-plus-prompts';
 import { openBrowser } from './auth.ts';
 import { readOperatorToken, resolveOperatorOrigin } from './operator-auth.ts';
 import { OperatorClient } from './operator-client.ts';
+import { humanLines } from './operator-cmd.ts';
+import { printSuccess } from './output.ts';
 import type { PlatformConfigArgs } from './platform-config-args.ts';
+import { platformPromptAnswer } from './platform-setup.ts';
 
 type Method = {
   id: string;
@@ -39,15 +34,15 @@ type Listing = {
   protection?: unknown;
 };
 
-function value<T>(input: T | typeof CANCEL_SYMBOL): T {
-  if (isCancel(input) || typeof input === 'symbol') {
-    throw new Error('platform: Cancelled.');
-  }
-  return input;
+function print(result: unknown, json: boolean): void {
+  console.log(json ? JSON.stringify(result, null, 2) : humanLines(result).join('\n'));
 }
 
-function print(result: unknown): void {
-  console.log(JSON.stringify(result, null, 2));
+function printApplied(result: Record<string, unknown>, args: PlatformConfigArgs): void {
+  print(result, args.json);
+  if (!args.json && !args.plan) {
+    printSuccess('Platform authentication configuration updated.');
+  }
 }
 
 async function apply(
@@ -68,7 +63,7 @@ async function apply(
     }
     console.error(JSON.stringify(preview, null, 2));
     if (
-      !value(
+      !platformPromptAnswer(
         await confirm({ message: `Apply this change to ${client.origin}?`, initialValue: false }),
       )
     ) {
@@ -178,9 +173,11 @@ async function configurationInput(
   const interactive = !!process.stdin.isTTY && !args.file;
   if (interactive) {
     if (!existing && kind !== 'github' && kind !== 'google' && !args.id) {
-      input.id = value(await text({ message: 'Connection ID:', initialValue: String(input.id) }));
+      input.id = platformPromptAnswer(
+        await text({ message: 'Connection ID:', initialValue: String(input.id) }),
+      );
     }
-    input.label = value(
+    input.label = platformPromptAnswer(
       await text({
         message: 'Login button label:',
         initialValue: String(
@@ -195,15 +192,15 @@ async function configurationInput(
       }),
     );
     if (kind === 'oidc' || kind === 'cloudflare-access') {
-      input.issuer = value(
+      input.issuer = platformPromptAnswer(
         await text({ message: 'OIDC issuer URL:', initialValue: String(input.issuer ?? '') }),
       );
     }
-    input.clientId = value(
+    input.clientId = platformPromptAnswer(
       await text({ message: 'Client ID:', initialValue: String(input.clientId ?? '') }),
     );
     if (kind === 'google') {
-      const domains = value(
+      const domains = platformPromptAnswer(
         await text({
           message: 'Allowed Workspace domains (comma-separated; blank allows any Google account):',
           initialValue: Array.isArray(input.allowedDomains) ? input.allowedDomains.join(', ') : '',
@@ -215,7 +212,7 @@ async function configurationInput(
         .filter(Boolean);
     }
     if (kind === 'oidc' || kind === 'cloudflare-access') {
-      const groups = value(
+      const groups = platformPromptAnswer(
         await text({
           message: 'Allowed groups (comma-separated; blank uses the provider’s access policy):',
           initialValue: Array.isArray(input.requiredGroups) ? input.requiredGroups.join(', ') : '',
@@ -237,7 +234,7 @@ async function configurationInput(
   }
   if (!args.clientSecretEnv && interactive) {
     secret =
-      value(
+      platformPromptAnswer(
         await password({
           message: existing
             ? 'Client secret (leave blank to keep the saved secret):'
@@ -267,15 +264,15 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
   const listing = (await client.request('/config/auth')) as unknown as Listing;
   if (!args.action) {
     if (!process.stdin.isTTY || args.json) {
-      print(listing);
+      print(listing, args.json);
       return;
     }
     if (!listing.initialized) {
-      print(await apply(client, '/config/auth/initialize', {}, args));
+      printApplied(await apply(client, '/config/auth/initialize', {}, args), args);
       console.log('Run void platform auth login, then return to void platform config auth.');
       return;
     }
-    const chosen = value(
+    const chosen = platformPromptAnswer(
       await select({
         message: 'Platform authentication:',
         options: [
@@ -290,7 +287,7 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
       }),
     );
     if (chosen === ':protection') {
-      const target = value(
+      const target = platformPromptAnswer(
         await select({
           message: 'Platform protection:',
           options: [
@@ -306,7 +303,7 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
       return runPlatformAuthConfig({ ...args, action: 'admission' });
     }
     if (chosen === ':add') {
-      const kind = value(
+      const kind = platformPromptAnswer(
         await select({
           message: 'Login method:',
           options: [
@@ -320,7 +317,7 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
       return runPlatformAuthConfig({ ...args, action: 'add', target: kind });
     }
     const method = listing.methods.find((method) => method.id === chosen)!;
-    const action = value(
+    const action = platformPromptAnswer(
       await select({
         message: stripVTControlCharacters(method.label),
         options: [
@@ -337,11 +334,11 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
     return runPlatformAuthConfig({ ...args, action, target: chosen });
   }
   if (args.action === 'list') {
-    print(listing);
+    print(listing, args.json);
     return;
   }
   if (args.action === 'initialize') {
-    print(await apply(client, '/config/auth/initialize', {}, args));
+    printApplied(await apply(client, '/config/auth/initialize', {}, args), args);
     return;
   }
   if (!listing.initialized) {
@@ -355,7 +352,7 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
       if (!process.stdin.isTTY || args.json) {
         throw new Error('platform: Supply --file with the signup policy in non-interactive mode.');
       }
-      const mode = value(
+      const mode = platformPromptAnswer(
         await select({
           message: 'Who can create an account?',
           initialValue: listing.admission?.mode ?? 'restricted',
@@ -369,7 +366,7 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
       if (mode === 'company') {
         const access =
           !!listing.protection &&
-          value(
+          platformPromptAnswer(
             await confirm({
               message: 'Allow everyone approved by Cloudflare Access protection?',
               initialValue: true,
@@ -388,7 +385,7 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
           );
         }
         const connections = eligible.length
-          ? value(
+          ? platformPromptAnswer(
               await multiselect({
                 message: 'Login methods whose company policies qualify new users:',
                 required: !access,
@@ -404,13 +401,14 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
         admission = { mode };
       }
     }
-    print(
+    printApplied(
       await apply(
         client,
         '/config/auth/admission',
         { revision: listing.revision, admission: parsePlatformAdmissionPolicy(admission) },
         args,
       ),
+      args,
     );
     return;
   }
@@ -419,11 +417,15 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
     throw new Error('platform: Login method not found. Run void platform config auth list.');
   }
   if (args.action === 'show') {
-    print(method);
+    print(method, args.json);
     return;
   }
   if (args.action === 'test') {
-    print(await testMethod(client, args.target, args));
+    const tested = await testMethod(client, args.target, args);
+    print(tested, args.json);
+    if (!args.json && !args.plan && tested.complete === true) {
+      printSuccess('Platform login verified.');
+    }
     return;
   }
   if (args.action === 'add' || args.action === 'configure') {
@@ -437,7 +439,7 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
       { ...input, revision: args.action === 'add' ? null : method!.revision },
       args,
     );
-    print(result);
+    printApplied(result, args);
     if (!args.plan && !args.json) {
       console.log(
         `Test and enable it with void platform config auth enable ${input.configuration.id}.`,
@@ -451,14 +453,14 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
       throw new Error('platform: Complete a login test and supply its --test-id.');
     }
     const tested = await testMethod(client, args.target, args);
-    print(tested);
+    print(tested, args.json);
     if (tested.complete !== true || typeof tested.id !== 'string') {
       throw new Error('platform: Complete the browser test before enabling or linking this login.');
     }
     testId = tested.id;
     if (
       args.action === 'enable' &&
-      value(
+      platformPromptAnswer(
         await confirm({
           message: 'Link this verified identity to your administrator account?',
           initialValue: true,
@@ -473,12 +475,13 @@ export async function runPlatformAuthConfig(args: PlatformConfigArgs): Promise<v
       );
     }
   }
-  print(
+  printApplied(
     await apply(
       client,
       `/config/auth/connections/${encodeURIComponent(args.target)}/${args.action}`,
       { revision: method!.revision, ...(testId ? { testId } : {}) },
       args,
     ),
+    args,
   );
 }

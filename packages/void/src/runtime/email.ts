@@ -17,7 +17,9 @@
 // workerd, so the capture is an explicit HTTP hop over the dev assets
 // binding — see `resolveDevInbox` below and `plugin-email-dev-inbox.ts`.
 
+import { isRecord } from '@void/deploy-core';
 import {
+  bytesToBase64,
   captureMessage,
   DEV_INBOX_ACK_HEADER,
   DEV_INBOX_ACK_VALUE,
@@ -30,6 +32,7 @@ import {
   serializeCapturedMessage,
   type CapturedMessage,
 } from './email/dev-inbox.ts';
+import { bytesToReadableStream } from './email/inbound.ts';
 import { buildMime, MimeError, normalizeEmail } from './email/mime.ts';
 import type {
   EmailDeliveryState,
@@ -136,7 +139,7 @@ function readEmailDomain(): string | undefined {
 }
 
 // The project's own default sender, written into the worker's `vars` by
-// `void deploy --platform cloudflare` from `email.from` in void.json. It is a
+// `void deploy --platform cloudflare` from `email.from` in void.config.ts. It is a
 // full address on a zone the developer owns, so there is no slug to
 // substitute; `normalizeEmail` validates it like any explicit `from`.
 function readEmailFrom(): string | undefined {
@@ -218,7 +221,6 @@ function resolveSendEmailBinding(
  * `OUTCOME_UNKNOWN` with the original error as `cause`: once `send()` has
  * started, an undocumented rejection does not prove the provider declined
  * the message before accepting it.
- *
  */
 function classifyBindingError(e: unknown): SendEmailError {
   const message = e instanceof Error ? e.message : String(e);
@@ -247,15 +249,6 @@ function classifyBindingError(e: unknown): SendEmailError {
 // cannot drag an unrelated mention of the address into a false positive.
 const UNVERIFIED_DESTINATION_RE =
   /^[^\n]{0,200}destination address[^\n]{0,200}not (?:yet )?verified/i;
-
-function bytesToReadableStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
-  return new ReadableStream({
-    start(controller) {
-      controller.enqueue(bytes);
-      controller.close();
-    },
-  });
-}
 
 /**
  * Deliver through the worker's own `SEND_EMAIL` binding. One `EmailMessage`
@@ -380,7 +373,7 @@ function resolveDefaultFrom(opts: SendEmailOptions): SendEmailOptions {
   }
   // `__VOID_EMAIL_FROM` (own-account deploys) wins over the platform's
   // `<slug>+noreply@<domain>`: a project that carries both is one whose
-  // void.json names a sender on purpose.
+  // void.config.ts names a sender on purpose.
   const configured = readEmailFrom();
   if (configured) {
     return { ...opts, from: configured };
@@ -404,17 +397,6 @@ function err(code: SendEmailErrorCode, message: string, cause?: unknown): SendEm
   return { ok: false, error: makeError(code, message, cause) };
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
-  // 8KB chunks keep us well under the typical V8 fromCharCode arg limit.
-  const CHUNK = 0x2000;
-  let binary = '';
-  for (let i = 0; i < bytes.byteLength; i += CHUNK) {
-    const slice = bytes.subarray(i, Math.min(i + CHUNK, bytes.byteLength));
-    binary += String.fromCharCode(...slice);
-  }
-  return btoa(binary);
-}
-
 interface ProxySendBody {
   projectId: string;
   /** Project HMAC accepted by the shared proxy authentication middleware. */
@@ -426,27 +408,11 @@ interface ProxySendBody {
   idempotencyKey?: string;
 }
 
-interface ProxyOkResponse {
-  ok: true;
-  ids: Array<SendEmailDelivery>;
-  operationId?: string;
-}
-interface ProxyPreflightFailure {
-  ok: false;
-  error: { code: SendEmailErrorCode | string; message: string };
-  operationId?: string;
-}
-interface ProxyMidBatchFailure {
-  ok: false;
-  operationId?: string;
-  deliveries: Array<{
-    recipient: string;
-    ok: boolean;
-    messageId?: string;
-    error?: { code: SendEmailErrorCode | string; message: string };
-  }>;
-}
-type ProxyResponse = ProxyOkResponse | ProxyPreflightFailure | ProxyMidBatchFailure;
+type ProxyResponse = { operationId: unknown } & (
+  | { ok: true; ids: Array<unknown> }
+  | { ok: false; error: { code: unknown; message: unknown } }
+  | { ok: false; deliveries: Array<unknown> }
+);
 
 function coerceErrorCode(code: unknown): SendEmailErrorCode {
   const known: Array<SendEmailErrorCode> = [
@@ -460,9 +426,7 @@ function coerceErrorCode(code: unknown): SendEmailErrorCode {
     'OUTCOME_UNKNOWN',
     'UPSTREAM_ERROR',
   ];
-  return known.includes(code as SendEmailErrorCode)
-    ? (code as SendEmailErrorCode)
-    : 'UPSTREAM_ERROR';
+  return known.find((knownCode) => knownCode === code) ?? 'UPSTREAM_ERROR';
 }
 
 /**
@@ -484,21 +448,32 @@ function readProxyRefusal(body: unknown): string | null {
 }
 
 // A malformed response leaves the provider outcome unknown.
-function isValidProxyResponse(b: unknown): b is ProxyResponse {
-  if (typeof b !== 'object' || b === null) {
-    return false;
+function readProxyResponse(value: unknown): ProxyResponse | null {
+  if (!isRecord(value)) {
+    return null;
   }
-  const r = b as Record<string, unknown>;
-  if (r.ok === true && Array.isArray(r.ids)) {
-    return true;
+  const operationId = value.operationId;
+  if (value.ok === true && Array.isArray(value.ids)) {
+    return { ok: true, ids: value.ids, operationId };
   }
-  if (r.ok === false && typeof r.error === 'object' && r.error !== null) {
-    return true;
+  if (value.ok !== false) {
+    return null;
   }
-  if (r.ok === false && Array.isArray(r.deliveries)) {
-    return true;
+  if (Array.isArray(value.deliveries)) {
+    return { ok: false, deliveries: value.deliveries, operationId };
   }
-  return false;
+  const error = value.error;
+  if (typeof error === 'object' && error !== null) {
+    return {
+      ok: false,
+      error: {
+        code: 'code' in error ? error.code : undefined,
+        message: 'message' in error ? error.message : undefined,
+      },
+      operationId,
+    };
+  }
+  return null;
 }
 
 type RecipientListRead<T> = { ok: true; entries: Array<T> } | { ok: false; reason: string };
@@ -597,13 +572,14 @@ function readFailureDeliveries(
           : undefined;
       }
       if (entry.ok === false) {
+        const state = readDeliveryState(entry.state);
         const error = entry.error as { code?: unknown; message?: unknown } | null | undefined;
         return typeof error === 'object' && error !== null && typeof error.message === 'string'
           ? {
               recipient,
               ok: false,
               error: makeError(coerceErrorCode(error.code), error.message),
-              ...(readDeliveryState(entry.state) ? { state: readDeliveryState(entry.state) } : {}),
+              ...(state ? { state } : {}),
             }
           : undefined;
       }
@@ -724,7 +700,8 @@ async function readResponseAsResult(
         `email: could not establish the send outcome (status ${res.status}); check email logs or repeat the same idempotency key`,
       );
     }
-    if (!isValidProxyResponse(body)) {
+    const response = readProxyResponse(body);
+    if (response === null) {
       // The proxy's own middleware — auth, platform lifecycle, capability
       // gates — answers ahead of the email handler with a flat
       // `{ error: string, message?: string }` and a non-2xx status. That
@@ -744,8 +721,8 @@ async function readResponseAsResult(
       );
     }
     // Both list-bearing shapes are validated as a whole against the
-    // recipients this send asked for (`ids` / `deliveries` are `unknown[]`
-    // from the typeguard's perspective).
+    // recipients this send asked for; their entries remain unknown until
+    // the whole list passes validation.
     const malformedList = (reason: string): SendEmailResult =>
       err(
         'OUTCOME_UNKNOWN',
@@ -753,24 +730,20 @@ async function readResponseAsResult(
         body,
       );
     const operation =
-      typeof body.operationId === 'string' && body.operationId.length <= 128
-        ? { operationId: body.operationId }
+      typeof response.operationId === 'string' && response.operationId.length <= 128
+        ? { operationId: response.operationId }
         : {};
-    if (body.ok === true) {
-      const list = readDeliveryList(body.ids as Array<unknown>, recipients, fallbackId);
+    if (response.ok === true) {
+      const list = readDeliveryList(response.ids, recipients, fallbackId);
       return list.ok ? { ok: true, ids: list.entries, ...operation } : malformedList(list.reason);
     }
-    // Treat the body as a flat record from here — the discriminated
-    // union narrowing fights the `unknown`-derived branches and adds
-    // little value once we've validated the shape via isValidProxyResponse.
-    const failure = body as unknown as Record<string, unknown>;
-    if (Array.isArray(failure.deliveries)) {
-      const list = readFailureDeliveries(failure.deliveries, recipients, fallbackId);
+    if ('deliveries' in response) {
+      const list = readFailureDeliveries(response.deliveries, recipients, fallbackId);
       return list.ok
         ? { ok: false, deliveries: list.entries, ...operation }
         : malformedList(list.reason);
     }
-    const e = failure.error as { code?: unknown; message?: unknown };
+    const e = response.error;
     return {
       ...err(
         coerceErrorCode(e.code),
@@ -940,11 +913,9 @@ async function postToDevInbox(
  * `ids` is built from the same deduplicated, lowercased list the two
  * production transports send to, so code written against a captured result
  * sees exactly what a deploy returns: one entry per unique address, keyed the
- * way `sendViaBinding` and the proxy report it. Mapping every `to`/`cc`/`bcc`
- * occurrence instead handed a test or `void dev` handler one success per
- * occurrence in its original case — deliveries that never happen once
- * deployed. The captured message itself keeps the original fields; the
- * inbox displays what was asked for, the result reports what would be sent.
+ * way `sendViaBinding` and the proxy report it. The captured message itself
+ * keeps the original fields; the inbox displays what was asked for, the
+ * result reports what would be sent.
  */
 function capturedResult(normalized: NormalizedEmail, captureId: string): SendEmailResult {
   const recipients = uniqueRecipients(normalized);
@@ -958,7 +929,8 @@ function capturedResult(normalized: NormalizedEmail, captureId: string): SendEma
 }
 
 /**
- * Send an email via the Void platform proxy.
+ * Send an email via the worker's own `SEND_EMAIL` binding or the Void
+ * platform proxy.
  *
  * During `void dev` the message is captured by the local inbox
  * (`/__void/inbox`) and never reaches the proxy; an in-process sink

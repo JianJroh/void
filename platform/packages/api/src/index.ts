@@ -69,6 +69,11 @@ import { ErrorAlertMonitor } from './error-alert-monitor.ts';
 import { cancelContainerBuildDos } from './github/cancel-builds.ts';
 import { authMiddleware } from './middleware/auth.ts';
 import { platformAccessProtection } from './middleware/platform-access.ts';
+import {
+  isMaintenanceReadRequest,
+  isMaintenanceLoginCallback,
+  isAdministratorCallback,
+} from './middleware/platform-maintenance.ts';
 import { operatorApi } from './operator/index.ts';
 import { sandboxDrainStatus } from './operator/sandbox-operations.ts';
 import { platformAppAccess } from './platform-app-access.ts';
@@ -131,7 +136,7 @@ import {
 } from './schema.ts';
 import { isAdminSuspended, REASON_REQUESTS_EXCEEDED } from './suspension.ts';
 import { getCurrentBillingPeriodStart } from './tiers.ts';
-import type { Domain, Project } from './types.ts';
+import type { Domain } from './types.ts';
 import { ensureUsageSigningKey, USAGE_PROTOCOL_VERSION } from './usage-auth.ts';
 import { UsageCounter } from './usage-counter.ts';
 import { replayFailedWebhookDeliveries } from './webhook-replay.ts';
@@ -223,16 +228,48 @@ const app = new Hono<ApiEnv>()
       context.req.header('X-Void-Auth-Setup') &&
       context.req.method === 'POST' &&
       context.req.path === '/internal/platform/auth-initialize';
+    // An upgrade or repair pauses traffic until it commits.
+    const maintenance =
+      context.env.PLATFORM_TRAFFIC_STATE === 'staging' ||
+      context.env.PLATFORM_TRAFFIC_STATE === 'sandbox-drain';
+    const trafficPaused =
+      maintenance ||
+      !!(
+        !authenticationSetup &&
+        !installerProbe &&
+        !maintenanceSandboxDrain &&
+        context.env.PLATFORM_INSTALLATION_ID &&
+        (await context.env.ROUTING.get(PLATFORM_DISABLED_KEY)) === PLATFORM_DISABLED_VALUE
+      );
+    context.set('platformTrafficPaused', trafficPaused);
+    if (context.req.path === '/admin/status' || context.req.path === '/admin/status.json') {
+      context.header('Cache-Control', 'private, no-store');
+    }
     if (
       !authenticationSetup &&
       !installerProbe &&
       !maintenanceSandboxDrain &&
-      (context.env.PLATFORM_TRAFFIC_STATE === 'staging' ||
-        context.env.PLATFORM_TRAFFIC_STATE === 'sandbox-drain' ||
-        (context.env.PLATFORM_INSTALLATION_ID &&
-          (await context.env.ROUTING.get(PLATFORM_DISABLED_KEY)) === PLATFORM_DISABLED_VALUE))
+      !isMaintenanceReadRequest(context) &&
+      !isMaintenanceLoginCallback(context) &&
+      trafficPaused
     ) {
-      return context.json({ error: 'Platform disabled' }, 503);
+      if (
+        context.req.method === 'GET' &&
+        (context.req.path === '/admin' || context.req.path.startsWith('/admin/')) &&
+        (context.req.header('Accept')?.includes('text/html') ||
+          context.req.header('X-VoidPages') === 'true')
+      ) {
+        context.header('Cache-Control', 'private, no-store');
+        return context.redirect('/admin/status', 302);
+      }
+      context.header('Cache-Control', 'no-store');
+      context.header('Retry-After', '30');
+      return context.json(
+        maintenance
+          ? { error: 'Platform disabled', reason: 'maintenance' }
+          : { error: 'Platform disabled' },
+        503,
+      );
     }
     await next();
   })
@@ -244,6 +281,22 @@ const app = new Hono<ApiEnv>()
   })
 
   .use('*', platformAccessProtection)
+
+  .use('*', async (context, next) => {
+    if (
+      context.get('platformTrafficPaused') &&
+      isMaintenanceLoginCallback(context) &&
+      !(
+        context.env.PLATFORM_TRAFFIC_STATE === 'sandbox-drain' &&
+        isSandboxDrainMaintenanceRequest(context.req.raw)
+      ) &&
+      !(await isAdministratorCallback(context))
+    ) {
+      context.header('Cache-Control', 'no-store');
+      return context.json({ error: 'Platform disabled' }, 503);
+    }
+    await next();
+  })
 
   .get('/health', async (context) => {
     try {
@@ -553,7 +606,7 @@ app.get('/admin', (context) => context.redirect(`/admin/${new URL(context.req.ur
 app.use('/admin/*', adminAuthMiddleware);
 app.use('/admin/*', adminCsrfMiddleware);
 app.post('/admin/fate', adminFateHandler);
-app.get('/admin/', adminAuthMiddleware, dashboardHandler);
+app.get('/admin/', dashboardHandler);
 app.route('/admin/users', adminUsers);
 app.route('/admin/projects', adminProjects);
 app.route('/admin/email', adminEmail);
@@ -708,11 +761,7 @@ async function scheduled(
     .catch((err) => console.error('[scheduled] failed to clean up stale deployments:', err));
 
   // Auto-fail GitHub Actions builds stuck ACTIVE far longer than any plan's
-  // build timeout. A missed `workflow_run` completion webhook — or a disconnect
-  // mid-run — would otherwise leave an Actions build active forever, pinning one
-  // of the owner's concurrency slots. Container builds free their slot via the
-  // BuildManager DO timeout, so this is scoped to executor='github_actions'.
-  // Best-effort and isolated like the steps around it.
+  // build timeout (see STALE_ACTIONS_BUILD_MAX_AGE_MINUTES).
   if (capabilities.managedBuilds) {
     await failStaleActiveGithubActionsBuilds(db, STALE_ACTIONS_BUILD_MAX_AGE_MINUTES)
       .then((n) => {
@@ -726,25 +775,16 @@ async function scheduled(
   }
 
   // Auto-fail container builds stuck ACTIVE far longer than the hard-max build
-  // timeout. The BuildManager DO normally reaps these via its own timeout, but
-  // if that timeout path tears down the container yet its terminal-status write
-  // to Postgres throws (Hyperdrive transient failure), the row stays ACTIVE
-  // forever — pinning a concurrency slot and blocking the project's queue.
+  // timeout (see STALE_CONTAINER_BUILD_MAX_AGE_MINUTES).
   //
-  // Two phases, ordered deliberately. (1) The DB terminalize is AUTHORITATIVE:
+  // Two phases, ordered deliberately. (1) The DB terminalize is authoritative:
   // it frees the concurrency slot and revokes the bound deploy token (build-row
-  // status is the token authority) even if the DO is unreachable — that is the
-  // whole point of this backstop, so it must run first and stand alone. (2) The
-  // `started_at > maxAge` predicate does NOT prove the container is gone: if the
-  // DO was evicted or its timeout alarm lost, the container may still be RUNNING.
-  // So we best-effort issue a BuildManager `cancelBuild` for each reaped id —
-  // stopping any still-alive orphan (halting its billing) and converging DO-local
-  // status. cancelBuild against an already-terminal row is harmless: it still
-  // calls stop() but its CAS no-ops the DB write (no double-deploy), setting
-  // DO-local status to 'cancelled' while the DB row stays 'failed' — both
-  // terminal, acceptable. A DO RPC failure must NOT break the handler (the slot
-  // is already freed by phase 1), so this is wrapped best-effort and isolated
-  // like the steps around it. Scoped to executor='container'.
+  // status is the token authority) even if the DO is unreachable, so it runs
+  // first and stands alone. (2) The age predicate does not prove the container
+  // is gone — an evicted DO or lost timeout alarm can leave it running — so each
+  // reaped build also gets a best-effort `cancelBuild`. That is harmless on an
+  // already-terminal row: its CAS no-ops the DB write and only DO-local status
+  // becomes 'cancelled'. A DO RPC failure must not break the handler.
   if (capabilities.managedBuilds) {
     await failStaleActiveContainerBuilds(db, STALE_CONTAINER_BUILD_MAX_AGE_MINUTES)
       .then(async (staleBuilds) => {
@@ -891,13 +931,9 @@ async function reconcilePendingDomains(
     return;
   }
 
-  // Batch-load projects for the deduped set of project_ids in a single query.
   const projectIds = [...new Set(pending.map((d) => d.project_id))];
   const projectRows = await getProjectsByIds(db, projectIds);
-  const projectMap = new Map<string, Project>();
-  for (const project of projectRows) {
-    projectMap.set(project.id, project);
-  }
+  const projectMap = new Map(projectRows.map((project) => [project.id, project]));
 
   // Batch-load the owners of the loaded projects so we can skip domains whose
   // owner is ADMIN-suspended. The authenticated `void domain status` route is
@@ -956,23 +992,21 @@ async function cleanupPendingDomainUnderProjectFence(
     // record the change for Zero Trust retry with the deletion, because the
     // project's custom domain application may already list this hostname.
     await lockZeroTrustConfiguration(tx, 'shared');
-    const txDb = tx as unknown as Db;
-    const current = await getDomain(txDb, domain.id);
+    const current = await getDomain(tx, domain.id);
     if (current?.status !== 'pending') {
       return false;
     }
     await beforeDelete?.();
     await env.ROUTING.delete(`domain:${domain.hostname}`).catch(() => {});
-    await markProjectCustomDomainsChanged(txDb, domain.project_id);
-    await deleteDomain(txDb, domain.id);
+    await markProjectCustomDomainsChanged(tx, domain.project_id);
+    await deleteDomain(tx, domain.id);
     return true;
   });
 }
 
-// Exported for direct integration testing of the janitor branch in isolation
-// from the reconcile pass (the hourly `scheduled()` runs reconcile first, which
-// would otherwise activate any gate-passing pending domain before the janitor
-// sees it — masking the >200-backlog starvation path the janitor now handles).
+// Exported so tests can exercise the janitor without the reconcile pass that
+// `scheduled()` runs first, which would activate any gate-passing pending
+// domain before the janitor sees it.
 export async function cleanupStalePendingDomains(
   env: ApiEnv['Bindings'],
   db: Db,
@@ -1100,15 +1134,14 @@ async function processUserRollover(
     for (const project of userProjects) {
       await db.transaction(async (tx) => {
         await tx.execute(sql`SELECT id FROM projects WHERE id = ${project.id} FOR UPDATE`);
-        const txDb = tx as unknown as Db;
-        const current = await getProject(txDb, project.id);
+        const current = await getProject(tx, project.id);
         if (!current || current.user_id !== user.id || current.status === 'deleting') {
           return;
         }
 
         // Resolve both route keys and values behind the same fence as deploy,
         // protection changes, domain activation, transfer, and deletion.
-        const domainMap = await getDomainsByProjectIds(txDb, [current.id]);
+        const domainMap = await getDomainsByProjectIds(tx, [current.id]);
         const protection = await resolveProjectZeroTrustRoutingForPublication(tx, current.id);
         const keys = [
           current.slug,

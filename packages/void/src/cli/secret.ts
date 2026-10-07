@@ -1,17 +1,9 @@
 import { readFileSync } from 'node:fs';
-import {
-  outro,
-  log,
-  note,
-  cancel,
-  isCancel,
-  password,
-  confirm,
-} from '@voidzero-dev/vite-plus-prompts';
+import { outro, log, cancel, isCancel, password, confirm } from '@voidzero-dev/vite-plus-prompts';
 import { getToken } from './auth.ts';
 import { PlatformClient } from './client.ts';
 import { validateSecretValues } from './env-validation.ts';
-import { formatCount } from './output.ts';
+import { printSuccess, formatCount, note } from './output.ts';
 import { readDeploymentPlatform, readProjectConfig } from './project.ts';
 import { getRequestedProjectSlug, resolveProjectBySlug } from './resolve-project.ts';
 import type { SecretArgs } from './secret-args.ts';
@@ -68,7 +60,7 @@ export async function runSecretCommand(root: string, args: SecretArgs): Promise<
     const value = args.value ?? (await readSecretValue());
     await validateSecretValues(root, [{ name: args.name, value }]);
     await client.setSecret(projectId, args.name, value);
-    outro(`Secret ${args.name} set.`);
+    printSuccess(`Secret ${args.name} set.`);
     return;
   }
 
@@ -97,14 +89,14 @@ export async function runSecretCommand(root: string, args: SecretArgs): Promise<
 
     for (const s of secrets) {
       await client.setSecret(projectId, s.name, s.value);
-      log.success(`Set ${s.name}`);
+      log.step(`Set ${s.name}`);
     }
-    outro(`Synced ${formatCount(secrets.length, 'secret')}.`);
+    printSuccess(`Synced ${formatCount(secrets.length, 'secret')}.`);
     return;
   }
 
   await client.deleteSecret(projectId, args.name);
-  outro(`Secret ${args.name} deleted.`);
+  printSuccess(`Secret ${args.name} deleted.`);
 }
 
 async function runCloudflareSecretCommand(root: string, args: SecretArgs): Promise<void> {
@@ -136,7 +128,7 @@ async function runCloudflareSecretCommand(root: string, args: SecretArgs): Promi
     const value = args.value ?? (await readSecretValue());
     await validateSecretValues(root, [{ name: args.name, value }]);
     await putCloudflareSecret(context, args.name, value);
-    outro(`Secret ${args.name} set.`);
+    printSuccess(`Secret ${args.name} set.`);
     return;
   }
   if (args.action === 'sync') {
@@ -159,11 +151,11 @@ async function runCloudflareSecretCommand(root: string, args: SecretArgs): Promi
       process.exit(0);
     }
     await syncCloudflareSecrets(context, secrets);
-    outro(`Synced ${formatCount(secrets.length, 'secret')}.`);
+    printSuccess(`Synced ${formatCount(secrets.length, 'secret')}.`);
     return;
   }
   await deleteCloudflareSecret(context, args.name);
-  outro(`Secret ${args.name} deleted.`);
+  printSuccess(`Secret ${args.name} deleted.`);
 }
 
 const SECRET_KEY_RE = /^[A-Z][A-Z0-9_]*$/;
