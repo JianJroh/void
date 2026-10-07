@@ -19,21 +19,6 @@ const { frontmatter } = useData();
 
   <Spacer class="bg-primary" />
 
-  <section
-    class="wrapper border-t border-nickel px-5 sm:px-10 h-70 sm:h-[22rem] flex flex-col justify-center gap-6 text-center items-center"
-    aria-labelledby="features-heading"
-  >
-    <a href="/guide/" class="section-label-link" aria-label="Void SDK guide">
-      <img src="/void-sdk.svg" alt="" class="section-label section-label--sdk" />
-    </a>
-    <h2 id="features-heading" class="text-white">Turn Vite Apps Full-Stack</h2>
-    <p class="max-w-md text-white/70 text-balance sm:text-pretty">
-      Use your favorite Vite framework, add the backend features you need, and infer your resources.
-    </p>
-  </section>
-
-  <HomeFeatures />
-
   <div class="platform-surface bg-white text-primary">
     <section
       class="wrapper border-t border-stroke px-5 sm:px-10 h-70 sm:h-80 flex flex-col justify-center items-center gap-5 text-center"
@@ -57,6 +42,21 @@ const { frontmatter } = useData();
     <HomePlatform />
     <Spacer />
   </div>
+
+  <section
+    class="wrapper border-t border-nickel px-5 sm:px-10 h-70 sm:h-[22rem] flex flex-col justify-center gap-6 text-center items-center"
+    aria-labelledby="features-heading"
+  >
+    <a href="/guide/" class="section-label-link" aria-label="Void SDK guide">
+      <img src="/void-sdk.svg" alt="" class="section-label section-label--sdk" />
+    </a>
+    <h2 id="features-heading" class="text-white">Turn Vite Apps Full-Stack</h2>
+    <p class="max-w-md text-white/70 text-balance sm:text-pretty">
+      Use your favorite Vite framework, add the backend features you need, and infer your resources.
+    </p>
+  </section>
+
+  <HomeFeatures />
 
   <Footer
     :heading="frontmatter.footer_heading"

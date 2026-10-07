@@ -428,16 +428,8 @@ onBeforeUnmount(() => {
 }
 .void-terminal--home .void-terminal-viewport {
   height: 100%;
-  scrollbar-width: thin;
-  scrollbar-color: #3b3440 transparent;
-}
-.void-terminal--home .void-terminal-viewport::-webkit-scrollbar {
-  display: block;
-  width: 4px;
-  height: 4px;
-}
-.void-terminal--home .void-terminal-viewport::-webkit-scrollbar-thumb {
-  background: #3b3440;
+  overflow: hidden;
+  overscroll-behavior: auto;
 }
 .void-terminal--home .void-terminal-output {
   padding: 24px 32px;

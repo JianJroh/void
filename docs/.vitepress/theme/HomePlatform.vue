@@ -2,10 +2,15 @@
 import RiveAnimation from '@components/shared/RiveAnimation.vue';
 import { Icon } from '@iconify/vue';
 import { useData } from 'vitepress';
-import controlPlaneAnimation from './assets/animations/640_x_320_void_platform_light.riv';
+import appsFieldAnimation from './assets/animations/640_x_320_apps_field_light.riv';
+import platformSecurityAnimation from './assets/animations/640_x_320_void_platform_light.riv';
 import HomePlatformResourceCode from './HomePlatformResourceCode.vue';
 
 const { frontmatter } = useData();
+const featureAnimations = {
+  'platform-ai-coding': appsFieldAnimation,
+  'platform-security': platformSecurityAnimation,
+};
 </script>
 
 <template>
@@ -47,7 +52,7 @@ const { frontmatter } = useData();
           :aria-label="feature.image_alt"
         >
           <RiveAnimation
-            :desktop-src="controlPlaneAnimation"
+            :desktop-src="featureAnimations[feature.id]"
             :desktop-width="640"
             :desktop-height="320"
             canvas-class="w-full h-auto"
